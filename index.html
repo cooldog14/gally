@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photos</title>
+<link rel="stylesheet" href="./styles.css">
+<script>
+try {
+  var saved = localStorage.getItem("theme");
+  document.documentElement.dataset.theme =
+    saved === "light" || saved === "dark" ? saved :
+    (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+} catch (_) { document.documentElement.dataset.theme = "light"; }
+</script>
+</head>
+<body>
+<header id="topbar">
+  <span id="wordmark">Photos</span>
+  <div id="account">
+    <div id="auth-block">
+      <input type="text" id="auth-username" placeholder="Username" autocomplete="username" maxlength="20">
+      <input type="password" id="auth-password" placeholder="Password" autocomplete="current-password">
+      <button id="login-btn" type="button">Log in</button>
+      <button id="register-btn" type="button">Register</button>
+    </div>
+    <div id="user-block" hidden>
+      <span id="user-label"></span>
+      <button id="logout-btn" type="button">Log out</button>
+    </div>
+    <div id="auth-error" role="alert"></div>
+  </div>
+  <div id="actions">
+    <label id="upload-btn" for="file-input" hidden>Upload</label>
+    <input type="file" id="file-input" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple hidden>
+    <button id="theme-btn" type="button" aria-label="Toggle theme">&#9789;</button>
+  </div>
+</header>
+<main id="main">
+  <p id="upload-status" role="status"></p>
+  <p id="empty">No photos yet</p>
+  <div id="grid"></div>
+</main>
+<footer id="footer">
+  <details id="admin-details">
+    <summary>Admin</summary>
+    <input type="password" id="admin-password" placeholder="Admin password" autocomplete="off">
+    <button id="admin-unlock-btn" type="button">Unlock</button>
+    <div id="admin-error" role="alert"></div>
+    <div id="admin-panel" hidden>
+      <h2>Users</h2>
+      <ul id="admin-users"></ul>
+    </div>
+  </details>
+</footer>
+<div id="lightbox" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>
+  <button id="close" aria-label="Close">&times;</button>
+  <button id="prev" aria-label="Previous">&lsaquo;</button>
+  <img id="frame" alt="">
+  <button id="next" aria-label="Next">&rsaquo;</button>
+  <button id="delete-btn" aria-label="Delete photo" hidden>Delete</button>
+  <div id="counter"></div>
+</div>
+<script src="./app.js"></script>
+</body>
+</html>
