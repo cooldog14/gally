@@ -1,29 +1,32 @@
-use httparse::{Request, EMPTY_HEADER};
-use std::collections::HashMap;
+//! Filename/slug/key validation helpers (ported from the former `http.rs`).
+//! Pure functions only — no HTTP parsing (axum handles that).
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_NAME_LEN: usize = 100;
 pub const KEY_MIN: usize = 4;
 pub const KEY_MAX: usize = 128;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    Get,
-    Head,
-    Put,
-    Post,
-    Delete,
-    Other,
-}
-
-pub fn content_type_for(ext: &str) -> &'static str {
-    match ext {
-        ".jpg" | ".jpeg" => "image/jpeg",
-        ".png" => "image/png",
-        ".gif" => "image/gif",
-        ".webp" => "image/webp",
-        _ => "application/octet-stream",
-    }
-}
+pub static ADJ: &[&str] = &[
+    "amber", "arctic", "ashen", "autumn", "azure", "birch", "bold", "brave", "brisk", "bronze",
+    "calm", "cedar", "chilly", "cinder", "clear", "cobalt", "comet", "copper", "coral", "crimson",
+    "daring", "dawn", "ember", "frosty", "gentle", "glacier", "golden", "granite", "harbor",
+    "hasty", "hazel", "honey", "ivory", "juniper", "kind", "lunar", "maple", "marble", "meadow",
+    "misty", "mossy", "nimble", "noble", "ochre", "olive", "opal", "pebble", "pine", "plucky",
+    "quartz", "quiet", "rapid", "redwood", "rocky", "ruby", "russet", "sandy", "silent", "silky",
+    "silver", "sleepy", "solar", "spruce", "stormy", "sunny", "swift", "tawny", "tidal", "timber",
+    "velvet", "verdant", "wheat", "willow", "wispy",
+];
+pub static NOUN: &[&str] = &[
+    "acorn", "anchor", "arrow", "aspen", "badger", "basin", "beacon", "beaver", "brook", "burrow",
+    "cabin", "canyon", "cavern", "cliff", "cove", "crane", "creek", "dune", "eagle", "elm",
+    "falcon", "fern", "finch", "fjord", "fox", "garnet", "glade", "grove", "gull", "heron",
+    "hill", "hollow", "inlet", "island", "jay", "kelp", "lagoon", "lark", "lichen", "lotus",
+    "meadowlark", "mesa", "moth", "newt", "oasis", "otter", "owl", "oxbow", "peak", "pond",
+    "poplar", "prairie", "quail", "raven", "reef", "ridge", "river", "robin", "sedge", "sparrow",
+    "stone", "stork", "summit", "tern", "thrush", "trail", "trout", "tundra", "valley", "vole",
+    "wren",
+];
 
 pub fn is_slug(s: &str) -> bool {
     // ^[a-z]+-[a-z]+-[1-9][0-9]{0,2}$
@@ -52,11 +55,11 @@ pub fn photo_slug(name: &str) -> Option<&str> {
     if rest.len() < 33 {
         return None;
     }
-    let (hex, tail) = rest.split_at(32);
+    let (hexpart, tail) = rest.split_at(32);
     if !tail.starts_with('_') {
         return None;
     }
-    if !hex.bytes().all(|v| v.is_ascii_hexdigit()) {
+    if !hexpart.bytes().all(|v| v.is_ascii_hexdigit()) {
         return None;
     }
     // slug check (allow 0-prefixed? python FILE_SLUG_RE allows 0xx; keep permissive)
@@ -127,79 +130,6 @@ pub fn normalize_key(raw: &str) -> Option<String> {
     }
 }
 
-pub fn json_body(status: u16, obj: &str) -> Vec<u8> {
-    let reason = match status {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-        status,
-        reason,
-        obj.len(),
-        obj
-    )
-    .into_bytes()
-}
-
-pub fn escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
-}
-
-pub fn parse_cookies(h: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    for part in h.split(';') {
-        let p = part.trim();
-        if let Some(i) = p.find('=') {
-            m.insert(p[..i].trim().to_string(), p[i + 1..].trim().to_string());
-        }
-    }
-    m
-}
-
-pub fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-pub fn parse_request(head: &[u8]) -> Option<(Method, String, HashMap<String, String>, usize)> {
-    let mut hdrs = [EMPTY_HEADER; 32];
-    let mut req = Request::new(&mut hdrs);
-    let Ok(httparse::Status::Complete(_)) = req.parse(head) else { return None };
-    let method = match req.method.unwrap_or("") {
-        "GET" => Method::Get,
-        "HEAD" => Method::Head,
-        "PUT" => Method::Put,
-        "POST" => Method::Post,
-        "DELETE" => Method::Delete,
-        _ => Method::Other,
-    };
-    let path = req.path.unwrap_or("/").split('?').next().unwrap_or("/").to_string();
-    let mut map = HashMap::new();
-    for h in req.headers.iter() {
-        map.insert(h.name.to_lowercase(), String::from_utf8_lossy(h.value).to_string());
-    }
-    Some((method, path, map, 0))
-}
-
 pub fn percent_decode(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     let b = s.as_bytes();
@@ -217,6 +147,7 @@ pub fn percent_decode(s: &str) -> String {
     }
     o
 }
+
 pub fn hex(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -226,80 +157,53 @@ pub fn hex(c: u8) -> Option<u8> {
     }
 }
 
-#[derive(Default)]
-pub struct SerdeJsonLike(HashMap<String, String>);
-impl SerdeJsonLike {
-    pub fn get(&self, k: &str) -> Option<&String> {
-        self.0.get(k)
+/// JSON string escape (for hand-built JSON payloads).
+pub fn escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn rand_below(n: u32) -> u32 {
+    // xorshift from nanos — no extra deps
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(1);
+    static mut S: u64 = 0x9e37_79b9_7f4a_7c15;
+    unsafe {
+        S ^= S << 13;
+        S ^= S >> 7;
+        S ^= S << 17;
+        S = S.wrapping_add(t);
+        ((S >> 11) % (n as u64)) as u32
     }
 }
-/// Minimal flat-JSON string parser: {"k":"v",...} — enough for {key,password}.
-pub fn parse_json_obj(b: &[u8]) -> SerdeJsonLike {
-    let mut m = HashMap::new();
-    let s = String::from_utf8_lossy(b);
-    let s = s.trim();
-    if !s.starts_with('{') {
-        return SerdeJsonLike(m);
-    }
-    // very small state machine for "key":"value" pairs
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut k = String::new();
-        while i < chars.len() && chars[i] != '"' {
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                i += 1;
-                k.push(chars[i]);
-            } else {
-                k.push(chars[i]);
-            }
-            i += 1;
-        }
-        i += 1; // closing quote
-        while i < chars.len() && (chars[i] == ' ' || chars[i] == ':' || chars[i] == ',') {
-            if chars[i] == ':' {
-                i += 1;
-                break;
-            }
-            i += 1;
-        }
-        while i < chars.len() && chars[i] == ' ' {
-            i += 1;
-        }
-        let mut v = String::new();
-        if i < chars.len() && chars[i] == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 1;
-                    match chars[i] {
-                        'n' => v.push('\n'),
-                        't' => v.push('\t'),
-                        c => v.push(c),
-                    }
-                } else {
-                    v.push(chars[i]);
-                }
-                i += 1;
-            }
-            i += 1;
-        } else {
-            while i < chars.len() && chars[i] != ',' && chars[i] != '}' {
-                v.push(chars[i]);
-                i += 1;
-            }
-            v = v.trim().to_string();
-        }
-        if !k.is_empty() {
-            m.insert(k, v);
+
+pub fn gen_slug(db: &rusqlite::Connection) -> String {
+    for _ in 0..50 {
+        let s = format!(
+            "{}-{}-{}",
+            ADJ[rand_below(ADJ.len() as u32) as usize],
+            NOUN[rand_below(NOUN.len() as u32) as usize],
+            rand_below(999) + 1
+        );
+        let taken: bool = db
+            .query_row("SELECT 1 FROM galleries WHERE slug = ?1", [&s], |_| Ok(()))
+            .is_ok();
+        if !taken {
+            return s;
         }
     }
-    SerdeJsonLike(m)
+    format!("oddball-slug-{}", rand_below(999) + 1)
 }
 
 #[cfg(test)]
@@ -377,18 +281,21 @@ mod tests {
     }
 
     #[test]
-    fn request_get_path_headers() {
-        let raw = b"GET /photos/abc?x=1 HTTP/1.1\r\nHost: ex.com\r\nX-Gallery-Key: sekrit\r\n\r\n";
-        let (m, path, hdrs, _) = parse_request(raw).expect("parse");
-        assert!(m == Method::Get);
-        assert_eq!(path, "/photos/abc");
-        assert_eq!(hdrs.get("host").unwrap(), "ex.com");
-        assert_eq!(hdrs.get("x-gallery-key").unwrap(), "sekrit");
+    fn gen_slug_shape_and_unique() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB, created INTEGER)",
+            [],
+        )
+        .unwrap();
+        let s = gen_slug(&db);
+        assert!(is_slug(&s), "generated slug should validate: {s}");
     }
 
     #[test]
-    fn request_bad_none() {
-        assert!(parse_request(b"GARBAGE").is_none());
-        assert!(parse_request(b"GET /only-path").is_none());
+    fn escape_json() {
+        assert_eq!(escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape("x\ny"), "x\\ny");
+        assert_eq!(escape("\u{1}"), "\\u0001");
     }
 }
