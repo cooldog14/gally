@@ -1,0 +1,19 @@
+[package]
+name = "gally-uring"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+httparse = "1.10.1"
+io-uring = "0.7"
+libc = "0.2.191"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.11.1"
+subtle = "2.6.1"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = true
