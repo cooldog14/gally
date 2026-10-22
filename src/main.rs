@@ -4,7 +4,6 @@
 //! uploads use blocking file writes (local fs, fast) to keep the loop simple.
 
 use anyhow::Result;
-use httparse::{Request, EMPTY_HEADER};
 use io_uring::{opcode, types, IoUring};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -12,6 +11,8 @@ use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+mod http;
+use http::*;
 
 const RING_ENTRIES: u32 = 1024;
 const BGID: u16 = 1;
@@ -19,7 +20,6 @@ const NBUFS: u16 = 256;
 const BUFSZ: usize = 4096;
 const MAX_BYTES: usize = 20 * 1024 * 1024;
 const CHUNK: usize = 65_536;
-const MAX_NAME_LEN: usize = 100;
 const RATE_MAX: usize = 60;
 const RATE_WINDOW_SECS: u64 = 60;
 
@@ -40,15 +40,6 @@ fn make_ud(conn: u32, op: u64) -> u64 {
     ((conn as u64) << 32) | op
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Method {
-    Get,
-    Head,
-    Put,
-    Post,
-    Delete,
-    Other,
-}
 
 struct Conn {
     fd: RawFd,
@@ -97,117 +88,10 @@ struct Statics {
     map: HashMap<String, (Vec<u8>, &'static str)>,
 }
 
-fn content_type_for(ext: &str) -> &'static str {
-    match ext {
-        ".jpg" | ".jpeg" => "image/jpeg",
-        ".png" => "image/png",
-        ".gif" => "image/gif",
-        ".webp" => "image/webp",
-        _ => "application/octet-stream",
-    }
-}
 
-fn is_slug(s: &str) -> bool {
-    // ^[a-z]+-[a-z]+-[1-9][0-9]{0,2}$
-    let mut parts = s.split('-');
-    let a = parts.next().unwrap_or("");
-    let b = parts.next().unwrap_or("");
-    let c = parts.next().unwrap_or("");
-    if parts.next().is_some() {
-        return false;
-    }
-    let alpha = |x: &str| !x.is_empty() && x.bytes().all(|v| v.is_ascii_lowercase());
-    if !alpha(a) || !alpha(b) {
-        return false;
-    }
-    if c.len() > 3 || c.is_empty() || c.as_bytes()[0] == b'0' {
-        return false;
-    }
-    c.bytes().all(|v| v.is_ascii_digit())
-}
 
-fn photo_slug(name: &str) -> Option<&str> {
-    // ^([a-z]+-[a-z]+-[0-9]{1,3})_[0-9a-f]{32}_
-    let us = name.find('_')?;
-    let slug = &name[..us];
-    let rest = &name[us + 1..];
-    if rest.len() < 33 {
-        return None;
-    }
-    let (hex, tail) = rest.split_at(32);
-    if !tail.starts_with('_') {
-        return None;
-    }
-    if !hex.bytes().all(|v| v.is_ascii_hexdigit()) {
-        return None;
-    }
-    // slug check (allow 0-prefixed? python FILE_SLUG_RE allows 0xx; keep permissive)
-    let mut parts = slug.split('-');
-    let a = parts.next()?;
-    let b = parts.next()?;
-    let c = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if a.is_empty() || b.is_empty() || c.is_empty() {
-        return None;
-    }
-    if !a.bytes().all(|v| v.is_ascii_lowercase()) || !b.bytes().all(|v| v.is_ascii_lowercase()) {
-        return None;
-    }
-    if c.len() > 3 || !c.bytes().all(|v| v.is_ascii_digit()) {
-        return None;
-    }
-    Some(slug)
-}
 
-fn sanitize_filename(raw: &str) -> (String, String) {
-    let base0 = raw.rsplit('/').next().unwrap_or(raw).rsplit('\\').next().unwrap_or(raw);
-    let mut base: String = base0
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if base.is_empty() || base == "." || base == ".." {
-        base = "file".into();
-    }
-    if base.len() > MAX_NAME_LEN {
-        let (stem, ext) = match base.rfind('.') {
-            Some(i) if i > 0 => {
-                let e = base[i..].to_lowercase();
-                (base[..i].to_string(), e)
-            }
-            _ => (base.clone(), String::new()),
-        };
-        let mut suffix = ext;
-        if suffix.len() >= MAX_NAME_LEN {
-            suffix.truncate(MAX_NAME_LEN);
-        }
-        let keep = MAX_NAME_LEN - suffix.len();
-        let mut s = stem;
-        s.truncate(keep);
-        base = s + &suffix;
-    }
-    let ext = match base.rfind('.') {
-        Some(i) if i > 0 => base[i..].to_lowercase(),
-        _ => String::new(),
-    };
-    (base, ext)
-}
 
-fn normalize_key(raw: &str) -> Option<String> {
-    let k = raw.trim();
-    if (4..=128).contains(&k.len()) {
-        Some(k.to_string())
-    } else {
-        None
-    }
-}
 
 fn key_hash(key: &str) -> Vec<u8> {
     let mut h = Sha256::new();
@@ -374,43 +258,7 @@ fn push_recv_multi(sq: &mut io_uring::SubmissionQueue, conn_id: u32, fd: RawFd) 
     }
 }
 
-fn json_body(status: u16, obj: &str) -> Vec<u8> {
-    let reason = match status {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
-        status,
-        reason,
-        obj.len(),
-        obj
-    )
-    .into_bytes()
-}
 
-fn escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
-}
 
 fn rate_limited(app: &mut App, ip: &str) -> bool {
     let now = Instant::now();
@@ -439,16 +287,6 @@ fn peer_ip(fd: RawFd) -> String {
     }
 }
 
-fn parse_cookies(h: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    for part in h.split(';') {
-        let p = part.trim();
-        if let Some(i) = p.find('=') {
-            m.insert(p[..i].trim().to_string(), p[i + 1..].trim().to_string());
-        }
-    }
-    m
-}
 
 fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -863,60 +701,13 @@ fn close_conn(mut c: Conn) {
     }
 }
 
-fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
 
-fn parse_request(head: &[u8]) -> Option<(Method, String, HashMap<String, String>, usize)> {
-    let mut hdrs = [EMPTY_HEADER; 32];
-    let mut req = Request::new(&mut hdrs);
-    let Ok(httparse::Status::Complete(_)) = req.parse(head) else { return None };
-    let method = match req.method.unwrap_or("") {
-        "GET" => Method::Get,
-        "HEAD" => Method::Head,
-        "PUT" => Method::Put,
-        "POST" => Method::Post,
-        "DELETE" => Method::Delete,
-        _ => Method::Other,
-    };
-    let path = req.path.unwrap_or("/").split('?').next().unwrap_or("/").to_string();
-    let mut map = HashMap::new();
-    for h in req.headers.iter() {
-        map.insert(h.name.to_lowercase(), String::from_utf8_lossy(h.value).to_string());
-    }
-    Some((method, path, map, 0))
-}
 
 fn photo_slug_name(p: &Path) -> Option<String> {
     let n = p.file_name()?.to_string_lossy().to_string();
     photo_slug(&n).map(|s| s.to_string())
 }
 
-fn percent_decode(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                o.push((h * 16 + l) as char);
-                i += 3;
-                continue;
-            }
-        }
-        o.push(b[i] as char);
-        i += 1;
-    }
-    o
-}
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
 
 /// Route one parsed request. `pipelined` = body bytes already received with head.
 fn handle_request(
@@ -1406,80 +1197,5 @@ fn const_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-#[derive(Default)]
-struct SerdeJsonLike(HashMap<String, String>);
-impl SerdeJsonLike {
-    fn get(&self, k: &str) -> Option<&String> {
-        self.0.get(k)
-    }
-}
-/// Minimal flat-JSON string parser: {"k":"v",...} — enough for {key,password}.
-fn parse_json_obj(b: &[u8]) -> SerdeJsonLike {
-    let mut m = HashMap::new();
-    let s = String::from_utf8_lossy(b);
-    let s = s.trim();
-    if !s.starts_with('{') {
-        return SerdeJsonLike(m);
-    }
-    // very small state machine for "key":"value" pairs
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut k = String::new();
-        while i < chars.len() && chars[i] != '"' {
-            if chars[i] == '\\' && i + 1 < chars.len() {
-                i += 1;
-                k.push(chars[i]);
-            } else {
-                k.push(chars[i]);
-            }
-            i += 1;
-        }
-        i += 1; // closing quote
-        while i < chars.len() && (chars[i] == ' ' || chars[i] == ':' || chars[i] == ',') {
-            if chars[i] == ':' {
-                i += 1;
-                break;
-            }
-            i += 1;
-        }
-        while i < chars.len() && chars[i] == ' ' {
-            i += 1;
-        }
-        let mut v = String::new();
-        if i < chars.len() && chars[i] == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 1;
-                    match chars[i] {
-                        'n' => v.push('\n'),
-                        't' => v.push('\t'),
-                        c => v.push(c),
-                    }
-                } else {
-                    v.push(chars[i]);
-                }
-                i += 1;
-            }
-            i += 1;
-        } else {
-            while i < chars.len() && chars[i] != ',' && chars[i] != '}' {
-                v.push(chars[i]);
-                i += 1;
-            }
-            v = v.trim().to_string();
-        }
-        if !k.is_empty() {
-            m.insert(k, v);
-        }
-    }
-    SerdeJsonLike(m)
-}
 
 
