@@ -25,4 +25,7 @@ opt-level = 3
 strip = true
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+futures = "0.3.34"
 tempfile = "3.27.0"
+tokio-test = "0.4.6"

@@ -5,7 +5,9 @@ use gally_uring::{router, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::var("GALLY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let state: Arc<AppState> = AppState::new(&root).await?;
     let app = router(state);
     let port: u16 = std::env::var("PORT")

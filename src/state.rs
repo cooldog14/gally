@@ -9,6 +9,14 @@ use crate::db::{self, GalleryDb};
 pub const RATE_MAX: usize = 60;
 pub const RATE_WINDOW_SECS: u64 = 60;
 
+/// Upload cap per IP per window. `GALLY_RATE_MAX` overrides (0 = unlimited).
+pub fn rate_max() -> usize {
+    std::env::var("GALLY_RATE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RATE_MAX)
+}
+
 pub struct AppState {
     pub dir: PathBuf,
     pub db: Mutex<rusqlite::Connection>,
@@ -78,14 +86,18 @@ impl AppState {
     }
 }
 
-/// Fixed-window rate limit: at most RATE_MAX hits per RATE_WINDOW_SECS.
+/// Fixed-window rate limit: at most `rate_max()` hits per window (0 = off).
 /// Returns true when the caller is over the limit (hit NOT recorded).
 pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
+    let max = rate_max();
+    if max == 0 {
+        return false;
+    }
     let now = Instant::now();
     let mut rate = state.rate.lock().unwrap();
     let hits = rate.entry(*ip).or_default();
     hits.retain(|t| now.duration_since(*t).as_secs() < RATE_WINDOW_SECS);
-    if hits.len() >= RATE_MAX {
+    if hits.len() >= max {
         return true;
     }
     hits.push(now);
