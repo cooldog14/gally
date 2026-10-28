@@ -1,8 +1,11 @@
 photos/*
 !photos/.gitkeep
 *.db
+*.db-shm
+*.db-wal
 __pycache__/
-
+.pytest_cache/
+*.log
 
 # Added by cargo
 

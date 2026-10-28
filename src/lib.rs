@@ -1,6 +1,10 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
+use axum::extract::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 
 pub mod db;
 pub mod routes;
@@ -9,6 +13,16 @@ pub mod validate;
 
 pub use state::AppState;
 
+/// Log every request with its latency.
+async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let t0 = Instant::now();
+    let resp = next.run(req).await;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    tracing::info!(method = %method, path = %path, status = %resp.status(), latency_ms = format!("{ms:.2}"));
+    resp
+}
 pub fn router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, post, put};
     use routes::*;
@@ -37,5 +51,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(static_path))
         .route("/{slug}", get(spa_or_404))
         .fallback(fallback_404)
+        .layer(middleware::from_fn(log_requests))
         .with_state(state)
 }

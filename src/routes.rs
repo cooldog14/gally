@@ -7,6 +7,7 @@ use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -95,19 +96,40 @@ pub async fn gallery_photos(
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
 ) -> Response {
+    let t_total = std::time::Instant::now();
     if !is_slug(&slug) {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
+    // Cached fast path: skip DB + directory scan.
+    if let Some(cached) = state.listings.lock().unwrap().get(&slug) {
+        let photos = cached.photos.clone();
+        tracing::debug!(stage = "list_cached", count = photos.len(), latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+        return (StatusCode::OK, Json(json!({ "slug": slug, "photos": photos })))
+            .into_response();
+    }
+    let t_db = std::time::Instant::now();
     let exists = {
         let db = state.db.lock().unwrap();
         db.gallery_exists(&slug)
     };
+    tracing::debug!(stage = "list_db_check", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
     if !exists {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    match photo_entries(&state, &slug).await {
-        Ok(photos) => (StatusCode::OK, Json(json!({ "slug": slug, "photos": photos })))
-            .into_response(),
+    let t_scan = std::time::Instant::now();
+    let result = photo_entries(&state, &slug).await;
+    tracing::debug!(stage = "list_dir_scan", latency_ms = format!("{:.2}", t_scan.elapsed().as_secs_f64() * 1000.0));
+    match result {
+        Ok(photos) => {
+            let count = photos.len();
+            state.listings.lock().unwrap().insert(
+                slug.clone(),
+                crate::state::CachedListing { photos: photos.clone() },
+            );
+            tracing::debug!(stage = "list_total", count = count, latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+            (StatusCode::OK, Json(json!({ "slug": slug, "photos": photos })))
+                .into_response()
+        }
         Err(_) => ApiError::Internal.into_response(),
     }
 }
@@ -341,6 +363,7 @@ pub async fn delete_gallery(
             }
         }
     }
+    state.invalidate_listing(&slug);
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
 }
 
@@ -389,6 +412,7 @@ pub async fn put_photo(
     AxumPath(raw_name): AxumPath<String>,
     body: Body,
 ) -> Response {
+    let t_total = std::time::Instant::now();
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
     if rate_limited(&state, &ip) {
         return ApiError::TooMany.into_response();
@@ -405,10 +429,12 @@ pub async fn put_photo(
     if !ctype.starts_with("image/") {
         return err(StatusCode::BAD_REQUEST, "not an image");
     }
+    let t_db = std::time::Instant::now();
     let slug = {
         let mut db = state.db.lock().unwrap();
         db.get_or_create_gallery(&key)
     };
+    tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
     let slug = match slug {
         Some(s) => s,
         None => return err(StatusCode::FORBIDDEN, "gallery banned"),
@@ -417,87 +443,129 @@ pub async fn put_photo(
     if !ALLOWED_EXTS.contains(&ext.as_str()) {
         return ApiError::UnsupportedType.into_response();
     }
-    let bytes = match axum::body::to_bytes(body, MAX_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            // axum rejects over-limit bodies; surface as 413.
-            let msg = e.to_string();
-            if msg.contains("length") || msg.contains("large") || msg.contains("limit") {
+    let t_body = std::time::Instant::now();
+    // Stream the body straight to the O_EXCL file: bounded RAM (one frame
+    // in flight), enforced MAX_BYTES cap, cleanup of partial files.
+    let mut stored = String::new();
+    let mut total: usize = 0;
+    let mut out: Option<tokio::fs::File> = None;
+    let mut stream = body.into_data_stream();
+    let mut over_limit = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => {
+                drop(out.take());
+                if !stored.is_empty() {
+                    let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
+                }
                 return ApiError::TooLarge.into_response();
             }
-            return ApiError::TooLarge.into_response();
+        };
+        if chunk.is_empty() {
+            continue;
         }
-    };
-    if bytes.is_empty() {
+        total += chunk.len();
+        if total > MAX_BYTES {
+            over_limit = true;
+            break;
+        }
+        if out.is_none() {
+            // First bytes: pick the final name now so a retry keeps O_EXCL.
+            let mut opened = false;
+            for _ in 0..2 {
+                let candidate = format!(
+                    "{}_{}_{}",
+                    slug,
+                    uuid::Uuid::new_v4().as_simple(),
+                    sanitized
+                );
+                let path = state.dir.join(&candidate);
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .await
+                {
+                    Ok(f) => {
+                        stored = candidate;
+                        out = Some(f);
+                        opened = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => {
+                        return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store");
+                    }
+                }
+            }
+            if !opened {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store");
+            }
+        }
+        if let Some(f) = out.as_mut() {
+            if f.write_all(&chunk).await.is_err() {
+                let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
+                return ApiError::Internal.into_response();
+            }
+        }
+    }
+    tracing::debug!(stage = "body_stream", bytes = total, latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0));
+    if over_limit {
+        if !stored.is_empty() {
+            let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
+        }
+        return ApiError::TooLarge.into_response();
+    }
+    if total == 0 {
+        if !stored.is_empty() {
+            let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
+        }
         return err(StatusCode::BAD_REQUEST, "empty body");
     }
-    // O_EXCL create: retry once on (astronomically unlikely) name collision.
-    let mut stored = String::new();
-    for _ in 0..2 {
-        let candidate = format!(
-            "{}_{}_{}",
-            slug,
-            uuid::Uuid::new_v4().as_simple(),
-            sanitized
-        );
-        let path = state.dir.join(&candidate);
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(mut f) => {
-                if f.write_all(&bytes).await.is_err() {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return ApiError::Internal.into_response();
-                }
-                stored = candidate;
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
-        }
-    }
-    if stored.is_empty() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store");
-    }
+    drop(out);
+    tracing::debug!(stage = "put_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+    state.invalidate_listing(&slug);
     (StatusCode::CREATED, Json(json!({ "name": stored, "slug": slug }))).into_response()
 }
-
 // --- photo serve / delete ---
 
 pub async fn get_photo(
     State(state): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
+    let t_total = std::time::Instant::now();
     if name.contains('/') || name.contains('\\') || name.starts_with('.') {
         return err(StatusCode::NOT_FOUND, "not found");
     }
+    let t_canon = std::time::Instant::now();
     let path = state.dir.join(&name);
-    // Contain within photos dir (no symlink escape).
-    let canon_base = state.dir.canonicalize().unwrap_or_else(|_| state.dir.clone());
+    // Contain within photos dir (no symlink escape); base canonicalized once.
     let canon_file = match path.canonicalize() {
         Ok(p) => p,
         Err(_) => return err(StatusCode::NOT_FOUND, "not found"),
     };
-    if !canon_file.starts_with(&canon_base) {
+    if !canon_file.starts_with(&state.canon_dir) {
         return err(StatusCode::NOT_FOUND, "not found");
     }
     let file = match tokio::fs::File::open(&canon_file).await {
         Ok(f) => f,
         Err(_) => return err(StatusCode::NOT_FOUND, "not found"),
     };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    tracing::debug!(stage = "serve_open", latency_ms = format!("{:.2}", t_canon.elapsed().as_secs_f64() * 1000.0));
     let ext = match name.rfind('.') {
         Some(i) if i > 0 => name[i..].to_lowercase(),
         _ => String::new(),
     };
     let ctype = content_type_for(ext.as_str()).to_string();
+    tracing::debug!(stage = "serve_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
     let stream = tokio_util::io::ReaderStream::new(file);
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, ctype),
+            (header::CONTENT_LENGTH, len.to_string()),
             (
                 header::HeaderName::from_static("x-content-type-options"),
                 "nosniff".to_string(),
@@ -541,14 +609,16 @@ pub async fn delete_photo(
         }
     }
     let path = state.dir.join(&name);
-    let canon_base = state.dir.canonicalize().unwrap_or_else(|_| state.dir.clone());
     if let Ok(canon) = path.canonicalize() {
-        if !canon.starts_with(&canon_base) {
+        if !canon.starts_with(&state.canon_dir) {
             return err(StatusCode::NOT_FOUND, "not found");
         }
     }
     match tokio::fs::remove_file(&path).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "deleted": name }))).into_response(),
+        Ok(()) => {
+            state.invalidate_listing(&slug);
+            (StatusCode::OK, Json(json!({ "deleted": name }))).into_response()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             err(StatusCode::NOT_FOUND, "not found")
         }

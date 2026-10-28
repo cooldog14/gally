@@ -17,12 +17,25 @@ pub fn rate_max() -> usize {
         .unwrap_or(RATE_MAX)
 }
 
+pub struct CachedListing {
+    pub photos: Vec<serde_json::Value>,
+}
+
 pub struct AppState {
     pub dir: PathBuf,
+    pub canon_dir: PathBuf,
     pub db: Mutex<rusqlite::Connection>,
     pub admin_tokens: Mutex<HashSet<String>>,
     pub rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str)>,
+    pub listings: Mutex<HashMap<String, CachedListing>>,
+}
+
+impl AppState {
+    /// Drop the cached listing for one gallery (after upload/delete).
+    pub fn invalidate_listing(&self, slug: &str) {
+        self.listings.lock().unwrap().remove(slug);
+    }
 }
 
 impl AppState {
@@ -77,11 +90,13 @@ impl AppState {
                 ),
             ]);
         Ok(Arc::new(AppState {
+            canon_dir: dir.canonicalize().unwrap_or_else(|_| dir.clone()),
             dir,
             db: Mutex::new(conn),
             admin_tokens: Mutex::new(HashSet::new()),
             rate: Mutex::new(HashMap::new()),
             statics,
+            listings: Mutex::new(HashMap::new()),
         }))
     }
 }
