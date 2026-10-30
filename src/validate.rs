@@ -148,21 +148,6 @@ pub fn hex(c: u8) -> Option<u8> {
     }
 }
 
-/// JSON string escape (for hand-built JSON payloads).
-pub fn escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
-}
-
 fn rand_below(n: u32) -> u32 {
     // Thread-safe: fresh OS randomness per draw (uuid v4).
     (uuid::Uuid::new_v4().as_u128() % (n as u128)) as u32
@@ -280,12 +265,5 @@ mod tests {
         .unwrap();
         let s = gen_slug(&db);
         assert!(is_slug(&s), "generated slug should validate: {s}");
-    }
-
-    #[test]
-    fn escape_json() {
-        assert_eq!(escape("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(escape("x\ny"), "x\\ny");
-        assert_eq!(escape("\u{1}"), "\\u0001");
-    }
+}
 }
