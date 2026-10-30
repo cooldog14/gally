@@ -14,11 +14,36 @@ use tokio::io::AsyncWriteExt;
 
 use crate::db::{key_hash, GalleryDb};
 use crate::state::{is_admin, rate_limited, AppState};
-use crate::validate::{is_slug, normalize_key, photo_slug, sanitize_filename};
+use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename};
 
-pub const MAX_BYTES: usize = 20 * 1024 * 1024;
+/// Max upload size. `GALLY_MAX_BYTES` overrides (default 10 GiB).
+pub fn max_bytes() -> usize {
+    std::env::var("GALLY_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10 * 1024 * 1024 * 1024)
+}
 
-static ALLOWED_EXTS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp"];
+/// OGG is a container: sniff the first content packet for the codec.
+/// Returns a video or audio MIME, or None when it's not OGG / unknown.
+async fn sniff_ogg(path: &std::path::Path) -> Option<&'static str> {
+    let mut buf = [0u8; 128];
+    let mut f = tokio::fs::File::open(path).await.ok()?;
+    use tokio::io::AsyncReadExt;
+    let n = f.read(&mut buf).await.ok()?;
+    if n < 8 || &buf[..4] != b"OggS" {
+        return None;
+    }
+    let head = &buf[..n];
+    let has = |tag: &[u8]| head.windows(tag.len()).any(|w| w == tag);
+    if has(b"theora") || has(b"dirac") || has(b"VP8") || has(b"VP9") || has(b"AV1") {
+        return Some("video/ogg");
+    }
+    if has(b"vorbis") || has(b"OpusHead") || has(b"FLAC") || has(b"Speex") {
+        return Some("audio/ogg");
+    }
+    None
+}
 
 fn content_type_for(ext: &str) -> &'static str {
     match ext {
@@ -26,18 +51,32 @@ fn content_type_for(ext: &str) -> &'static str {
         ".png" => "image/png",
         ".gif" => "image/gif",
         ".webp" => "image/webp",
+        ".avif" => "image/avif",
+        ".bmp" => "image/bmp",
+        ".svg" => "image/svg+xml",
+        ".ico" => "image/vnd.microsoft.icon",
+        ".heic" | ".heif" => "image/heic",
+        ".mp4" => "video/mp4",
+        ".webm" => "video/webm",
+        ".mov" => "video/quicktime",
+        ".ogv" => "video/ogg",
+        ".mp3" => "audio/mpeg",
+        ".wav" => "audio/wav",
+        ".ogg" => "audio/ogg",
+        ".flac" => "audio/flac",
+        ".m4a" => "audio/mp4",
+        ".pdf" => "application/pdf",
+        ".txt" => "text/plain",
+        ".json" => "application/json",
+        ".md" => "text/markdown",
         _ => "application/octet-stream",
     }
 }
 
 #[derive(Debug)]
 pub enum ApiError {
-    BadRequest,
     Unauthorized,
-    Forbidden,
-    NotFound,
     TooLarge,
-    UnsupportedType,
     TooMany,
     Internal,
 }
@@ -45,14 +84,8 @@ pub enum ApiError {
 impl ApiError {
     fn status_and_msg(&self) -> (StatusCode, &'static str) {
         match self {
-            ApiError::BadRequest => (StatusCode::BAD_REQUEST, "bad request"),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "gallery key required"),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found"),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "file too large"),
-            ApiError::UnsupportedType => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported type")
-            }
             ApiError::TooMany => (StatusCode::TOO_MANY_REQUESTS, "too many uploads"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
@@ -70,16 +103,9 @@ fn err(status: StatusCode, msg: &'static str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
-fn client_ip(headers: &HeaderMap, info: Option<ConnectInfo<std::net::SocketAddr>>) -> IpAddr {
-    if let Some(fwd) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-    {
-        if let Ok(ip) = fwd.trim().parse::<IpAddr>() {
-            return ip;
-        }
-    }
+fn client_ip(_headers: &HeaderMap, info: Option<ConnectInfo<std::net::SocketAddr>>) -> IpAddr {
+    // Never trust X-Forwarded-For: any client can spoof it and dodge the
+    // rate limit. Only the real connection address counts.
     info.map(|c| c.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
 
@@ -90,23 +116,91 @@ fn request_key(headers: &HeaderMap) -> Option<String> {
         .and_then(normalize_key)
 }
 
+/// Target gallery for uploads. Absent on home (= mint a fresh gallery).
+fn request_slug(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-gallery-slug")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| is_slug(s))
+        .map(|s| s.to_string())
+}
+
+/// Viewer password from header or query. Empty when absent.
+fn request_pass(headers: &HeaderMap, query: &str) -> String {
+    if let Some(p) = headers.get("x-gallery-pass").and_then(|v| v.to_str().ok()) {
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    for part in query.split('&') {
+        let (k, v) = match part.split_once('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        if k == "pass" {
+            return percent_decode(v);
+        }
+    }
+    String::new()
+}
+
+/// Slow Argon2 work runs on the blocking pool: never stall the runtime.
+/// `None` = open (public gallery or correct password / owner bypass).
+/// `Some(response)` = locked, return it directly.
+async fn check_locked(state: &AppState, slug: &str, pass: &str) -> Option<Response> {
+    let stored = {
+        let db = state.db.lock().unwrap();
+        db.gallery_pass_hash(slug)
+    };
+    let hash = match stored {
+        None => return None,
+        Some(h) => h,
+    };
+    // The gallery key always opens its own gallery (owner bypass).
+    if !pass.is_empty() {
+        let pass = pass.to_string();
+        let ok = tokio::task::spawn_blocking(move || crate::db::verify_password(&pass, &hash))
+            .await
+            .unwrap_or(false);
+        if ok {
+            return None;
+        }
+    }
+    Some((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "gallery locked", "locked": true })),
+    )
+        .into_response())
+}
+
+/// True when gallery creation is allowed: no invite configured, or the
+/// request carries the invite code (constant-time compare).
+fn invite_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    let guard = state.invite.lock().unwrap();
+    let Some(expected) = guard.as_deref() else {
+        return true;
+    };
+    let got = headers
+        .get("x-invite-code")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    use subtle::ConstantTimeEq;
+    got.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+}
+
 // --- gallery photo listing ---
 
 pub async fn gallery_photos(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxumPath(slug): AxumPath<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let t_total = std::time::Instant::now();
     if !is_slug(&slug) {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    // Cached fast path: skip DB + directory scan.
-    if let Some(cached) = state.listings.lock().unwrap().get(&slug) {
-        let photos = cached.photos.clone();
-        tracing::debug!(stage = "list_cached", count = photos.len(), latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
-        return (StatusCode::OK, Json(json!({ "slug": slug, "photos": photos })))
-            .into_response();
-    }
+    // No cache: plain scan is fast and never goes stale under concurrent upload.
     let t_db = std::time::Instant::now();
     let exists = {
         let db = state.db.lock().unwrap();
@@ -116,16 +210,27 @@ pub async fn gallery_photos(
     if !exists {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
+    // Viewer lock: owner key bypasses, otherwise require the gallery password.
+    let key_ok = request_key(&headers)
+        .map(|k| {
+            let db = state.db.lock().unwrap();
+            // Scoped: the key must own THIS slug, not just any gallery.
+            db.key_owns_slug(&k, &slug)
+        })
+        .unwrap_or(false);
+    if !key_ok {
+        let query = raw.unwrap_or_default();
+        let pass = request_pass(&headers, &query);
+        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+            return deny;
+        }
+    }
     let t_scan = std::time::Instant::now();
     let result = photo_entries(&state, &slug).await;
     tracing::debug!(stage = "list_dir_scan", latency_ms = format!("{:.2}", t_scan.elapsed().as_secs_f64() * 1000.0));
     match result {
         Ok(photos) => {
             let count = photos.len();
-            state.listings.lock().unwrap().insert(
-                slug.clone(),
-                crate::state::CachedListing { photos: photos.clone() },
-            );
             tracing::debug!(stage = "list_total", count = count, latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
             (StatusCode::OK, Json(json!({ "slug": slug, "photos": photos })))
                 .into_response()
@@ -262,28 +367,54 @@ pub async fn admin_unlock(
 struct ResolveBody {
     #[serde(default)]
     key: String,
+    #[serde(default)]
+    slug: String,
 }
 
+/// Home (no slug): always mint a fresh gallery — same key, new gallery.
+/// Gallery page (slug given): verify the key owns that slug.
 pub async fn resolve_gallery(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     let mut key = request_key(&headers);
+    let mut slug_param: Option<String> = None;
     if key.is_none() {
         let bytes = match axum::body::to_bytes(body, 8192).await {
             Ok(b) => b,
             Err(_) => return ApiError::Unauthorized.into_response(),
         };
-        key = serde_json::from_slice::<ResolveBody>(&bytes)
-            .ok()
-            .and_then(|b| normalize_key(&b.key));
+        let parsed: Option<ResolveBody> = serde_json::from_slice(&bytes).ok();
+        key = parsed.as_ref().and_then(|b| normalize_key(&b.key));
+        slug_param = parsed.and_then(|b| {
+            let s = b.slug.trim().to_string();
+            if is_slug(&s) { Some(s) } else { None }
+        });
     }
     let key = match key {
         Some(k) => k,
         None => return ApiError::Unauthorized.into_response(),
     };
+    if let Some(t) = slug_param {
+        let ok = {
+            let db = state.db.lock().unwrap();
+            db.gallery_exists(&t) && db.key_owns_slug(&key, &t)
+        };
+        return match ok {
+            true => (StatusCode::OK, Json(json!({ "slug": t }))).into_response(),
+            false => err(StatusCode::FORBIDDEN, "forbidden"),
+        };
+    }
     let slug = {
+        let db = state.db.lock().unwrap();
+        if db.is_banned(&key_hash(&key)) {
+            return err(StatusCode::FORBIDDEN, "gallery banned");
+        }
+        if !invite_ok(&state, &headers) {
+            return err(StatusCode::FORBIDDEN, "invite required");
+        }
+        drop(db);
         let mut db = state.db.lock().unwrap();
         db.get_or_create_gallery(&key)
     };
@@ -295,11 +426,37 @@ pub async fn resolve_gallery(
 
 // --- statics + SPA fallback ---
 
+static ADMIN_HTML: &[u8] = include_bytes!("../admin.html");
+
+pub async fn admin_page() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html")],
+        ADMIN_HTML.to_vec(),
+    )
+        .into_response()
+}
+
+pub async fn admin_page_redirect() -> Response {
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(header::LOCATION, "/gally/admin/")],
+        "",
+    )
+        .into_response()
+}
+
 pub async fn static_path(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Response {
     match state.statics.get(uri.path()) {
         Some((bytes, ctype)) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, *ctype)],
+            [
+                (header::CONTENT_TYPE, *ctype),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
             bytes.to_vec(),
         )
             .into_response(),
@@ -311,15 +468,22 @@ pub async fn spa_or_404(
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
 ) -> Response {
-    if slug.contains('/') || !is_slug(&slug) {
+    if slug.contains('/') || slug == "gally" {
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    let exists = {
+    let known = is_slug(&slug) && {
         let db = state.db.lock().unwrap();
         db.gallery_exists(&slug)
     };
-    if !exists {
-        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    if !known {
+        // Unknown, deleted, or legacy slug: send the user home.
+        tracing::debug!(stage = "spa_gone", slug = slug.as_str());
+        return (
+            StatusCode::FOUND,
+            [(header::LOCATION, "/")],
+            "",
+        )
+            .into_response();
     }
     match state.statics.get("/index.html") {
         Some((bytes, ctype)) => (
@@ -363,8 +527,64 @@ pub async fn delete_gallery(
             }
         }
     }
-    state.invalidate_listing(&slug);
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct LockBody {
+    #[serde(default)]
+    password: String,
+}
+
+/// Set (non-empty password) or clear (empty/missing) the gallery viewer lock.
+/// Requires the gallery key. Passwords are Argon2id-hashed, never stored raw.
+pub async fn lock_gallery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+    body: Body,
+) -> Response {
+    if !is_slug(&slug) {
+        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    let key = match request_key(&headers) {
+        Some(k) => k,
+        None => return ApiError::Unauthorized.into_response(),
+    };
+    let known = {
+        let db = state.db.lock().unwrap();
+        db.key_owns_slug(&key, slug.as_str())
+    };
+    if !known {
+        return err(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let bytes = match axum::body::to_bytes(body, 8192).await {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "bad request"),
+    };
+    let password: String = serde_json::from_slice::<LockBody>(&bytes)
+        .map(|b| b.password)
+        .unwrap_or_default();
+    let hash = if password.is_empty() {
+        None
+    } else {
+        // Argon2 is slow by design: hash off the async runtime.
+        let h = tokio::task::spawn_blocking(move || crate::db::hash_password(&password))
+            .await
+            .unwrap_or_default();
+        if h.is_empty() {
+            return ApiError::Internal.into_response();
+        }
+        Some(h)
+    };
+    let ok = {
+        let mut db = state.db.lock().unwrap();
+        db.set_gallery_pass(&slug, hash.as_deref())
+    };
+    if !ok {
+        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    (StatusCode::OK, Json(json!({ "slug": slug, "locked": hash.is_some() }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -421,28 +641,40 @@ pub async fn put_photo(
         Some(k) => k,
         None => return ApiError::Unauthorized.into_response(),
     };
-    let ctype = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !ctype.starts_with("image/") {
-        return err(StatusCode::BAD_REQUEST, "not an image");
-    }
     let t_db = std::time::Instant::now();
+    let target = request_slug(&headers);
     let slug = {
-        let mut db = state.db.lock().unwrap();
-        db.get_or_create_gallery(&key)
+        let db = state.db.lock().unwrap();
+        match (&target, &key) {
+            // Gallery page: key must own this slug. Same password on two
+            // galleries stays two galleries.
+            (Some(t), k) if db.gallery_exists(t) => {
+                if !db.key_owns_slug(k, t) {
+                    return err(StatusCode::FORBIDDEN, "forbidden");
+                }
+                Some(t.clone())
+            }
+            (Some(_), _) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
+            // Home: always mint a fresh gallery, never reuse.
+            (None, k) => {
+                if db.is_banned(&key_hash(k)) {
+                    return err(StatusCode::FORBIDDEN, "gallery banned");
+                }
+                if !invite_ok(&state, &headers) {
+                    return err(StatusCode::FORBIDDEN, "invite required");
+                }
+                drop(db);
+                let mut db = state.db.lock().unwrap();
+                db.get_or_create_gallery(k)
+            }
+        }
     };
     tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
     let slug = match slug {
         Some(s) => s,
         None => return err(StatusCode::FORBIDDEN, "gallery banned"),
     };
-    let (sanitized, ext) = sanitize_filename(&raw_name);
-    if !ALLOWED_EXTS.contains(&ext.as_str()) {
-        return ApiError::UnsupportedType.into_response();
-    }
+    let (sanitized, _ext) = sanitize_filename(&raw_name);
     let t_body = std::time::Instant::now();
     // Stream the body straight to the O_EXCL file: bounded RAM (one frame
     // in flight), enforced MAX_BYTES cap, cleanup of partial files.
@@ -466,7 +698,7 @@ pub async fn put_photo(
             continue;
         }
         total += chunk.len();
-        if total > MAX_BYTES {
+        if total > max_bytes() {
             over_limit = true;
             break;
         }
@@ -525,18 +757,35 @@ pub async fn put_photo(
     }
     drop(out);
     tracing::debug!(stage = "put_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
-    state.invalidate_listing(&slug);
     (StatusCode::CREATED, Json(json!({ "name": stored, "slug": slug }))).into_response()
 }
 // --- photo serve / delete ---
 
 pub async fn get_photo(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let t_total = std::time::Instant::now();
     if name.contains('/') || name.contains('\\') || name.starts_with('.') {
         return err(StatusCode::NOT_FOUND, "not found");
+    }
+    // Viewer lock applies per-file too (direct /photos/ links).
+    if let Some(slug) = photo_slug(&name) {
+        let key_ok = request_key(&headers)
+            .map(|k| {
+                let db = state.db.lock().unwrap();
+                db.key_owns_slug(&k, slug)
+            })
+            .unwrap_or(false);
+        if !key_ok {
+            let query = raw.unwrap_or_default();
+            let pass = request_pass(&headers, &query);
+            if let Some(deny) = check_locked(&state, slug, &pass).await {
+                return deny;
+            }
+        }
     }
     let t_canon = std::time::Instant::now();
     let path = state.dir.join(&name);
@@ -558,14 +807,20 @@ pub async fn get_photo(
         Some(i) if i > 0 => name[i..].to_lowercase(),
         _ => String::new(),
     };
-    let ctype = content_type_for(ext.as_str()).to_string();
+    // .ogg is ambiguous (Theora video vs Vorbis/Opus audio): sniff content.
+    let ctype = if ext == ".ogg" || ext == ".ogv" || ext == ".ogm" || ext == ".opus" {
+        sniff_ogg(&canon_file).await.unwrap_or_else(|| content_type_for(ext.as_str()))
+    } else {
+        content_type_for(ext.as_str())
+    }
+    .to_string();
     tracing::debug!(stage = "serve_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
     let stream = tokio_util::io::ReaderStream::new(file);
     (
-        StatusCode::OK,
         [
             (header::CONTENT_TYPE, ctype),
             (header::CONTENT_LENGTH, len.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
             (
                 header::HeaderName::from_static("x-content-type-options"),
                 "nosniff".to_string(),
@@ -600,7 +855,7 @@ pub async fn delete_photo(
         let ok = match key {
             Some(k) => {
                 let db = state.db.lock().unwrap();
-                db.lookup_gallery(&k).as_deref() == Some(slug.as_str())
+                db.key_owns_slug(&k, slug.as_str())
             }
             None => false,
         };
@@ -615,10 +870,9 @@ pub async fn delete_photo(
         }
     }
     match tokio::fs::remove_file(&path).await {
-        Ok(()) => {
-            state.invalidate_listing(&slug);
-            (StatusCode::OK, Json(json!({ "deleted": name }))).into_response()
-        }
+        // Keep the gallery row: a concurrent upload landing between a file
+        // count and a row delete orphaned files under a dead slug.
+        Ok(()) => (StatusCode::OK, Json(json!({ "deleted": name, "gallery_gone": false }))).into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             err(StatusCode::NOT_FOUND, "not found")
         }
