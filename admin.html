@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; }
+input, button { font: inherit; padding: 6px 10px; }
+#error { color: #b91c1c; min-height: 1.2em; }
+ul { list-style: none; padding: 0; }
+li { padding: 6px 0; border-bottom: 1px solid #e5e5e5; }
+li a { margin-right: 12px; }
+li button { margin-left: 12px; }
+#panel[hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>Admin</h1>
+<div id="login">
+  <input type="password" id="password" placeholder="Admin password" autocomplete="off">
+  <button id="unlock" type="button">Unlock</button>
+  <p id="error" role="alert"></p>
+</div>
+<div id="panel" hidden>
+  <h2>Galleries</h2>
+  <ul id="galleries"></ul>
+</div>
+<script>
+"use strict";
+const password = document.getElementById("password");
+const unlockBtn = document.getElementById("unlock");
+const errorEl = document.getElementById("error");
+const panel = document.getElementById("panel");
+const list = document.getElementById("galleries");
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function load() {
+  const data = await api("/api/admin/galleries");
+  list.textContent = "";
+  for (const g of data.galleries || []) {
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = "/" + g.slug;
+    a.textContent = g.slug + " (" + g.photos + ")";
+    const del = document.createElement("button");
+    del.textContent = "Delete + ban";
+    del.addEventListener("click", async () => {
+      if (!confirm("Delete " + g.slug + " and ban its key?")) return;
+      try {
+        await api("/api/admin/galleries/" + g.slug + "/delete", { method: "POST" });
+        await load();
+      } catch (e) { errorEl.textContent = e.message; }
+    });
+    li.append(a, del);
+    list.appendChild(li);
+  }
+}
+
+unlockBtn.addEventListener("click", async () => {
+  errorEl.textContent = "";
+  try {
+    await api("/api/admin/unlock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password.value }),
+    });
+    document.getElementById("login").hidden = true;
+    panel.hidden = false;
+    await load();
+  } catch (e) { errorEl.textContent = e.message; }
+});
+</script>
+</body>
+</html>

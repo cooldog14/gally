@@ -6,6 +6,9 @@ photos/*
 __pycache__/
 .pytest_cache/
 *.log
+LOCAL.md
+todo.md
+note.md
 
 # Added by cargo
 
