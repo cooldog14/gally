@@ -97,17 +97,31 @@ async fn concurrent_uploads_same_key() {
     let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0")]);
     let client = client();
     let body = vec![0xABu8; 200_000];
+    // Mint one gallery first; writers target it via slug header (scoped auth).
+    let slug: String = client
+        .post(srv.url("/api/galleries/resolve"))
+        .json(&serde_json::json!({"key": "stresskey-001"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["slug"]
+        .as_str()
+        .unwrap()
+        .into();
     let t0 = Instant::now();
     let mut handles = vec![];
     for t in 0..32usize {
-        let (c, b) = (client.clone(), body.clone());
+        let (c, b, s) = (client.clone(), body.clone(), slug.clone());
         let url = srv.url("/api/photos/");
         handles.push(tokio::spawn(async move {
             let mut ok = 0;
             for i in 0..25 {
                 let r = c
                     .put(format!("{url}t{t}-{i}.jpg"))
-                    .header("X-Gallery-Key", "stresskey1")
+                    .header("X-Gallery-Key", "stresskey-001")
+                    .header("X-Gallery-Slug", s.clone())
                     .header("Content-Type", "image/jpeg")
                     .body(b.clone())
                     .send()
@@ -126,19 +140,7 @@ async fn concurrent_uploads_same_key() {
     let el = t0.elapsed();
     println!("800 PUTs (200KB) in {el:.1?} = {:.0}/s", 800.0 / el.as_secs_f64());
     assert_eq!(total, 800);
-    // listing must contain all 800
-    let slug: String = client
-        .post(srv.url("/api/galleries/resolve"))
-        .json(&serde_json::json!({"key": "stresskey1"}))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap()["slug"]
-        .as_str()
-        .unwrap()
-        .into();
+    // listing must contain all 800 (slug minted up front)
     let list: serde_json::Value = client
         .get(srv.url(&format!("/api/galleries/{slug}/photos")))
         .send()
@@ -151,11 +153,91 @@ async fn concurrent_uploads_same_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_uploads_with_listings_stay_correct() {
+    // Pins no-stale-listing under concurrent writes: N uploads race with
+    // continuous listings, then the final listing must contain exactly N.
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 25;
+    const N: usize = WRITERS * PER_WRITER;
+    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0")]);
+    let client = client();
+    let body = vec![0x5Au8; 20_000];
+    let url = srv.url("/api/photos/");
+    // Mint one gallery up front; writers + readers share it via header.
+    let slug: String = client
+        .post(srv.url("/api/galleries/resolve"))
+        .json(&serde_json::json!({"key": "racekey-0001"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["slug"]
+        .as_str()
+        .unwrap()
+        .into();
+    let mut handles = vec![];
+    for t in 0..WRITERS {
+        let (c, b, u, s) = (client.clone(), body.clone(), url.clone(), slug.clone());
+        handles.push(tokio::spawn(async move {
+            for i in 0..PER_WRITER {
+                let r = c
+                    .put(format!("{u}race{t}-{i}.jpg"))
+                    .header("X-Gallery-Key", "racekey-0001")
+                    .header("X-Gallery-Slug", s.clone())
+                    .header("Content-Type", "image/jpeg")
+                    .body(b.clone())
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    // Readers hammer the listing while uploads land; every read must be 200
+    // with a well-formed body (never an error, never a malformed payload).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = vec![];
+    for _ in 0..4 {
+        let (c, u, s) = (client.clone(), srv.url(&format!("/api/galleries/{slug}/photos")), stop.clone());
+        readers.push(tokio::spawn(async move {
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                let r = c.get(&u).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                assert!(r.json::<serde_json::Value>().await.unwrap()["photos"].is_array());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        r.await.unwrap();
+    }
+    // Quiesced: final listing contains exactly N photos, no more, no fewer.
+    let list: serde_json::Value = client
+        .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let photos = list["photos"].as_array().unwrap();
+    assert_eq!(photos.len(), N, "final listing must contain exactly all uploads");
+    let mut names: Vec<&str> = photos.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), N, "no duplicate or missing names");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_downloads_one_file() {
     let srv = Server::boot(None);
     let client = client();
     let body = vec![0xCDu8; 1_000_000];
-    let r = put(&client, &srv, "dlkey1", "big.jpg", &body).await;
+    let r = put(&client, &srv, "dlkey-000001", "big.jpg", &body).await;
     assert_eq!(r.status(), StatusCode::CREATED);
     let name: String = r.json::<serde_json::Value>().await.unwrap()["name"].as_str().unwrap().into();
     let t0 = Instant::now();
@@ -195,15 +277,28 @@ async fn mixed_read_write_churn() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
-    // writers
+    // writers target one pre-minted gallery (scoped auth); deleter shares it.
+    let churn_slug: String = client
+        .post(srv.url("/api/galleries/resolve"))
+        .json(&serde_json::json!({"key": "churnkey-0001"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["slug"]
+        .as_str()
+        .unwrap()
+        .into();
     let mut handles = vec![];
     for t in 0..8usize {
-        let (c, u) = (client.clone(), srv.url("/api/photos/"));
+        let (c, u, s) = (client.clone(), srv.url("/api/photos/"), churn_slug.clone());
         handles.push(tokio::spawn(async move {
             for i in 0..20 {
                 let r = c
                     .put(format!("{u}w{t}-{i}.png"))
-                    .header("X-Gallery-Key", "churnkey")
+                    .header("X-Gallery-Key", "churnkey-0001")
+                    .header("X-Gallery-Slug", s.clone())
                     .header("Content-Type", "image/png")
                     .body(vec![7u8; 50_000])
                     .send()
@@ -225,25 +320,12 @@ async fn mixed_read_write_churn() {
     }
     // deleter removes what writers create (best effort; 404 ok)
     {
-        let (c, ck) = (client.clone(), cookie.clone());
-        let list_url = srv.url("/api/galleries/resolve");
+        let (c, ck, s) = (client.clone(), cookie.clone(), churn_slug.clone());
         handles.push(tokio::spawn(async move {
             for _ in 0..20 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let slug: String = c
-                    .post(&list_url)
-                    .json(&serde_json::json!({"key": "churnkey"}))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json::<serde_json::Value>()
-                    .await
-                    .unwrap()["slug"]
-                    .as_str()
-                    .unwrap()
-                    .into();
                 let l: serde_json::Value = c
-                    .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+                    .get(srv.url(&format!("/api/galleries/{s}/photos")))
                     .send()
                     .await
                     .unwrap()
@@ -272,42 +354,46 @@ async fn mixed_read_write_churn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edge_cases() {
-    let srv = Server::boot(None);
+    let srv = Server::boot_with_env(None, &[("GALLY_MAX_BYTES", "32")]);
     let client = client();
     // empty body
     let r = client
         .put(srv.url("/api/photos/e.jpg"))
-        .header("X-Gallery-Key", "edgekey1")
+        .header("X-Gallery-Key", "edgekey-0001")
         .header("Content-Type", "image/jpeg")
         .body(vec![])
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    // 21 MiB over cap → 413
+    // 33 bytes over the 32-byte test cap → 413
     let r = client
         .put(srv.url("/api/photos/big.jpg"))
-        .header("X-Gallery-Key", "edgekey1")
+        .header("X-Gallery-Key", "edgekey-0001")
         .header("Content-Type", "image/jpeg")
-        .body(vec![0u8; 21 * 1024 * 1024])
+        .body(vec![0u8; 33])
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE, "got {}", r.status());
-    // dotfile + traversal
+    // dotfile + traversal: rejected, never serves files (404, redirect home,
+    // or the landing page after a redirect is followed — all without content)
     for p in ["/photos/.hidden", "/photos/a%2Fb", "/photos/%2e%2e/server.py"] {
         let r = client.get(srv.url(p)).send().await.unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{p}");
+        let body = r.bytes().await.unwrap();
+        let needle = b"fn put_photo";
+        assert!(!body.windows(needle.len()).any(|w| w == needle), "{p}");
+        assert!(body.len() < 1024 * 1024, "{p}");
     }
     // unknown gallery slug shape vs missing
-    let r = client.get(srv.url("/api/galleries/nope-1/photos")).send().await.unwrap();
+    let r = client.get(srv.url("/api/galleries/nope-slug-calm-1a2b/photos")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
-    let r = client.get(srv.url("/no-such-gallery-1")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let r = client.get(srv.url("/no-such-gallery-calm-1a2b")).send().await.unwrap();
+    assert_eq!(r.url().path(), "/");
     // delete nonexistent
     let r = client
-        .delete(srv.url("/api/photos/ghost-x_00000000000000000000000000000000_y.jpg"))
-        .header("X-Gallery-Key", "edgekey1")
+        .delete(srv.url("/api/photos/ghost-calm-otter-1a2b_00000000000000000000000000000000_y.jpg"))
+        .header("X-Gallery-Key", "edgekey-0001")
         .send()
         .await
         .unwrap();
@@ -339,7 +425,7 @@ async fn large_directory_degradation() {
         tokio::fs::write(dir.join(format!("seed_{i:05}.jpg")), [1u8; 100]).await.unwrap();
     }
     let t0 = std::time::Instant::now();
-    let r = put(&client, &srv, "bigdir1", "one.jpg", &[2u8; 1000]).await;
+    let r = put(&client, &srv, "bigdir-000001", "one.jpg", &[2u8; 1000]).await;
     assert_eq!(r.status(), StatusCode::CREATED);
     let slug: String = r.json::<serde_json::Value>().await.unwrap()["slug"].as_str().unwrap().into();
     // listing with 2001 files must still respond quickly (<2s) and contain ours
