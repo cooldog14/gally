@@ -30,7 +30,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/galleries/{slug}/photos", get(gallery_photos))
         .route("/api/admin/galleries", get(admin_galleries))
         .route("/api/admin/banned", get(admin_banned))
-        .route("/api/me", get(api_me))
         .route("/api/photos/{*name}", put(put_photo))
         .route("/api/photos/{*name}", delete(delete_photo))
         .route("/photos/{*name}", get(get_photo))

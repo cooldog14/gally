@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::db::{self, GalleryDb};
 
@@ -23,7 +23,7 @@ pub struct AppState {
     pub dir: PathBuf,
     pub canon_dir: PathBuf,
     pub db: Mutex<rusqlite::Connection>,
-    pub admin_tokens: Mutex<HashSet<String>>,
+    pub admin_tokens: Mutex<HashMap<String, Instant>>,
     pub rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str)>,
     /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
@@ -94,7 +94,7 @@ impl AppState {
             canon_dir: dir.canonicalize().unwrap_or_else(|_| dir.clone()),
             dir,
             db: Mutex::new(conn),
-            admin_tokens: Mutex::new(HashSet::new()),
+            admin_tokens: Mutex::new(HashMap::new()),
             rate: Mutex::new(HashMap::new()),
             statics,
             invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
@@ -127,6 +127,9 @@ pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
     false
 }
 
+/// Admin tokens live 24h from issue; expired ones are dropped on sight.
+pub const ADMIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
+
 /// True when the request carries a live `admin=` cookie value.
 pub fn is_admin(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
     let raw = match headers
@@ -141,7 +144,17 @@ pub fn is_admin(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
         .map(str::trim)
         .find_map(|p| p.strip_prefix("admin="));
     match tok {
-        Some(t) => state.admin_tokens.lock().unwrap().contains(t),
+        Some(t) => {
+            let mut tokens = state.admin_tokens.lock().unwrap();
+            match tokens.get(t) {
+                Some(issued) if issued.elapsed() < ADMIN_TOKEN_TTL => true,
+                // Expired (or just removed): drop it so the map never grows.
+                _ => {
+                    tokens.remove(t);
+                    false
+                }
+            }
+        }
         None => false,
     }
 }

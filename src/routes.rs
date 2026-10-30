@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
-use crate::db::{key_hash, GalleryDb};
+use crate::db::{key_hash, GalleryDb, MintError};
 use crate::state::{is_admin, rate_limited, AppState};
 use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename};
 
@@ -319,10 +319,6 @@ pub async fn admin_banned(State(state): State<Arc<AppState>>, headers: HeaderMap
     (StatusCode::OK, Json(json!({ "banned": banned }))).into_response()
 }
 
-pub async fn api_me() -> Response {
-    err(StatusCode::UNAUTHORIZED, "unauthorized")
-}
-
 #[derive(Deserialize)]
 struct UnlockBody {
     #[serde(default)]
@@ -331,17 +327,21 @@ struct UnlockBody {
 
 pub async fn admin_unlock(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let _ = headers;
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    if rate_limited(&state, &ip) {
+        return ApiError::TooMany.into_response();
+    }
     let admin_pass = std::env::var("ADMIN_PASS").unwrap_or_default();
     if admin_pass.is_empty() {
         return err(StatusCode::NOT_FOUND, "not found");
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::FORBIDDEN, "forbidden"),
+        Err(_) => return ApiError::TooLarge.into_response(),
     };
     let guess: String = serde_json::from_slice::<UnlockBody>(&bytes)
         .map(|b| b.password)
@@ -353,8 +353,15 @@ pub async fn admin_unlock(
     }
     let tok = uuid::Uuid::new_v4().as_simple().to_string()
         + &uuid::Uuid::new_v4().as_simple().to_string();
-    state.admin_tokens.lock().unwrap().insert(tok.clone());
-    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/");
+    {
+        // Fresh login also sweeps expired tokens so the map never grows.
+        let mut tokens = state.admin_tokens.lock().unwrap();
+        tokens.retain(|_, issued| issued.elapsed() < crate::state::ADMIN_TOKEN_TTL);
+        tokens.insert(tok.clone(), std::time::Instant::now());
+    }
+    // No `Secure`: the server is plain HTTP, so browsers would refuse to
+    // store (and never return) a Secure cookie, silently breaking login.
+    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400");
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
@@ -375,15 +382,20 @@ struct ResolveBody {
 /// Gallery page (slug given): verify the key owns that slug.
 pub async fn resolve_gallery(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    if rate_limited(&state, &ip) {
+        return ApiError::TooMany.into_response();
+    }
     let mut key = request_key(&headers);
     let mut slug_param: Option<String> = None;
     if key.is_none() {
         let bytes = match axum::body::to_bytes(body, 8192).await {
             Ok(b) => b,
-            Err(_) => return ApiError::Unauthorized.into_response(),
+            Err(_) => return ApiError::TooLarge.into_response(),
         };
         let parsed: Option<ResolveBody> = serde_json::from_slice(&bytes).ok();
         key = parsed.as_ref().and_then(|b| normalize_key(&b.key));
@@ -419,8 +431,9 @@ pub async fn resolve_gallery(
         db.get_or_create_gallery(&key)
     };
     match slug {
-        Some(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
-        None => err(StatusCode::FORBIDDEN, "gallery banned"),
+        Ok(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
+        Err(MintError::Banned) => err(StatusCode::FORBIDDEN, "gallery banned"),
+        Err(MintError::Db) => ApiError::Internal.into_response(),
     }
 }
 
@@ -516,6 +529,7 @@ pub async fn delete_gallery(
     }
     let prefix = format!("{slug}_");
     let mut removed: usize = 0;
+    let mut failed: usize = 0;
     if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
         while let Ok(Some(ent)) = rd.next_entry().await {
             let name = ent.file_name().to_string_lossy().into_owned();
@@ -524,8 +538,28 @@ pub async fn delete_gallery(
             }
             if tokio::fs::remove_file(ent.path()).await.is_ok() {
                 removed += 1;
+            } else {
+                failed += 1;
             }
         }
+    }
+    // A concurrent upload may land mid-sweep: re-scan, never claim success
+    // while files remain.
+    let mut remaining = false;
+    if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            if ent.file_name().to_string_lossy().starts_with(&prefix) {
+                remaining = true;
+                break;
+            }
+        }
+    }
+    if failed > 0 || remaining {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "deleted": slug, "files": removed, "error": "partial delete" })),
+        )
+            .into_response();
     }
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
 }
@@ -560,11 +594,15 @@ pub async fn lock_gallery(
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
+        // Oversize and stream errors both surface here; oversize is the
+        // only realistic cause, so report 413 (ApiError::TooLarge).
+        Err(_) => return ApiError::TooLarge.into_response(),
+    };
+    // Malformed JSON never silently clears the lock: reject it.
+    let password: String = match serde_json::from_slice::<LockBody>(&bytes) {
+        Ok(b) => b.password,
         Err(_) => return err(StatusCode::BAD_REQUEST, "bad request"),
     };
-    let password: String = serde_json::from_slice::<LockBody>(&bytes)
-        .map(|b| b.password)
-        .unwrap_or_default();
     let hash = if password.is_empty() {
         None
     } else {
@@ -603,7 +641,7 @@ pub async fn admin_unban(
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::BAD_REQUEST, "gallery key required"),
+        Err(_) => return ApiError::TooLarge.into_response(),
     };
     let key = serde_json::from_slice::<UnbanBody>(&bytes)
         .ok()
@@ -647,14 +685,19 @@ pub async fn put_photo(
         let db = state.db.lock().unwrap();
         match (&target, &key) {
             // Gallery page: key must own this slug. Same password on two
-            // galleries stays two galleries.
-            (Some(t), k) if db.gallery_exists(t) => {
+            // galleries stays two galleries. Banned keys stay banned.
+            (Some(t), k) => {
+                if db.is_banned(&key_hash(k)) {
+                    return err(StatusCode::FORBIDDEN, "gallery banned");
+                }
+                if !db.gallery_exists(t) {
+                    return err(StatusCode::NOT_FOUND, "unknown gallery");
+                }
                 if !db.key_owns_slug(k, t) {
                     return err(StatusCode::FORBIDDEN, "forbidden");
                 }
-                Some(t.clone())
+                t.clone()
             }
-            (Some(_), _) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
             // Home: always mint a fresh gallery, never reuse.
             (None, k) => {
                 if db.is_banned(&key_hash(k)) {
@@ -665,15 +708,17 @@ pub async fn put_photo(
                 }
                 drop(db);
                 let mut db = state.db.lock().unwrap();
-                db.get_or_create_gallery(k)
+                match db.get_or_create_gallery(k) {
+                    Ok(s) => s,
+                    Err(MintError::Banned) => {
+                        return err(StatusCode::FORBIDDEN, "gallery banned");
+                    }
+                    Err(MintError::Db) => return ApiError::Internal.into_response(),
+                }
             }
         }
     };
     tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
-    let slug = match slug {
-        Some(s) => s,
-        None => return err(StatusCode::FORBIDDEN, "gallery banned"),
-    };
     let (sanitized, _ext) = sanitize_filename(&raw_name);
     let t_body = std::time::Instant::now();
     // Stream the body straight to the O_EXCL file: bounded RAM (one frame
@@ -768,25 +813,46 @@ pub async fn get_photo(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let t_total = std::time::Instant::now();
-    if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+    // Orphaned/banned files stay on disk but are unreachable: reject names
+    // outside a known gallery before touching the filesystem.
+    let slug = match photo_slug(&name) {
+        Some(s) => s.to_string(),
+        None => return err(StatusCode::NOT_FOUND, "not found"),
+    };
+    let gallery_known = {
+        let db = state.db.lock().unwrap();
+        db.gallery_exists(&slug)
+    };
+    if !gallery_known {
         return err(StatusCode::NOT_FOUND, "not found");
     }
+    // ?pass= in <img> URLs stays: media tags cannot set headers, so the
+    // query secret is the only way to authorize direct photo embeds.
+    let query = raw.unwrap_or_default();
+    let pass = request_pass(&headers, &query);
     // Viewer lock applies per-file too (direct /photos/ links).
-    if let Some(slug) = photo_slug(&name) {
-        let key_ok = request_key(&headers)
-            .map(|k| {
-                let db = state.db.lock().unwrap();
-                db.key_owns_slug(&k, slug)
-            })
-            .unwrap_or(false);
-        if !key_ok {
-            let query = raw.unwrap_or_default();
-            let pass = request_pass(&headers, &query);
-            if let Some(deny) = check_locked(&state, slug, &pass).await {
-                return deny;
-            }
+    let key_ok = request_key(&headers)
+        .map(|k| {
+            let db = state.db.lock().unwrap();
+            db.key_owns_slug(&k, &slug)
+        })
+        .unwrap_or(false);
+    if !key_ok {
+        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+            return deny;
         }
     }
+    // Private cache when the gallery is locked and the viewer proved it with
+    // a password (header or ?pass=): never let a shared cache serve it.
+    let locked_gallery = {
+        let db = state.db.lock().unwrap();
+        db.gallery_pass_hash(&slug).is_some()
+    };
+    let cache_control = if locked_gallery && !pass.is_empty() {
+        "private, no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
     let t_canon = std::time::Instant::now();
     let path = state.dir.join(&name);
     // Contain within photos dir (no symlink escape); base canonicalized once.
@@ -816,19 +882,18 @@ pub async fn get_photo(
     .to_string();
     tracing::debug!(stage = "serve_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
     let stream = tokio_util::io::ReaderStream::new(file);
-    (
-        [
-            (header::CONTENT_TYPE, ctype),
-            (header::CONTENT_LENGTH, len.to_string()),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
-            (
-                header::HeaderName::from_static("x-content-type-options"),
-                "nosniff".to_string(),
-            ),
-        ],
-        Body::from_stream(stream),
-    )
-        .into_response()
+    // SVG runs in site origin: sandbox it and force download.
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header(header::CACHE_CONTROL, cache_control)
+        .header("x-content-type-options", "nosniff");
+    if ext == ".svg" {
+        builder = builder
+            .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+            .header(header::CONTENT_DISPOSITION, "attachment");
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 pub async fn delete_photo(
@@ -864,10 +929,9 @@ pub async fn delete_photo(
         }
     }
     let path = state.dir.join(&name);
-    if let Ok(canon) = path.canonicalize() {
-        if !canon.starts_with(&state.canon_dir) {
-            return err(StatusCode::NOT_FOUND, "not found");
-        }
+    match path.canonicalize() {
+        Ok(canon) if canon.starts_with(&state.canon_dir) => {}
+        _ => return err(StatusCode::NOT_FOUND, "not found"),
     }
     match tokio::fs::remove_file(&path).await {
         // Keep the gallery row: a concurrent upload landing between a file
@@ -883,7 +947,7 @@ pub async fn delete_photo(
 // --- compat stubs ---
 
 pub async fn gone_compat() -> Response {
-    err(StatusCode::NOT_FOUND, "not found")
+    err(StatusCode::GONE, "gone")
 }
 
 pub async fn fallback_404() -> Response {

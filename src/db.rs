@@ -61,14 +61,14 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     // Migrate pre-password databases.
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN pass_hash BLOB", []);
     // Migrate pre-scoped-auth databases: same key may own many galleries now.
-    // A UNIQUE index auto-created for `key_hash BLOB UNIQUE` shows up in
-    // sqlite_master as an autoindex; rebuild the table without it.
+    // Old DDL carried `UNIQUE` on key_hash; rebuild the table without it.
     let legacy: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND tbl_name='galleries' AND sql IS NULL",
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='galleries'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, String>(0),
         )
+        .map(|ddl| ddl.contains("UNIQUE"))
         .unwrap_or(false);
     if legacy {
         conn.execute_batch(
@@ -88,12 +88,16 @@ fn gen_slug(conn: &Connection) -> String {
     crate::validate::gen_slug(conn)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MintError {
+    Banned,
+    Db,
+}
 pub trait GalleryDb {
     fn is_banned(&self, digest: &[u8]) -> bool;
-    fn lookup_gallery(&self, key: &str) -> Option<String>;
     /// Scoped auth: does this key own this slug? Same key may own many slugs.
     fn key_owns_slug(&self, key: &str, slug: &str) -> bool;
-    fn get_or_create_gallery(&mut self, key: &str) -> Option<String>;
+    fn get_or_create_gallery(&mut self, key: &str) -> Result<String, MintError>;
     fn gallery_exists(&self, slug: &str) -> bool;
     /// (Empty galleries keep their row; see delete_photo.)
     /// Delete every row sharing the slug's key hash and ban the hash
@@ -112,18 +116,6 @@ impl GalleryDb for Connection {
             .is_ok()
     }
 
-    /// Legacy helper: first gallery for a key (resolve fallback only).
-    fn lookup_gallery(&self, key: &str) -> Option<String> {
-        let d = key_hash(key);
-        if self.is_banned(&d) {
-            return None;
-        }
-        self.query_row("SELECT slug FROM galleries WHERE key_hash = ?1 ORDER BY created LIMIT 1", [&d], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-    }
-
     fn key_owns_slug(&self, key: &str, slug: &str) -> bool {
         let d = key_hash(key);
         if self.is_banned(&d) {
@@ -139,10 +131,10 @@ impl GalleryDb for Connection {
 
     /// Home upload: always mint a fresh gallery, never reuse.
     /// Same password, different visit = different gallery.
-    fn get_or_create_gallery(&mut self, key: &str) -> Option<String> {
+    fn get_or_create_gallery(&mut self, key: &str) -> Result<String, MintError> {
         let d = key_hash(key);
         if self.is_banned(&d) {
-            return None;
+            return Err(MintError::Banned);
         }
         for _ in 0..50 {
             let slug = gen_slug(self);
@@ -150,12 +142,13 @@ impl GalleryDb for Connection {
                 "INSERT INTO galleries(slug, key_hash, created) VALUES(?1,?2,?3)",
                 rusqlite::params![slug, d, now_secs()],
             ) {
-                Ok(_) => return Some(slug),
-                // Slug collision (uuid words): retry. Key reuse is fine now.
-                Err(_) => continue,
+                Ok(_) => return Ok(slug),
+                // Retry only on slug collision; other failures are real errors.
+                Err(_) if self.gallery_exists(&slug) => continue,
+                Err(_) => return Err(MintError::Db),
             }
         }
-        None
+        Err(MintError::Db)
     }
 
     fn gallery_exists(&self, slug: &str) -> bool {
@@ -220,7 +213,6 @@ mod tests {
     #[test]
     fn create_lookup_roundtrip() {
         let mut db = mem();
-        assert_eq!(db.lookup_gallery("test-gallery-key-01"), None);
         let slug = db.get_or_create_gallery("test-gallery-key-01").expect("create");
         assert!(db.gallery_exists(&slug));
         assert!(db.key_owns_slug("test-gallery-key-01", &slug));
@@ -235,22 +227,22 @@ mod tests {
         let mut db = mem();
         let slug = db.get_or_create_gallery("test-gallery-key-02").expect("create");
         assert!(db.ban_gallery(&slug));
-        // Key hash moved to banned: lookups and creation both blocked.
-        assert!(db.lookup_gallery("test-gallery-key-02").is_none());
-        assert!(db.get_or_create_gallery("test-gallery-key-02").is_none());
+        // Key hash moved to banned: ownership checks and creation both blocked.
+        assert!(!db.key_owns_slug("test-gallery-key-02", &slug));
+        assert_eq!(db.get_or_create_gallery("test-gallery-key-02"), Err(MintError::Banned));
         assert!(!db.gallery_exists(&slug));
         assert!(db.is_banned(&key_hash("test-gallery-key-02")));
         // Unban restores ability to create (new slug).
         assert!(db.unban(&key_hash("test-gallery-key-02")));
         assert!(!db.is_banned(&key_hash("test-gallery-key-02")));
-        assert!(db.get_or_create_gallery("test-gallery-key-02").is_some());
+        assert!(db.get_or_create_gallery("test-gallery-key-02").is_ok());
     }
 
     #[test]
     fn ban_gallery_moves_row() {
         let mut db = mem();
-        db.get_or_create_gallery("test-gallery-key-03").expect("create");
-        let slug = db.lookup_gallery("test-gallery-key-03").unwrap();
+        let slug = db.get_or_create_gallery("test-gallery-key-03").expect("create");
+        assert!(db.key_owns_slug("test-gallery-key-03", &slug));
         let digest = key_hash("test-gallery-key-03");
         assert!(db.ban_gallery(&slug));
         assert!(!db.gallery_exists(&slug));
@@ -258,6 +250,25 @@ mod tests {
         // Unknown slug → false.
         assert!(!db.ban_gallery("nope-not-real-slug-aaaa"));
         assert!(!db.unban(&key_hash("never-banned-key-00")));
+    }
+
+    #[test]
+    fn fix_a_migration_idempotent() {
+        let dir = std::env::temp_dir().join(format!("gally-db-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("g.db");
+        let mut db = open(&path).expect("open");
+        let slug = db.get_or_create_gallery("fix-a-key-01").expect("create");
+        drop(db);
+        let db2 = open(&path).expect("reopen");
+        let tables: i64 = db2
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='galleries'", [], |r| r.get(0))
+            .expect("count tables");
+        assert_eq!(tables, 1);
+        let rows: i64 = db2.query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0)).expect("count rows");
+        assert_eq!(rows, 1);
+        assert!(db2.gallery_exists(&slug));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
