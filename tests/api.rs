@@ -818,3 +818,134 @@ async fn fix_b_svg_sandboxed() {
         "attachment"
     );
 }
+
+// --- fix: partial uploads, startup sweep, password/key lockout ---
+
+#[tokio::test]
+async fn partial_upload_is_invisible_and_cleaned_up() {
+    let (state, tmp) = test_state().await;
+    let (status, v) = resolve(&state, KEY_A).await;
+    assert_eq!(status, StatusCode::OK);
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Vec<u8>, std::io::Error>>();
+    let r = request(
+        "PUT",
+        "/api/photos/stream.jpg",
+        &[key_header(KEY_A), ("x-gallery-slug", slug.as_str())],
+        Body::from_stream(rx),
+    );
+    let up = tokio::spawn({
+        let state = state.clone();
+        async move { router(state).oneshot(r).await.unwrap() }
+    });
+
+    tx.unbounded_send(Ok(jpeg())).unwrap();
+    let photos = tmp.path().join("photos");
+    let mut saw_part = false;
+    for _ in 0..500 {
+        let mut rd = tokio::fs::read_dir(&photos).await.unwrap();
+        while let Some(ent) = rd.next_entry().await.unwrap() {
+            if ent.file_name().to_string_lossy().starts_with(".part-") {
+                saw_part = true;
+            }
+        }
+        if saw_part {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(saw_part, "upload should stream into a .part- temp file");
+    assert!(!up.is_finished(), "upload must still be in flight");
+
+    // While the body is open, the gallery lists nothing.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed = body_json(resp).await;
+    assert_eq!(listed["photos"].as_array().unwrap().len(), 0);
+
+    tx.unbounded_send(Ok(vec![0x11, 0x22])).unwrap();
+    drop(tx);
+    let resp = up.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let done = body_json(resp).await;
+    assert!(done["name"].as_str().unwrap().starts_with(&format!("{slug}_")));
+
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    let listed = body_json(resp).await;
+    assert_eq!(listed["photos"].as_array().unwrap().len(), 1);
+    let mut rd = tokio::fs::read_dir(&photos).await.unwrap();
+    let mut files = 0;
+    while let Some(ent) = rd.next_entry().await.unwrap() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with(".part-"), "stale temp file left: {name}");
+        files += 1;
+    }
+    assert_eq!(files, 1);
+}
+
+#[tokio::test]
+async fn startup_sweeps_stale_part_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let photos = tmp.path().join("photos");
+    tokio::fs::create_dir_all(&photos).await.unwrap();
+    let stale = photos.join(".part-dead");
+    tokio::fs::write(&stale, b"junk").await.unwrap();
+    let _state = AppState::new(tmp.path()).await.expect("AppState::new");
+    assert!(!stale.exists(), "startup must sweep stale .part- files");
+}
+
+#[tokio::test]
+async fn viewer_password_lockout_after_ten_failures() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"s3cret-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let uri = format!("/api/galleries/{slug}/photos?pass=nope");
+    for _ in 0..10 {
+        let resp = router(state.clone()).oneshot(get(&uri, &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = router(state.clone()).oneshot(get(&uri, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // A correct password is not hashed (nor accepted) once the bucket is full.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos?pass=s3cret-pass"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn delete_key_lockout_after_ten_failures() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
+    let uri = format!("/api/photos/{name}");
+    for _ in 0..10 {
+        let r = request("DELETE", &uri, &[key_header(KEY_B)], Body::empty());
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    let r = request("DELETE", &uri, &[key_header(KEY_B)], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The real key still works: lockout only stops guessing.
+    let r = request("DELETE", &uri, &[key_header(KEY_A)], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

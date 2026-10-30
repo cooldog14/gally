@@ -9,6 +9,12 @@ use crate::db::{self, GalleryDb};
 pub const RATE_MAX: usize = 60;
 pub const RATE_WINDOW_SECS: u64 = 60;
 
+/// How long a verified (hash, password) pair stays accepted.
+pub const PASS_CACHE_TTL: Duration = Duration::from_secs(300);
+/// Failed password/key attempts allowed per IP per window.
+pub const PASS_FAIL_MAX: usize = 10;
+pub const PASS_FAIL_WINDOW_SECS: u64 = 60;
+
 /// Upload cap per IP per window. `GALLY_RATE_MAX` overrides (0 = unlimited).
 pub fn rate_max() -> usize {
     std::env::var("GALLY_RATE_MAX")
@@ -25,6 +31,11 @@ pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub admin_tokens: Mutex<HashMap<String, Instant>>,
     pub rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    /// Verified (stored hash, supplied password) digests: a locked gallery
+    /// costs one Argon2 run, not one per image.
+    pub pass_ok: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// Failed password/key attempts per IP (sliding window).
+    pub pass_fail: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str)>,
     /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
     /// startup; `None` = open creation). Contributing to an existing
@@ -36,6 +47,15 @@ impl AppState {
     pub async fn new(root: &Path) -> anyhow::Result<Arc<AppState>> {
         let dir = root.join("photos");
         tokio::fs::create_dir_all(&dir).await?;
+        // An upload that died mid-stream leaves a `.part-` temp behind; they
+        // are never listed, so drop them here rather than let them pile up.
+        if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                if ent.file_name().to_string_lossy().starts_with(".part-") {
+                    let _ = tokio::fs::remove_file(ent.path()).await;
+                }
+            }
+        }
         // db::open is synchronous but fast (local SQLite open + DDL); run
         // it blocking so we never stall the runtime.
         let db_path = root.join("galleries.db");
@@ -96,6 +116,8 @@ impl AppState {
             db: Mutex::new(conn),
             admin_tokens: Mutex::new(HashMap::new()),
             rate: Mutex::new(HashMap::new()),
+            pass_ok: Mutex::new(HashMap::new()),
+            pass_fail: Mutex::new(HashMap::new()),
             statics,
             invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
         }))
@@ -125,6 +147,35 @@ pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
     }
     hits.push(now);
     false
+}
+
+/// True when `ip` already burned `PASS_FAIL_MAX` attempts in the window.
+/// Read-only: never records a failure (the caller still refuses outright).
+pub fn pass_fail_exceeded(state: &AppState, ip: &IpAddr) -> bool {
+    let now = Instant::now();
+    let mut fail = state.pass_fail.lock().unwrap();
+    let Some(hits) = fail.get_mut(ip) else {
+        return false;
+    };
+    hits.retain(|t| now.duration_since(*t).as_secs() < PASS_FAIL_WINDOW_SECS);
+    hits.len() >= PASS_FAIL_MAX
+}
+
+/// Record one failed password/key attempt. Returns true once over the limit.
+/// shortcut: same 10k-IP bound as rate_limited, evicts oldest — switch to LRU
+/// when NAT-heavy.
+pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
+    let now = Instant::now();
+    let mut fail = state.pass_fail.lock().unwrap();
+    if !fail.contains_key(ip) && fail.len() >= 10_000 {
+        if let Some(oldest) = fail.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
+            fail.remove(&oldest);
+        }
+    }
+    let hits = fail.entry(*ip).or_default();
+    hits.retain(|t| now.duration_since(*t).as_secs() < PASS_FAIL_WINDOW_SECS);
+    hits.push(now);
+    hits.len() > PASS_FAIL_MAX
 }
 
 /// Admin tokens live 24h from issue; expired ones are dropped on sight.

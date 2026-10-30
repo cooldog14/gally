@@ -13,7 +13,9 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::db::{key_hash, GalleryDb, MintError};
-use crate::state::{is_admin, rate_limited, AppState};
+use crate::state::{
+    is_admin, pass_fail_exceeded, pass_fail_record, rate_limited, AppState, PASS_CACHE_TTL,
+};
 use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename};
 
 /// Max upload size. `GALLY_MAX_BYTES` overrides (default 10 GiB).
@@ -144,10 +146,26 @@ fn request_pass(headers: &HeaderMap, query: &str) -> String {
     String::new()
 }
 
+/// Cache key for a verified (stored hash, supplied password) pair: changing
+/// the gallery password changes the hash, so old entries miss.
+fn pass_cache_key(hash: &[u8], pass: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(hash);
+    h.update([0u8]);
+    h.update(pass.as_bytes());
+    h.finalize().to_vec()
+}
+
 /// Slow Argon2 work runs on the blocking pool: never stall the runtime.
 /// `None` = open (public gallery or correct password / owner bypass).
 /// `Some(response)` = locked, return it directly.
-async fn check_locked(state: &AppState, slug: &str, pass: &str) -> Option<Response> {
+async fn check_locked(
+    state: &AppState,
+    ip: IpAddr,
+    slug: &str,
+    pass: &str,
+) -> Option<Response> {
     let stored = {
         let db = state.db.lock().unwrap();
         db.gallery_pass_hash(slug)
@@ -158,13 +176,36 @@ async fn check_locked(state: &AppState, slug: &str, pass: &str) -> Option<Respon
     };
     // The gallery key always opens its own gallery (owner bypass).
     if !pass.is_empty() {
-        let pass = pass.to_string();
-        let ok = tokio::task::spawn_blocking(move || crate::db::verify_password(&pass, &hash))
-            .await
-            .unwrap_or(false);
+        let key = pass_cache_key(&hash, pass);
+        if let Some(at) = state.pass_ok.lock().unwrap().get(&key) {
+            if at.elapsed() < PASS_CACHE_TTL {
+                return None;
+            }
+        }
+        if pass_fail_exceeded(state, &ip) {
+            return Some(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "too many attempts" })),
+                )
+                    .into_response(),
+            );
+        }
+        let ok = tokio::task::spawn_blocking({
+            let pass = pass.to_string();
+            move || crate::db::verify_password(&pass, &hash)
+        })
+        .await
+        .unwrap_or(false);
         if ok {
+            let mut cache = state.pass_ok.lock().unwrap();
+            if cache.len() >= 10_000 {
+                cache.retain(|_, at| at.elapsed() < PASS_CACHE_TTL);
+            }
+            cache.insert(key, std::time::Instant::now());
             return None;
         }
+        pass_fail_record(state, &ip);
     }
     Some((
         StatusCode::UNAUTHORIZED,
@@ -192,6 +233,7 @@ fn invite_ok(state: &AppState, headers: &HeaderMap) -> bool {
 
 pub async fn gallery_photos(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(slug): AxumPath<String>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -221,7 +263,8 @@ pub async fn gallery_photos(
     if !key_ok {
         let query = raw.unwrap_or_default();
         let pass = request_pass(&headers, &query);
-        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+        let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+        if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
             return deny;
         }
     }
@@ -574,6 +617,7 @@ struct LockBody {
 /// Requires the gallery key. Passwords are Argon2id-hashed, never stored raw.
 pub async fn lock_gallery(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(slug): AxumPath<String>,
     body: Body,
@@ -581,15 +625,26 @@ pub async fn lock_gallery(
     if !is_slug(&slug) {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
+    // Correct keys are checked before the failure bucket, so a valid key is
+    // never locked out by someone else's guessing.
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
     let key = match request_key(&headers) {
         Some(k) => k,
-        None => return ApiError::Unauthorized.into_response(),
+        None => {
+            if pass_fail_record(&state, &ip) {
+                return ApiError::TooMany.into_response();
+            }
+            return ApiError::Unauthorized.into_response();
+        }
     };
     let known = {
         let db = state.db.lock().unwrap();
         db.key_owns_slug(&key, slug.as_str())
     };
     if !known {
+        if pass_fail_record(&state, &ip) {
+            return ApiError::TooMany.into_response();
+        }
         return err(StatusCode::FORBIDDEN, "forbidden");
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
@@ -721,21 +776,29 @@ pub async fn put_photo(
     tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
     let (sanitized, _ext) = sanitize_filename(&raw_name);
     let t_body = std::time::Instant::now();
-    // Stream the body straight to the O_EXCL file: bounded RAM (one frame
-    // in flight), enforced MAX_BYTES cap, cleanup of partial files.
-    let mut stored = String::new();
+    // Stream into a dot-prefixed temp file: `photo_entries` skips dot names,
+    // so a stalled or aborted upload is never listed or served as a photo.
+    // The real name only appears after a successful `rename`.
+    let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+    let temp_path = state.dir.join(format!(".part-{uuid}"));
+    let final_name = format!("{slug}_{uuid}_{sanitized}");
+    let mut out = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+    };
     let mut total: usize = 0;
-    let mut out: Option<tokio::fs::File> = None;
     let mut stream = body.into_data_stream();
-    let mut over_limit = false;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
             Err(_) => {
-                drop(out.take());
-                if !stored.is_empty() {
-                    let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
-                }
+                drop(out);
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return ApiError::TooLarge.into_response();
             }
         };
@@ -744,70 +807,37 @@ pub async fn put_photo(
         }
         total += chunk.len();
         if total > max_bytes() {
-            over_limit = true;
-            break;
+            drop(out);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return ApiError::TooLarge.into_response();
         }
-        if out.is_none() {
-            // First bytes: pick the final name now so a retry keeps O_EXCL.
-            let mut opened = false;
-            for _ in 0..2 {
-                let candidate = format!(
-                    "{}_{}_{}",
-                    slug,
-                    uuid::Uuid::new_v4().as_simple(),
-                    sanitized
-                );
-                let path = state.dir.join(&candidate);
-                match tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .await
-                {
-                    Ok(f) => {
-                        stored = candidate;
-                        out = Some(f);
-                        opened = true;
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(_) => {
-                        return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store");
-                    }
-                }
-            }
-            if !opened {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store");
-            }
+        if out.write_all(&chunk).await.is_err() {
+            drop(out);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return ApiError::Internal.into_response();
         }
-        if let Some(f) = out.as_mut() {
-            if f.write_all(&chunk).await.is_err() {
-                let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
-                return ApiError::Internal.into_response();
-            }
-        }
-    }
-    tracing::debug!(stage = "body_stream", bytes = total, latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0));
-    if over_limit {
-        if !stored.is_empty() {
-            let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
-        }
-        return ApiError::TooLarge.into_response();
-    }
-    if total == 0 {
-        if !stored.is_empty() {
-            let _ = tokio::fs::remove_file(state.dir.join(&stored)).await;
-        }
-        return err(StatusCode::BAD_REQUEST, "empty body");
     }
     drop(out);
+    tracing::debug!(stage = "body_stream", bytes = total, latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0));
+    if total == 0 {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return err(StatusCode::BAD_REQUEST, "empty body");
+    }
+    if tokio::fs::rename(&temp_path, state.dir.join(&final_name))
+        .await
+        .is_err()
+    {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return ApiError::Internal.into_response();
+    }
     tracing::debug!(stage = "put_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
-    (StatusCode::CREATED, Json(json!({ "name": stored, "slug": slug }))).into_response()
+    (StatusCode::CREATED, Json(json!({ "name": final_name, "slug": slug }))).into_response()
 }
 // --- photo serve / delete ---
 
 pub async fn get_photo(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -838,7 +868,8 @@ pub async fn get_photo(
         })
         .unwrap_or(false);
     if !key_ok {
-        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+        let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+        if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
             return deny;
         }
     }
@@ -898,6 +929,7 @@ pub async fn get_photo(
 
 pub async fn delete_photo(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
@@ -925,6 +957,11 @@ pub async fn delete_photo(
             None => false,
         };
         if !ok {
+            // Correct keys are checked first, so they can never be locked out.
+            let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+            if pass_fail_record(&state, &ip) {
+                return ApiError::TooMany.into_response();
+            }
             return err(StatusCode::FORBIDDEN, "forbidden");
         }
     }
