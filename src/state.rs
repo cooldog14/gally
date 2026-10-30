@@ -17,9 +17,7 @@ pub fn rate_max() -> usize {
         .unwrap_or(RATE_MAX)
 }
 
-pub struct CachedListing {
-    pub photos: Vec<serde_json::Value>,
-}
+// (Listing cache removed: plain directory scans never go stale.)
 
 pub struct AppState {
     pub dir: PathBuf,
@@ -28,14 +26,10 @@ pub struct AppState {
     pub admin_tokens: Mutex<HashSet<String>>,
     pub rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str)>,
-    pub listings: Mutex<HashMap<String, CachedListing>>,
-}
-
-impl AppState {
-    /// Drop the cached listing for one gallery (after upload/delete).
-    pub fn invalidate_listing(&self, slug: &str) {
-        self.listings.lock().unwrap().remove(slug);
-    }
+    /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
+    /// startup; `None` = open creation). Contributing to an existing
+    /// gallery never needs it.
+    pub invite: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -60,6 +54,13 @@ impl AppState {
                     "/app.js",
                     (
                         &include_bytes!("../app.js")[..],
+                        "application/javascript",
+                    ),
+                ),
+                (
+                    "/vendor-heic2any.min.js",
+                    (
+                        &include_bytes!("../vendor-heic2any.min.js")[..],
                         "application/javascript",
                     ),
                 ),
@@ -96,13 +97,14 @@ impl AppState {
             admin_tokens: Mutex::new(HashSet::new()),
             rate: Mutex::new(HashMap::new()),
             statics,
-            listings: Mutex::new(HashMap::new()),
+            invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
         }))
     }
 }
 
 /// Fixed-window rate limit: at most `rate_max()` hits per window (0 = off).
 /// Returns true when the caller is over the limit (hit NOT recorded).
+/// shortcut: hard cap at 10k IPs, evicts oldest — switch to LRU when NAT-heavy.
 pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
     let max = rate_max();
     if max == 0 {
@@ -110,6 +112,12 @@ pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
     }
     let now = Instant::now();
     let mut rate = state.rate.lock().unwrap();
+    // Bound memory: drop the oldest entry when full (dead IPs never return).
+    if !rate.contains_key(ip) && rate.len() >= 10_000 {
+        if let Some(oldest) = rate.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
+            rate.remove(&oldest);
+        }
+    }
     let hits = rate.entry(*ip).or_default();
     hits.retain(|t| now.duration_since(*t).as_secs() < RATE_WINDOW_SECS);
     if hits.len() >= max {

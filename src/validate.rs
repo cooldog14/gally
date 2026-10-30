@@ -1,10 +1,10 @@
 //! Filename/slug/key validation helpers (ported from the former `http.rs`).
 //! Pure functions only — no HTTP parsing (axum handles that).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+// (no imports: uuid provides the thread-safe randomness)
 
 pub const MAX_NAME_LEN: usize = 100;
-pub const KEY_MIN: usize = 4;
+pub const KEY_MIN: usize = 12;
 pub const KEY_MAX: usize = 128;
 
 pub static ADJ: &[&str] = &[
@@ -29,26 +29,31 @@ pub static NOUN: &[&str] = &[
 ];
 
 pub fn is_slug(s: &str) -> bool {
-    // ^[a-z]+-[a-z]+-[1-9][0-9]{0,2}$
+    // ^[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4}$ (odd fallback: oddball-slug-extra-[0-9a-f]{8})
+    if let Some(hex) = s.strip_prefix("oddball-slug-extra-") {
+        return hex.len() == 8 && hex.bytes().all(|v| v.is_ascii_hexdigit());
+    }
     let mut parts = s.split('-');
     let a = parts.next().unwrap_or("");
     let b = parts.next().unwrap_or("");
     let c = parts.next().unwrap_or("");
+    let d = parts.next().unwrap_or("");
+    let e = parts.next().unwrap_or("");
     if parts.next().is_some() {
         return false;
     }
     let alpha = |x: &str| !x.is_empty() && x.bytes().all(|v| v.is_ascii_lowercase());
-    if !alpha(a) || !alpha(b) {
+    if !alpha(a) || !alpha(b) || !alpha(c) || !alpha(d) {
         return false;
     }
-    if c.len() > 3 || c.is_empty() || c.as_bytes()[0] == b'0' {
+    if e.len() != 4 {
         return false;
     }
-    c.bytes().all(|v| v.is_ascii_digit())
+    e.bytes().all(|v| v.is_ascii_hexdigit())
 }
 
 pub fn photo_slug(name: &str) -> Option<&str> {
-    // ^([a-z]+-[a-z]+-[0-9]{1,3})_[0-9a-f]{32}_
+    // ^gallery-slug_[0-9a-f]{32}_ (gallery-slug checked by is_slug)
     let us = name.find('_')?;
     let slug = &name[..us];
     let rest = &name[us + 1..];
@@ -62,21 +67,7 @@ pub fn photo_slug(name: &str) -> Option<&str> {
     if !hexpart.bytes().all(|v| v.is_ascii_hexdigit()) {
         return None;
     }
-    // slug check (allow 0-prefixed? python FILE_SLUG_RE allows 0xx; keep permissive)
-    let mut parts = slug.split('-');
-    let a = parts.next()?;
-    let b = parts.next()?;
-    let c = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if a.is_empty() || b.is_empty() || c.is_empty() {
-        return None;
-    }
-    if !a.bytes().all(|v| v.is_ascii_lowercase()) || !b.bytes().all(|v| v.is_ascii_lowercase()) {
-        return None;
-    }
-    if c.len() > 3 || !c.bytes().all(|v| v.is_ascii_digit()) {
+    if !is_slug(slug) {
         return None;
     }
     Some(slug)
@@ -173,28 +164,21 @@ pub fn escape(s: &str) -> String {
 }
 
 fn rand_below(n: u32) -> u32 {
-    // xorshift from nanos — no extra deps
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(1);
-    static mut S: u64 = 0x9e37_79b9_7f4a_7c15;
-    unsafe {
-        S ^= S << 13;
-        S ^= S >> 7;
-        S ^= S << 17;
-        S = S.wrapping_add(t);
-        ((S >> 11) % (n as u64)) as u32
-    }
+    // Thread-safe: fresh OS randomness per draw (uuid v4).
+    (uuid::Uuid::new_v4().as_u128() % (n as u128)) as u32
 }
 
+/// Four random words plus a short hex tail, e.g. `velvet-lagoon-quiet-river-1a2b`.
+/// Uniqueness is enforced by the caller via DB check-and-retry.
 pub fn gen_slug(db: &rusqlite::Connection) -> String {
     for _ in 0..50 {
         let s = format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}-{:04x}",
             ADJ[rand_below(ADJ.len() as u32) as usize],
             NOUN[rand_below(NOUN.len() as u32) as usize],
-            rand_below(999) + 1
+            ADJ[rand_below(ADJ.len() as u32) as usize],
+            NOUN[rand_below(NOUN.len() as u32) as usize],
+            uuid::Uuid::new_v4().as_u128() as u16
         );
         let taken: bool = db
             .query_row("SELECT 1 FROM galleries WHERE slug = ?1", [&s], |_| Ok(()))
@@ -203,7 +187,7 @@ pub fn gen_slug(db: &rusqlite::Connection) -> String {
             return s;
         }
     }
-    format!("oddball-slug-{}", rand_below(999) + 1)
+    format!("oddball-slug-extra-{:08x}", uuid::Uuid::new_v4().as_u128() as u32)
 }
 
 #[cfg(test)]
@@ -212,20 +196,23 @@ mod tests {
 
     #[test]
     fn slug_accepts() {
-        assert!(is_slug("happy-otter-7"));
-        assert!(is_slug("blue-heron-123"));
-        assert!(is_slug("a-b-1"));
+        assert!(is_slug("velvet-lagoon-quiet-river-1a2b"));
+        assert!(is_slug("blue-heron-granite-pond-00ff"));
+        assert!(is_slug("a-b-c-d-1234"));
+        assert!(is_slug("oddball-slug-extra-89abcdef"));
     }
 
     #[test]
     fn slug_rejects() {
-        assert!(!is_slug("Happy-otter-7")); // uppercase
-        assert!(!is_slug("happy-otter-007")); // leading zero
-        assert!(!is_slug("happy-otter-1234")); // 4-digit
-        assert!(!is_slug("happy-otter-0")); // zero
-        assert!(!is_slug("happy-otter")); // missing part
-        assert!(!is_slug("happy-otter-1-x")); // extra part
-        assert!(!is_slug("happy-ott3r-1")); // digit in word
+        assert!(!is_slug("Happy-otter-calm-pond-1a2b")); // uppercase
+        assert!(!is_slug("happy-otter-007")); // old short format
+        assert!(!is_slug("happy-otter-calm-1a2b")); // old 3-word format
+        assert!(!is_slug("happy-otter-calm-pond-12345")); // 5-hex
+        assert!(!is_slug("happy-otter-calm-pond-123")); // 3-hex
+        assert!(!is_slug("happy-otter-calm-pond-XYZ1")); // non-hex
+        assert!(!is_slug("happy-otter-calm-pond")); // missing tail
+        assert!(!is_slug("happy-otter-calm-pond-1a2b-x")); // extra part
+        assert!(!is_slug("happy-ott3r-calm-pond-1a2b")); // digit in word
         assert!(!is_slug("")); // empty
     }
 
@@ -249,11 +236,11 @@ mod tests {
 
     #[test]
     fn normalize_key_bounds() {
-        assert!(normalize_key("abcd").is_some());
-        assert!(normalize_key("abc").is_none());
+        assert!(normalize_key("abcdefghijkl").is_some());
+        assert!(normalize_key("abcdefghijk").is_none());
         assert!(normalize_key(&"k".repeat(128)).is_some());
         assert!(normalize_key(&"k".repeat(129)).is_none());
-        assert_eq!(normalize_key("  secret  "), Some("secret".to_string()));
+        assert_eq!(normalize_key("  a-long-secret-key  "), Some("a-long-secret-key".to_string()));
     }
 
     #[test]
@@ -268,16 +255,19 @@ mod tests {
     #[test]
     fn photo_slug_ok() {
         let h = "a".repeat(32);
-        let name = format!("happy-otter-7_{}_photo.jpg", h);
-        assert_eq!(photo_slug(&name), Some("happy-otter-7"));
+        let name = format!("velvet-lagoon-quiet-river-1a2b_{}_photo.jpg", h);
+        assert_eq!(photo_slug(&name), Some("velvet-lagoon-quiet-river-1a2b"));
     }
 
     #[test]
     fn photo_slug_bad() {
         assert!(photo_slug("nope.jpg").is_none());
         let h = "z".repeat(32); // not hex
-        assert!(photo_slug(&format!("happy-otter-7_{}_x.jpg", h)).is_none());
-        assert!(photo_slug("Happy-otter-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        assert!(photo_slug(&format!("velvet-lagoon-quiet-river-1a2b_{}_x.jpg", h)).is_none());
+        assert!(photo_slug("Happy-otter-calm-pond-1a2b_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        // Old short galleries no longer resolve.
+        assert!(photo_slug("happy-otter-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        assert!(photo_slug("happy-otter-calm-pond-123_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
     }
 
     #[test]
