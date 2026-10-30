@@ -502,22 +502,29 @@ pub async fn admin_page_redirect() -> Response {
         .into_response()
 }
 
-pub async fn static_path(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Response {
-    match state.statics.get(uri.path()) {
-        Some((bytes, ctype)) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, *ctype),
-                (
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                ),
-            ],
-            bytes.to_vec(),
-        )
-            .into_response(),
-        None => err(StatusCode::NOT_FOUND, "not found"),
+pub async fn static_path(
+    State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some((bytes, ctype, etag)) = state.statics.get(uri.path()) else {
+        return err(StatusCode::NOT_FOUND, "not found");
+    };
+    let resp = Response::builder()
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::ETAG, etag);
+    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return resp
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap();
     }
+    resp.header(header::CONTENT_TYPE, *ctype)
+        .status(StatusCode::OK)
+        .body(Body::from(bytes.to_vec()))
+        .unwrap()
 }
 
 pub async fn spa_or_404(
@@ -542,7 +549,7 @@ pub async fn spa_or_404(
             .into_response();
     }
     match state.statics.get("/index.html") {
-        Some((bytes, ctype)) => (
+        Some((bytes, ctype, _)) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, *ctype)],
             bytes.to_vec(),

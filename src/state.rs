@@ -36,7 +36,7 @@ pub struct AppState {
     pub pass_ok: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Failed password/key attempts per IP (sliding window).
     pub pass_fail: Mutex<HashMap<IpAddr, Vec<Instant>>>,
-    pub statics: HashMap<&'static str, (&'static [u8], &'static str)>,
+    pub statics: HashMap<&'static str, (&'static [u8], &'static str, String)>,
     /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
     /// startup; `None` = open creation). Contributing to an existing
     /// gallery never needs it.
@@ -110,6 +110,17 @@ impl AppState {
                     ),
                 ),
             ]);
+        let statics = statics
+            .into_iter()
+            .map(|(path, (bytes, ctype))| {
+                use sha2::{Digest, Sha256};
+                let hex: String = Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                (path, (bytes, ctype, format!("\"{hex}\"")))
+            })
+            .collect();
         Ok(Arc::new(AppState {
             canon_dir: dir.canonicalize().unwrap_or_else(|_| dir.clone()),
             dir,
