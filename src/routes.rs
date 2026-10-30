@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
-use crate::db::{key_hash, GalleryDb};
+use crate::db::{key_hash, GalleryDb, MintError};
 use crate::state::{is_admin, rate_limited, AppState};
 use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename};
 
@@ -375,15 +375,20 @@ struct ResolveBody {
 /// Gallery page (slug given): verify the key owns that slug.
 pub async fn resolve_gallery(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    if rate_limited(&state, &ip) {
+        return ApiError::TooMany.into_response();
+    }
     let mut key = request_key(&headers);
     let mut slug_param: Option<String> = None;
     if key.is_none() {
         let bytes = match axum::body::to_bytes(body, 8192).await {
             Ok(b) => b,
-            Err(_) => return ApiError::Unauthorized.into_response(),
+            Err(_) => return ApiError::TooLarge.into_response(),
         };
         let parsed: Option<ResolveBody> = serde_json::from_slice(&bytes).ok();
         key = parsed.as_ref().and_then(|b| normalize_key(&b.key));
@@ -419,8 +424,9 @@ pub async fn resolve_gallery(
         db.get_or_create_gallery(&key)
     };
     match slug {
-        Some(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
-        None => err(StatusCode::FORBIDDEN, "gallery banned"),
+        Ok(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
+        Err(MintError::Banned) => err(StatusCode::FORBIDDEN, "gallery banned"),
+        Err(MintError::Db) => ApiError::Internal.into_response(),
     }
 }
 
@@ -647,14 +653,19 @@ pub async fn put_photo(
         let db = state.db.lock().unwrap();
         match (&target, &key) {
             // Gallery page: key must own this slug. Same password on two
-            // galleries stays two galleries.
-            (Some(t), k) if db.gallery_exists(t) => {
+            // galleries stays two galleries. Banned keys stay banned.
+            (Some(t), k) => {
+                if db.is_banned(&key_hash(k)) {
+                    return err(StatusCode::FORBIDDEN, "gallery banned");
+                }
+                if !db.gallery_exists(t) {
+                    return err(StatusCode::NOT_FOUND, "unknown gallery");
+                }
                 if !db.key_owns_slug(k, t) {
                     return err(StatusCode::FORBIDDEN, "forbidden");
                 }
-                Some(t.clone())
+                t.clone()
             }
-            (Some(_), _) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
             // Home: always mint a fresh gallery, never reuse.
             (None, k) => {
                 if db.is_banned(&key_hash(k)) {
@@ -665,15 +676,17 @@ pub async fn put_photo(
                 }
                 drop(db);
                 let mut db = state.db.lock().unwrap();
-                db.get_or_create_gallery(k)
+                match db.get_or_create_gallery(k) {
+                    Ok(s) => s,
+                    Err(MintError::Banned) => {
+                        return err(StatusCode::FORBIDDEN, "gallery banned");
+                    }
+                    Err(MintError::Db) => return ApiError::Internal.into_response(),
+                }
             }
         }
     };
     tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
-    let slug = match slug {
-        Some(s) => s,
-        None => return err(StatusCode::FORBIDDEN, "gallery banned"),
-    };
     let (sanitized, _ext) = sanitize_filename(&raw_name);
     let t_body = std::time::Instant::now();
     // Stream the body straight to the O_EXCL file: bounded RAM (one frame
