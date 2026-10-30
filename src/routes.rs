@@ -529,6 +529,7 @@ pub async fn delete_gallery(
     }
     let prefix = format!("{slug}_");
     let mut removed: usize = 0;
+    let mut failed: usize = 0;
     if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
         while let Ok(Some(ent)) = rd.next_entry().await {
             let name = ent.file_name().to_string_lossy().into_owned();
@@ -537,8 +538,28 @@ pub async fn delete_gallery(
             }
             if tokio::fs::remove_file(ent.path()).await.is_ok() {
                 removed += 1;
+            } else {
+                failed += 1;
             }
         }
+    }
+    // A concurrent upload may land mid-sweep: re-scan, never claim success
+    // while files remain.
+    let mut remaining = false;
+    if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            if ent.file_name().to_string_lossy().starts_with(&prefix) {
+                remaining = true;
+                break;
+            }
+        }
+    }
+    if failed > 0 || remaining {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "deleted": slug, "files": removed, "error": "partial delete" })),
+        )
+            .into_response();
     }
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
 }
@@ -792,25 +813,46 @@ pub async fn get_photo(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let t_total = std::time::Instant::now();
-    if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+    // Orphaned/banned files stay on disk but are unreachable: reject names
+    // outside a known gallery before touching the filesystem.
+    let slug = match photo_slug(&name) {
+        Some(s) => s.to_string(),
+        None => return err(StatusCode::NOT_FOUND, "not found"),
+    };
+    let gallery_known = {
+        let db = state.db.lock().unwrap();
+        db.gallery_exists(&slug)
+    };
+    if !gallery_known {
         return err(StatusCode::NOT_FOUND, "not found");
     }
+    // ?pass= in <img> URLs stays: media tags cannot set headers, so the
+    // query secret is the only way to authorize direct photo embeds.
+    let query = raw.unwrap_or_default();
+    let pass = request_pass(&headers, &query);
     // Viewer lock applies per-file too (direct /photos/ links).
-    if let Some(slug) = photo_slug(&name) {
-        let key_ok = request_key(&headers)
-            .map(|k| {
-                let db = state.db.lock().unwrap();
-                db.key_owns_slug(&k, slug)
-            })
-            .unwrap_or(false);
-        if !key_ok {
-            let query = raw.unwrap_or_default();
-            let pass = request_pass(&headers, &query);
-            if let Some(deny) = check_locked(&state, slug, &pass).await {
-                return deny;
-            }
+    let key_ok = request_key(&headers)
+        .map(|k| {
+            let db = state.db.lock().unwrap();
+            db.key_owns_slug(&k, &slug)
+        })
+        .unwrap_or(false);
+    if !key_ok {
+        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+            return deny;
         }
     }
+    // Private cache when the gallery is locked and the viewer proved it with
+    // a password (header or ?pass=): never let a shared cache serve it.
+    let locked_gallery = {
+        let db = state.db.lock().unwrap();
+        db.gallery_pass_hash(&slug).is_some()
+    };
+    let cache_control = if locked_gallery && !pass.is_empty() {
+        "private, no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
     let t_canon = std::time::Instant::now();
     let path = state.dir.join(&name);
     // Contain within photos dir (no symlink escape); base canonicalized once.
@@ -840,19 +882,18 @@ pub async fn get_photo(
     .to_string();
     tracing::debug!(stage = "serve_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
     let stream = tokio_util::io::ReaderStream::new(file);
-    (
-        [
-            (header::CONTENT_TYPE, ctype),
-            (header::CONTENT_LENGTH, len.to_string()),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
-            (
-                header::HeaderName::from_static("x-content-type-options"),
-                "nosniff".to_string(),
-            ),
-        ],
-        Body::from_stream(stream),
-    )
-        .into_response()
+    // SVG runs in site origin: sandbox it and force download.
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header(header::CACHE_CONTROL, cache_control)
+        .header("x-content-type-options", "nosniff");
+    if ext == ".svg" {
+        builder = builder
+            .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+            .header(header::CONTENT_DISPOSITION, "attachment");
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 pub async fn delete_photo(
@@ -888,10 +929,9 @@ pub async fn delete_photo(
         }
     }
     let path = state.dir.join(&name);
-    if let Ok(canon) = path.canonicalize() {
-        if !canon.starts_with(&state.canon_dir) {
-            return err(StatusCode::NOT_FOUND, "not found");
-        }
+    match path.canonicalize() {
+        Ok(canon) if canon.starts_with(&state.canon_dir) => {}
+        _ => return err(StatusCode::NOT_FOUND, "not found"),
     }
     match tokio::fs::remove_file(&path).await {
         // Keep the gallery row: a concurrent upload landing between a file

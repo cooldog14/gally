@@ -797,3 +797,24 @@ async fn fix_c_oversize_admin_bodies_are_413() {
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     unsafe { std::env::remove_var("ADMIN_PASS"); }
 }
+
+#[tokio::test]
+async fn fix_b_svg_sandboxed() {
+    let (state, _tmp) = test_state().await;
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_vec();
+    let (status, v) =
+        put_photo(&state, "x.svg", Some(KEY_A), None, "image/svg+xml", svg).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
+    let uri = format!("/photos/{name}");
+    let resp = router(state).oneshot(get(&uri, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-security-policy").unwrap(),
+        "sandbox"
+    );
+    assert_eq!(
+        resp.headers().get("content-disposition").unwrap(),
+        "attachment"
+    );
+}
