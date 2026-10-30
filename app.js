@@ -141,6 +141,7 @@ lockBtn.addEventListener("click", async () => {
   input.value = "";
   // Keyless probe: the owner key bypasses the lock, so only an
   // unauthenticated listing 401s when the gallery is protected.
+  let locked = false;
   try {
     const probe = await fetch("/api/galleries/" + slug + "/photos");
     locked = probe.status === 401;

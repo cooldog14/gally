@@ -2,7 +2,7 @@
 
 - [x] 1. Migration predicate rebuilds every boot (A `fix/db-mint`)
 - [x] 2. Malformed lock body clears password (C `fix/admin-lock`)
-- [ ] 3. Protect dialog `ReferenceError` on undeclared `locked` (D `fix/client-dialog`)
+- [x] 3. Protect dialog `ReferenceError` on undeclared `locked` (D `fix/client-dialog`)
 - [x] 4. Uploaded SVG executes in site origin (B `fix/serve-files`)
 - [x] 5. Admin unlock brute-forceable, tokens never expire, no `Secure` (C `fix/admin-lock`)
 - [x] 6. `resolve_gallery` not rate-limited (A `fix/db-mint`)
