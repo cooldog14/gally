@@ -1,10 +1,10 @@
 # Audit fixes (review 2026-10-30) — 17 findings
 
 - [x] 1. Migration predicate rebuilds every boot (A `fix/db-mint`)
-- [ ] 2. Malformed lock body clears password (C `fix/admin-lock`)
+- [x] 2. Malformed lock body clears password (C `fix/admin-lock`)
 - [ ] 3. Protect dialog `ReferenceError` on undeclared `locked` (D `fix/client-dialog`)
 - [ ] 4. Uploaded SVG executes in site origin (B `fix/serve-files`)
-- [ ] 5. Admin unlock brute-forceable, tokens never expire, no `Secure` (C `fix/admin-lock`)
+- [x] 5. Admin unlock brute-forceable, tokens never expire, no `Secure` (C `fix/admin-lock`)
 - [x] 6. `resolve_gallery` not rate-limited (A `fix/db-mint`)
 - [x] 7. Mint errors misreported as "gallery banned" (A `fix/db-mint`)
 - [ ] 8. `delete_gallery` reports success on partial delete (B `fix/serve-files`)
@@ -15,5 +15,5 @@
 - [x] 13. Dead `escape()` (E `fix/lean-deps`)
 - [x] 14. Unused `libc`, `tower-http` deps (E `fix/lean-deps`)
 - [x] 15. Dead `lookup_gallery` trait method (A `fix/db-mint`)
-- [ ] 16. Dead `/api/me`, compat stubs return 404 not 410 (C `fix/admin-lock`)
+- [x] 16. Dead `/api/me`, compat stubs return 404 not 410 (C `fix/admin-lock`)
 - [ ] 17. `delete_photo` skips containment check on canonicalize failure (B `fix/serve-files`)

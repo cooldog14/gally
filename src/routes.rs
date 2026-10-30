@@ -319,10 +319,6 @@ pub async fn admin_banned(State(state): State<Arc<AppState>>, headers: HeaderMap
     (StatusCode::OK, Json(json!({ "banned": banned }))).into_response()
 }
 
-pub async fn api_me() -> Response {
-    err(StatusCode::UNAUTHORIZED, "unauthorized")
-}
-
 #[derive(Deserialize)]
 struct UnlockBody {
     #[serde(default)]
@@ -331,17 +327,21 @@ struct UnlockBody {
 
 pub async fn admin_unlock(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let _ = headers;
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    if rate_limited(&state, &ip) {
+        return ApiError::TooMany.into_response();
+    }
     let admin_pass = std::env::var("ADMIN_PASS").unwrap_or_default();
     if admin_pass.is_empty() {
         return err(StatusCode::NOT_FOUND, "not found");
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::FORBIDDEN, "forbidden"),
+        Err(_) => return ApiError::TooLarge.into_response(),
     };
     let guess: String = serde_json::from_slice::<UnlockBody>(&bytes)
         .map(|b| b.password)
@@ -353,8 +353,15 @@ pub async fn admin_unlock(
     }
     let tok = uuid::Uuid::new_v4().as_simple().to_string()
         + &uuid::Uuid::new_v4().as_simple().to_string();
-    state.admin_tokens.lock().unwrap().insert(tok.clone());
-    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/");
+    {
+        // Fresh login also sweeps expired tokens so the map never grows.
+        let mut tokens = state.admin_tokens.lock().unwrap();
+        tokens.retain(|_, issued| issued.elapsed() < crate::state::ADMIN_TOKEN_TTL);
+        tokens.insert(tok.clone(), std::time::Instant::now());
+    }
+    // No `Secure`: the server is plain HTTP, so browsers would refuse to
+    // store (and never return) a Secure cookie, silently breaking login.
+    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400");
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
@@ -566,11 +573,15 @@ pub async fn lock_gallery(
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
+        // Oversize and stream errors both surface here; oversize is the
+        // only realistic cause, so report 413 (ApiError::TooLarge).
+        Err(_) => return ApiError::TooLarge.into_response(),
+    };
+    // Malformed JSON never silently clears the lock: reject it.
+    let password: String = match serde_json::from_slice::<LockBody>(&bytes) {
+        Ok(b) => b.password,
         Err(_) => return err(StatusCode::BAD_REQUEST, "bad request"),
     };
-    let password: String = serde_json::from_slice::<LockBody>(&bytes)
-        .map(|b| b.password)
-        .unwrap_or_default();
     let hash = if password.is_empty() {
         None
     } else {
@@ -609,7 +620,7 @@ pub async fn admin_unban(
     }
     let bytes = match axum::body::to_bytes(body, 8192).await {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::BAD_REQUEST, "gallery key required"),
+        Err(_) => return ApiError::TooLarge.into_response(),
     };
     let key = serde_json::from_slice::<UnbanBody>(&bytes)
         .ok()
@@ -896,7 +907,7 @@ pub async fn delete_photo(
 // --- compat stubs ---
 
 pub async fn gone_compat() -> Response {
-    err(StatusCode::NOT_FOUND, "not found")
+    err(StatusCode::GONE, "gone")
 }
 
 pub async fn fallback_404() -> Response {

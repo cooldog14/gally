@@ -60,8 +60,15 @@ async fn body_bytes(resp: Response) -> Vec<u8> {
 /// Insert a live admin token directly and return its `Cookie` header value.
 fn admin_cookie(state: &Arc<AppState>) -> String {
     let tok = "test-admin-token".to_string();
-    state.admin_tokens.lock().unwrap().insert(tok.clone());
+    state.admin_tokens.lock().unwrap().insert(tok.clone(), std::time::Instant::now());
     format!("admin={tok}")
+}
+
+/// `ADMIN_PASS` is process-global: every test that sets/removes it must hold
+/// this lock for its whole body, or parallel tests race each other.
+static ADMIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn lock_admin_env() -> std::sync::MutexGuard<'static, ()> {
+    ADMIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn key_header(key: &str) -> (&str, &str) {
@@ -581,8 +588,9 @@ async fn delete_by_admin_succeeds() {
 
 #[tokio::test]
 async fn admin_unlock_without_pass_is_404() {
-    // Only this test touches the process env, and no other test reads
-    // ADMIN_PASS, so remove/restore here is race-free within this binary.
+    let _env = lock_admin_env();
+    // Only tests holding ADMIN_ENV_LOCK touch the process env, so
+    // remove/restore here is race-free within this binary.
     let saved = std::env::var("ADMIN_PASS").ok();
     // SAFETY: only this test touches the process env in this binary.
     unsafe { std::env::remove_var("ADMIN_PASS"); }
@@ -595,7 +603,6 @@ async fn admin_unlock_without_pass_is_404() {
         unsafe { std::env::set_var("ADMIN_PASS", v); }
     }
 }
-
 #[tokio::test]
 async fn admin_endpoints_reject_unauth() {
     let (state, _tmp) = test_state().await;
@@ -669,16 +676,124 @@ async fn unknown_gallery_slug_redirects_home() {
 // --- compat stubs ---
 
 #[tokio::test]
-async fn compat_register_is_404() {
+async fn compat_register_is_gone() {
     let (state, _tmp) = test_state().await;
     let r = post_json("/api/register", &[], "{}");
     let resp = router(state).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::GONE);
 }
 
 #[tokio::test]
-async fn api_me_is_401() {
+async fn compat_login_logout_are_gone() {
     let (state, _tmp) = test_state().await;
-    let resp = router(state).oneshot(get("/api/me", &[])).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    for uri in ["/api/login", "/api/logout"] {
+        let r = post_json(uri, &[], "{}");
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+        assert_eq!(body_json(resp).await.get("error"), Some(&serde_json::Value::String("gone".into())));
+    }
+}
+
+// --- stream C findings ---
+
+#[tokio::test]
+async fn fix_c_malformed_lock_body_is_400_and_keeps_state() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    let uri = format!("/api/galleries/{slug}/lock");
+    // Malformed JSON must not clear (or set) the lock: 400, gallery stays open.
+    let r = post_json(&uri, &[key_header(KEY_A)], "not json{{{");
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Empty body is likewise a 400, not a silent clear.
+    let r = request("POST", &uri, &[("content-type", "application/json"), key_header(KEY_A)], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fix_c_wrong_admin_password_is_403() {
+    let _env = lock_admin_env();
+    let (state, _tmp) = test_state().await;
+    // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
+    unsafe { std::env::set_var("ADMIN_PASS", "correct-horse"); }
+    let r = post_json("/api/admin/unlock", &[], r#"{"password":"wrong"}"#);
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    unsafe { std::env::remove_var("ADMIN_PASS"); }
+}
+
+#[tokio::test]
+async fn fix_c_unlock_login_lists_and_unbans() {
+    let _env = lock_admin_env();
+    // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
+    unsafe { std::env::set_var("ADMIN_PASS", "s3cret-admin"); }
+    let (state, _tmp) = test_state().await;
+    // Unlock: get the HttpOnly 24h cookie.
+    let r = post_json("/api/admin/unlock", &[], r#"{"password":"s3cret-admin"}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(set_cookie.contains("admin="), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("Max-Age=86400"), "{set_cookie}");
+    // Plain-HTTP server: no `Secure`, or browsers silently drop the cookie.
+    assert!(!set_cookie.to_ascii_lowercase().split(';').skip(1).any(|p| p.trim() == "secure"), "{set_cookie}");
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    // Admin list works with the cookie.
+    let resp = router(state.clone())
+        .oneshot(get("/api/admin/galleries", &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Unban with garbage key: 400 (valid JSON, unusable key).
+    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], r#"{"key":"x"}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Unban a well-formed but never-banned key: 404.
+    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], r#"{"key":"never-banned-anywhere"}"#);
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    unsafe { std::env::remove_var("ADMIN_PASS"); }
+}
+
+#[tokio::test]
+async fn fix_c_expired_admin_token_rejected() {
+    let (state, _tmp) = test_state().await;
+    let tok = "stale-admin-token".to_string();
+    state.admin_tokens.lock().unwrap().insert(
+        tok.clone(),
+        std::time::Instant::now() - gally_uring::state::ADMIN_TOKEN_TTL - std::time::Duration::from_secs(1),
+    );
+    let resp = router(state.clone())
+        .oneshot(get("/api/admin/galleries", &[("cookie", format!("admin={tok}").as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Expired token is swept on sight.
+    assert!(!state.admin_tokens.lock().unwrap().contains_key(&tok));
+}
+
+#[tokio::test]
+async fn fix_c_oversize_admin_bodies_are_413() {
+    let _env = lock_admin_env();
+    // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
+    unsafe { std::env::set_var("ADMIN_PASS", "s3cret-admin"); }
+    let (state, _tmp) = test_state().await;
+    let cookie = admin_cookie(&state);
+    let big = "x".repeat(9000);
+    let big_json = format!(r#"{{"password":"{big}"}}"#);
+    let r = post_json("/api/admin/unlock", &[], &big_json);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], &big_json.replace("password", "key"));
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    unsafe { std::env::remove_var("ADMIN_PASS"); }
 }
