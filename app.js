@@ -176,6 +176,10 @@ document.getElementById("setpass-form").addEventListener("submit", async () => {
       return;
     }
     const data = await res.json().catch(() => null);
+    try {
+      if (clicked === "remove") sessionStorage.removeItem("gallery-pass:" + slug);
+      else sessionStorage.setItem("gallery-pass:" + slug, input.value);
+    } catch (_) {}
     uploadStatus.textContent = data && data.locked ? "Gallery protected." : "Protection removed.";
     await loadPhotos();
   } catch (_) {
@@ -231,11 +235,10 @@ function mediaKind(name) {
 }
 
 // Media URLs carry the viewer password (query) when the gallery is locked;
-// the owner key bypasses the lock server-side so no query is needed then.
+// <img>/<video>/<audio> cannot send the header, so it goes in the URL.
 function mediaUrl(name) {
   const slug = slugFromPath();
   const base = "/photos/" + encodeURIComponent(name);
-  if (galleryKey) return base;
   const p = slug ? storedPass(slug) : "";
   return p ? base + "?pass=" + encodeURIComponent(p) : base;
 }
@@ -679,7 +682,8 @@ fileInput.addEventListener("change", async () => {
   const pageSlug = slugFromPath();
   async function putFile(file, extra) {
     const headers = { "X-Gallery-Key": key, ...extra };
-    if (pageSlug) headers["X-Gallery-Slug"] = pageSlug;
+    const target = pageSlug || firstSlug;
+    if (target) headers["X-Gallery-Slug"] = target;
     if (file.type) headers["Content-Type"] = file.type;
     try {
       return await fetch("/api/photos/" + encodeURIComponent(file.name), {
