@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Photos</title>
 <link rel="stylesheet" href="./styles.css">
+<script src="./vendor-heic2any.min.js" defer></script>
 <script>
 try {
   var saved = localStorage.getItem("theme");
@@ -16,49 +17,77 @@ try {
 </head>
 <body>
 <header id="topbar">
-  <span id="wordmark">Photos</span>
-  <div id="account">
-    <div id="auth-block">
-      <input type="text" id="auth-username" placeholder="Username" autocomplete="username" maxlength="20">
-      <input type="password" id="auth-password" placeholder="Password" autocomplete="current-password">
-      <button id="login-btn" type="button">Log in</button>
-      <button id="register-btn" type="button">Register</button>
-    </div>
-    <div id="user-block" hidden>
-      <span id="user-label"></span>
-      <button id="logout-btn" type="button">Log out</button>
-    </div>
-    <div id="auth-error" role="alert"></div>
-  </div>
+  <button id="upload-btn" type="button">Upload</button>
+  <input type="file" id="file-input" multiple hidden>
+  <button id="edit-btn" type="button" hidden>Edit</button>
+  <span id="gallery-label"></span>
   <div id="actions">
-    <label id="upload-btn" for="file-input" hidden>Upload</label>
-    <input type="file" id="file-input" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple hidden>
     <button id="theme-btn" type="button" aria-label="Toggle theme">&#9789;</button>
   </div>
 </header>
+<div id="editbar" hidden>
+  <span id="sel-count">0 selected</span>
+  <button id="lock-btn" type="button">Protect</button>
+  <button id="delete-btn" type="button">Delete</button>
+  <button id="done-btn" type="button">Done</button>
+</div>
 <main id="main">
   <p id="upload-status" role="status"></p>
-  <p id="empty">No photos yet</p>
+  <p id="empty" hidden>Empty gallery.</p>
   <div id="grid"></div>
 </main>
-<footer id="footer">
-  <details id="admin-details">
-    <summary>Admin</summary>
-    <input type="password" id="admin-password" placeholder="Admin password" autocomplete="off">
-    <button id="admin-unlock-btn" type="button">Unlock</button>
-    <div id="admin-error" role="alert"></div>
-    <div id="admin-panel" hidden>
-      <h2>Users</h2>
-      <ul id="admin-users"></ul>
+<dialog id="key-dialog" aria-labelledby="key-title">
+  <form method="dialog" id="key-form">
+    <h2 id="key-title">Gallery key</h2>
+    <input type="password" id="key-input" autocomplete="off" maxlength="128">
+    <p id="key-error" role="alert"></p>
+    <label id="private-row"><input type="checkbox" id="private-check"> Private gallery</label>
+    <input type="password" id="key-pass-input" placeholder="Viewer password" autocomplete="new-password" hidden>
+    <div id="key-actions">
+      <button id="key-confirm" value="default" type="submit">Continue</button>
     </div>
-  </details>
-</footer>
+  </form>
+</dialog>
+<dialog id="pass-dialog" aria-labelledby="pass-title">
+  <form method="dialog" id="pass-form">
+    <h2 id="pass-title">Locked gallery</h2>
+    <p>This gallery is password-protected. Enter the gallery password to view it. The owner key always works too.</p>
+    <input type="password" id="pass-input" placeholder="Gallery password" autocomplete="off">
+    <p id="pass-error" role="alert"></p>
+    <div id="key-actions">
+      <button value="cancel" formnovalidate type="submit">Cancel</button>
+      <button id="pass-confirm" value="default" type="submit">Unlock</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="setpass-dialog" aria-labelledby="setpass-title">
+  <form method="dialog" id="setpass-form">
+    <h2 id="setpass-title">Protect gallery</h2>
+    <p id="setpass-help">Viewers will need this password to open the gallery.</p>
+    <input type="password" id="setpass-input" placeholder="New password" autocomplete="new-password">
+    <p id="setpass-error" role="alert"></p>
+    <div id="key-actions">
+      <button value="cancel" formnovalidate type="submit">Cancel</button>
+      <button id="setpass-remove" value="remove" formnovalidate type="submit" hidden>Remove protection</button>
+      <button id="setpass-confirm" value="default" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <form method="dialog" id="confirm-form">
+    <h2 id="confirm-title">Delete photos?</h2>
+    <p id="confirm-text">This cannot be undone.</p>
+    <div id="key-actions">
+      <button value="cancel" formnovalidate type="submit">Cancel</button>
+      <button id="confirm-yes" value="default" type="submit">Delete</button>
+    </div>
+  </form>
+</dialog>
 <div id="lightbox" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>
   <button id="close" aria-label="Close">&times;</button>
   <button id="prev" aria-label="Previous">&lsaquo;</button>
-  <img id="frame" alt="">
+  <div id="viewport"></div>
   <button id="next" aria-label="Next">&rsaquo;</button>
-  <button id="delete-btn" aria-label="Delete photo" hidden>Delete</button>
   <div id="counter"></div>
 </div>
 <script src="./app.js"></script>
