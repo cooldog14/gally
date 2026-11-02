@@ -60,6 +60,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     )?;
     // Migrate pre-password databases.
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN pass_hash BLOB", []);
+    // Migrate pre-canvas databases: one freeform canvas document per gallery.
+    let _ = conn.execute("ALTER TABLE galleries ADD COLUMN canvas TEXT", []);
     // Migrate pre-scoped-auth databases: same key may own many galleries now.
     // Old DDL carried `UNIQUE` on key_hash; rebuild the table without it.
     let legacy: bool = conn
@@ -72,8 +74,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         .unwrap_or(false);
     if legacy {
         conn.execute_batch(
-            "CREATE TABLE galleries_new(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB);
-             INSERT INTO galleries_new SELECT slug, key_hash, created, pass_hash FROM galleries;
+            "CREATE TABLE galleries_new(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, canvas TEXT);
+             INSERT INTO galleries_new SELECT slug, key_hash, created, pass_hash, canvas FROM galleries;
              DROP TABLE galleries;
              ALTER TABLE galleries_new RENAME TO galleries;
              CREATE INDEX idx_galleries_key ON galleries(key_hash);",
@@ -108,6 +110,15 @@ pub trait GalleryDb {
     fn gallery_pass_hash(&self, slug: &str) -> Option<Vec<u8>>;
     /// Set (Some) or clear (None) the gallery password. False when unknown.
     fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> bool;
+    /// Stored canvas JSON document, if the gallery has one.
+    fn get_canvas(&self, slug: &str) -> Option<String>;
+    /// Store a validated canvas document verbatim. False when slug unknown.
+    fn set_canvas(&self, slug: &str, doc: &str) -> bool;
+    /// Slugs at least `min_age_secs` old whose stored canvas has no content.
+    /// Media on disk is the caller's half of the emptiness check.
+    fn empty_galleries(&self, min_age_secs: i64) -> Vec<String>;
+    /// Drop one gallery row without banning its key. False when unknown.
+    fn delete_gallery_rows(&self, slug: &str) -> bool;
 }
 
 impl GalleryDb for Connection {
@@ -192,6 +203,42 @@ impl GalleryDb for Connection {
             .map(|n| n > 0)
             .unwrap_or(false)
     }
+
+    fn get_canvas(&self, slug: &str) -> Option<String> {
+        self.query_row("SELECT canvas FROM galleries WHERE slug = ?1", [slug], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+    }
+
+    fn set_canvas(&self, slug: &str, doc: &str) -> bool {
+        self.execute("UPDATE galleries SET canvas = ?1 WHERE slug = ?2", rusqlite::params![doc, slug])
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    fn empty_galleries(&self, min_age_secs: i64) -> Vec<String> {
+        let cutoff = now_secs() - min_age_secs;
+        let mut out = Vec::new();
+        // Empty = never saved a canvas, or saved the empty document the client
+        // writes (`{"blocks":[]}`, no whitespace).
+        let Ok(mut stmt) = self.prepare(
+            "SELECT slug FROM galleries WHERE created <= ?1 AND (canvas IS NULL OR canvas IN ('', '{\"blocks\":[]}'))",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([cutoff], |r| r.get::<_, String>(0)) {
+            out.extend(rows.flatten());
+        }
+        out
+    }
+
+    fn delete_gallery_rows(&self, slug: &str) -> bool {
+        self.execute("DELETE FROM galleries WHERE slug = ?1", [slug])
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +249,7 @@ mod tests {
         let conn = Connection::open_in_memory().expect("mem db");
         conn.execute_batch(
             "PRAGMA temp_store=MEMORY;
-             CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB);
+             CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, canvas TEXT);
              CREATE INDEX idx_galleries_key ON galleries(key_hash);
              CREATE TABLE banned_keys(key_hash BLOB PRIMARY KEY, created INTEGER NOT NULL);",
         )
@@ -269,6 +316,51 @@ mod tests {
         assert_eq!(rows, 1);
         assert!(db2.gallery_exists(&slug));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canvas_roundtrip_and_persists_across_reopen() {
+        let dir = std::env::temp_dir().join(format!("gally-db-canvas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("g.db");
+        let doc = r#"{"blocks":[{"id":"a","kind":"text","x":5,"y":20,"w":50,"text":"hi"}]}"#;
+        let mut db = open(&path).expect("open");
+        let slug = db.get_or_create_gallery("canvas-key-01").expect("create");
+        assert_eq!(db.get_canvas(&slug), None);
+        assert!(db.set_canvas(&slug, doc));
+        assert_eq!(db.get_canvas(&slug).as_deref(), Some(doc));
+        // Unknown slug: never writes, never invents a row.
+        assert!(!db.set_canvas("nope-not-real-slug-aaaa", doc));
+        assert_eq!(db.get_canvas("nope-not-real-slug-aaaa"), None);
+        drop(db);
+        // Canvas survives reopen (migration is idempotent).
+        let db2 = open(&path).expect("reopen");
+        assert_eq!(db2.get_canvas(&slug).as_deref(), Some(doc));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_galleries_listed_and_deleted_without_banning() {
+        let mut db = mem();
+        let blank = db.get_or_create_gallery("purge-key-01").expect("create");
+        let emptied = db.get_or_create_gallery("purge-key-02").expect("create");
+        let used = db.get_or_create_gallery("purge-key-03").expect("create");
+        assert!(db.set_canvas(&emptied, r#"{"blocks":[]}"#));
+        assert!(db.set_canvas(&used, r#"{"blocks":[{"id":"a"}]}"#));
+
+        let empty = db.empty_galleries(0);
+        assert!(empty.contains(&blank), "{empty:?}");
+        assert!(empty.contains(&emptied), "{empty:?}");
+        assert!(!empty.contains(&used), "{empty:?}");
+        // Too young to judge: nothing listed.
+        assert!(db.empty_galleries(3600).is_empty());
+
+        // Purge drops the row but leaves the key usable (no ban).
+        assert!(db.delete_gallery_rows(&blank));
+        assert!(!db.gallery_exists(&blank));
+        assert!(!db.delete_gallery_rows(&blank));
+        assert!(!db.is_banned(&key_hash("purge-key-01")));
+        assert!(db.get_or_create_gallery("purge-key-01").is_ok());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 
 pub mod db;
+pub mod purge;
 pub mod routes;
 pub mod state;
 pub mod validate;
@@ -28,6 +29,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     use routes::*;
     Router::new()
         .route("/api/galleries/{slug}/photos", get(gallery_photos))
+        .route("/api/galleries/{slug}/canvas", get(get_canvas).put(put_canvas))
         .route("/api/admin/galleries", get(admin_galleries))
         .route("/api/admin/banned", get(admin_banned))
         .route("/api/photos/{*name}", put(put_photo))
@@ -45,7 +47,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/gally/admin/", get(admin_page))
         .route("/gally/admin", get(admin_page_redirect))
         .route("/app.js", get(static_path))
-        .route("/vendor-heic2any.min.js", get(static_path))
         .route("/styles.css", get(static_path))
         .route("/index.html", get(static_path))
         .route("/fonts/Figtree-400.woff2", get(static_path))

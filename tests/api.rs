@@ -818,3 +818,202 @@ async fn fix_b_svg_sandboxed() {
         "attachment"
     );
 }
+
+// --- canvas document ---
+
+async fn put_canvas_doc(
+    state: &Arc<AppState>,
+    slug: &str,
+    key: Option<&str>,
+    doc: &str,
+) -> (StatusCode, serde_json::Value) {
+    let mut h = vec![("content-type", "application/json")];
+    if let Some(k) = key {
+        h.push(key_header(k));
+    }
+    let uri = format!("/api/galleries/{slug}/canvas");
+    let resp = router(state.clone())
+        .oneshot(request("PUT", &uri, &h, Body::from(doc.to_string())))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+async fn get_canvas_raw(
+    state: &Arc<AppState>,
+    slug: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let uri = format!("/api/galleries/{slug}/canvas");
+    let resp = router(state.clone())
+        .oneshot(get(&uri, headers))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, String::from_utf8(body_bytes(resp).await).unwrap())
+}
+
+fn text_canvas_doc() -> String {
+    r#"{"blocks":[{"id":"a","kind":"text","x":5,"y":20,"w":50,"text":"hello"}]}"#.to_string()
+}
+
+#[tokio::test]
+async fn canvas_owner_put_viewer_get_roundtrip() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+
+    // Fresh gallery: empty canvas, not a 404.
+    let (status, body) = get_canvas_raw(&state, &slug, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"blocks":[]}"#);
+
+    let doc = text_canvas_doc();
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &doc).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Viewer (no key, no password): identical document, verbatim.
+    let (status, body) = get_canvas_raw(&state, &slug, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, doc);
+}
+
+#[tokio::test]
+async fn canvas_put_needs_owning_key() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    let doc = text_canvas_doc();
+    let (status, _) = put_canvas_doc(&state, &slug, None, &doc).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_B), &doc).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Rejected writes never land.
+    let (status, body) = get_canvas_raw(&state, &slug, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"blocks":[]}"#);
+}
+
+#[tokio::test]
+async fn canvas_media_must_exist_in_this_gallery() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    // A real photo in someone else's gallery.
+    let (_, v) = put_photo(&state, "other.jpg", Some(KEY_B), None, "image/jpeg", jpeg()).await;
+    let other_slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    let other_name = v.get("name").and_then(|s| s.as_str()).unwrap().to_string();
+    assert_ne!(slug, other_slug);
+
+    let cross = format!(
+        r#"{{"blocks":[{{"id":"a","kind":"image","x":0,"y":0,"w":50,"src":"{other_name}"}}]}}"#
+    );
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &cross).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Own-shaped name that does not exist on disk is rejected too.
+    let ghost = format!("{slug}_{}_ghost.jpg", "b".repeat(32));
+    let doc = format!(
+        r#"{{"blocks":[{{"id":"a","kind":"audio","x":0,"y":0,"w":50,"src":"{ghost}"}}]}}"#
+    );
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &doc).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Real own photo: accepted.
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), Some(&slug), "image/jpeg", jpeg()).await;
+    let own = v.get("name").and_then(|s| s.as_str()).unwrap().to_string();
+    let doc = format!(
+        r#"{{"blocks":[{{"id":"a","kind":"image","x":0,"y":0,"w":50,"src":"{own}"}}]}}"#
+    );
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &doc).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn canvas_rejects_malformed_documents() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    for doc in [
+        "",
+        "not json",
+        "[]",
+        r#"{"blocks":[] ,"extra":1}"#,
+        r#"{"blocks":[{"id":"a","kind":"video","x":0,"y":0,"w":50}]}"#,
+        r#"{"blocks":[{"id":"a","kind":"text","x":5,"y":20,"w":200,"text":"hi"}]}"#,
+    ] {
+        let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), doc).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "accepted: {doc}");
+    }
+    // Oversize body (cap is 256 KiB).
+    let big = format!(
+        r#"{{"blocks":[{{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":"{}"}}]}}"#,
+        "x".repeat(300 * 1024)
+    );
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &big).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Unknown gallery: GET 404; PUT 403 (not owned), like the lock route.
+    let (status, _) = put_canvas_doc(&state, "quiet-river-calm-pond-1a2b", Some(KEY_A), &text_canvas_doc()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = get_canvas_raw(&state, "quiet-river-calm-pond-1a2b", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn canvas_respects_viewer_lock() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    let (status, _) = put_canvas_doc(&state, &slug, Some(KEY_A), &text_canvas_doc()).await;
+    assert_eq!(status, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"letmein"}"#,
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Locked: no credentials → 401, unknown document (not a leak).
+    let (status, _) = get_canvas_raw(&state, &slug, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Viewer password and owner key both open it.
+    let (status, body) = get_canvas_raw(&state, &slug, &[("x-gallery-pass", "letmein")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, text_canvas_doc());
+    let (status, _) = get_canvas_raw(&state, &slug, &[key_header(KEY_A)]).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// --- empty-gallery sweep ---
+
+#[tokio::test]
+async fn sweep_purges_only_unused_galleries() {
+    use gally_uring::db::GalleryDb;
+    let (state, _tmp) = test_state().await;
+    // Minted and never used.
+    let (_, v) = resolve(&state, KEY_A).await;
+    let blank = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    // Media uploaded, canvas never saved: must survive.
+    let (_, v) = put_photo(&state, "keep.jpg", Some(KEY_B), None, "image/jpeg", jpeg()).await;
+    let with_media = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    // Canvas with a block: must survive.
+    let (_, v) = resolve(&state, "purge-third-key-01").await;
+    let with_canvas = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    {
+        let db = state.db.lock().unwrap();
+        db.set_canvas(&with_canvas, r#"{"blocks":[{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":"hi"}]}"#);
+        // Age everything past the grace period.
+        db.execute("UPDATE galleries SET created = 0", []).expect("age rows");
+    }
+    gally_uring::purge::sweep(&state).await;
+    let db = state.db.lock().unwrap();
+    assert!(!db.gallery_exists(&blank), "empty gallery survived the sweep");
+    assert!(db.gallery_exists(&with_media), "gallery with media was purged");
+    assert!(db.gallery_exists(&with_canvas), "gallery with canvas was purged");
+    // Purging is not banning: the key still mints.
+    drop(db);
+    let (status, _) = resolve(&state, KEY_A).await;
+    assert_eq!(status, StatusCode::OK);
+}

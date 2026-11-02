@@ -1,233 +1,41 @@
 "use strict";
 
-const grid = document.getElementById("grid");
-const empty = document.getElementById("empty");
-const lightbox = document.getElementById("lightbox");
-const viewport = document.getElementById("viewport");
-const counter = document.getElementById("counter");
-const prevBtn = document.getElementById("prev");
-const nextBtn = document.getElementById("next");
-const closeBtn = document.getElementById("close");
-const fileInput = document.getElementById("file-input");
+const MAX_BYTES = 10 * 1024 * 1024 * 1024;
+
+const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4})$/;
+
 const galleryLabel = document.getElementById("gallery-label");
+const uploadBtn = document.getElementById("upload-btn");
+const uploadStatus = document.getElementById("upload-status");
+const fileInput = document.getElementById("file-input");
+const themeBtn = document.getElementById("theme-btn");
 const keyDialog = document.getElementById("key-dialog");
 const keyForm = document.getElementById("key-form");
 const keyInput = document.getElementById("key-input");
 const keyError = document.getElementById("key-error");
 
-const MAX_BYTES = 10 * 1024 * 1024 * 1024;
-
-const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4})$/;
-
-let photos = [];
-let index = 0;
 // Gallery key: kept in memory + sessionStorage (per-tab). Never in the URL.
 let galleryKey = sessionStorage.getItem("gallery-key") || "";
 let keyResolver = null;
-// Viewer password for locked galleries: "<slug>:<password>" per tab.
-function storedPass(slug) {
-  try { return sessionStorage.getItem("gallery-pass:" + slug) || ""; }
-  catch (_) { return ""; }
-}
-// Edit mode: tap tiles to select, Delete acts on the selection.
-let editing = false;
-const selected = new Set();
-const selCount = document.getElementById("sel-count");
-const uploadBtn = document.getElementById("upload-btn");
-const uploadStatus = document.getElementById("upload-status");
-const themeBtn = document.getElementById("theme-btn");
-const editBtn = document.getElementById("edit-btn");
-const editBar = document.getElementById("editbar");
-const deleteBtn = document.getElementById("delete-btn");
-const lockBtn = document.getElementById("lock-btn");
-const doneBtn = document.getElementById("done-btn");
-const confirmDialog = document.getElementById("confirm-dialog");
-const confirmText = document.getElementById("confirm-text");
-const confirmForm = document.getElementById("confirm-form");
+
+// Media uploaded to this gallery: the canvas block picker reads it.
+let photos = [];
 
 function slugFromPath() {
   const seg = location.pathname.split("/").filter(Boolean)[0] || "";
   return SLUG_RE.test(seg) ? seg : "";
 }
 
-async function loadPhotos() {
-  const slug = slugFromPath();
-  if (!slug) {
-    // Landing page: no gallery yet. Upload prompts for a key.
-    galleryLabel.textContent = "";
-    editBtn.hidden = true;
-    setEditing(false);
-    photos = [];
-    renderGrid();
-    return;
-  }
-  galleryLabel.textContent = slug;
-  editBtn.hidden = false;
-  try {
-    const headers = {};
-    if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
-    else {
-      const p = storedPass(slug);
-      if (p) headers["X-Gallery-Pass"] = p;
-    }
-    const res = await fetch("/api/galleries/" + slug + "/photos", { headers });
-    if (res.status === 404) {
-      // Gallery deleted/emptied away: back to the landing page.
-      location.assign("/");
-      return;
-    }
-    if (res.status === 401) {
-      // Locked: prompt for the viewer password (owner key also accepted).
-      const ok = await needPass(slug);
-      if (ok) return loadPhotos();
-      photos = [];
-      renderGrid();
-      empty.hidden = false;
-      empty.textContent = "This gallery is locked.";
-      return;
-    }
-    if (!res.ok) throw new Error("bad status " + res.status);
-    const data = await res.json();
-    photos = data.photos || [];
-    // Drop selection for photos that no longer exist.
-    for (const name of Array.from(selected)) {
-      if (!photos.some((p) => p.name === name)) selected.delete(name);
-    }
-    renderGrid();
-    updateEditUI();
-  } catch (_) {
-    empty.hidden = false;
-    empty.textContent = "Could not load photos";
-  }
+// Viewer password for locked galleries: "<slug>:<password>" per tab.
+function storedPass(slug) {
+  try { return sessionStorage.getItem("gallery-pass:" + slug) || ""; }
+  catch (_) { return ""; }
 }
-
-function setEditing(on) {
-  editing = on;
-  if (!on) selected.clear();
-  editBar.hidden = !on;
-  editBtn.textContent = on ? "Editing…" : "Edit";
-  uploadBtn.hidden = on;
-  updateEditUI();
-}
-
-function updateEditUI() {
-  selCount.textContent = selected.size + " selected";
-  deleteBtn.disabled = selected.size === 0;
-  renderGrid();
-}
-
-editBtn.addEventListener("click", async () => {
-  if (editing) {
-    setEditing(false);
-    return;
-  }
-  const key = await needKey();
-  if (!key) return;
-  setEditing(true);
-});
-
-doneBtn.addEventListener("click", () => setEditing(false));
-
-lockBtn.addEventListener("click", async () => {
-  const slug = slugFromPath();
-  if (!slug) return;
-  const key = await needKey();
-  if (!key) return;
-  const input = document.getElementById("setpass-input");
-  const errEl = document.getElementById("setpass-error");
-  const help = document.getElementById("setpass-help");
-  const removeBtn = document.getElementById("setpass-remove");
-  errEl.textContent = "";
-  input.value = "";
-  // Keyless probe: the owner key bypasses the lock, so only an
-  // unauthenticated listing 401s when the gallery is protected.
-  let locked = false;
-  try {
-    const probe = await fetch("/api/galleries/" + slug + "/photos");
-    locked = probe.status === 401;
-  } catch (_) {}
-  removeBtn.hidden = !locked;
-  help.textContent = locked
-    ? "This gallery is protected. Enter a new password to change it, or remove protection below."
-    : "Viewers will need this password to open the gallery.";
-  document.getElementById("setpass-dialog").showModal();
-  input.focus();
-});
-
-document.getElementById("setpass-form").addEventListener("submit", async () => {
-  const clicked = document.activeElement && document.activeElement.value;
-  if (clicked === "cancel") return;
-  const slug = slugFromPath();
-  const input = document.getElementById("setpass-input");
-  const errEl = document.getElementById("setpass-error");
-  if (clicked !== "remove" && !input.value) return; // empty = keep, no request
-  const key = galleryKey;
-  try {
-    const res = await fetch("/api/galleries/" + slug + "/lock", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
-      body: JSON.stringify({ password: clicked === "remove" ? "" : input.value }),
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
-      errEl.textContent = msg;
-      document.getElementById("setpass-dialog").showModal();
-      return;
-    }
-    const data = await res.json().catch(() => null);
-    uploadStatus.textContent = data && data.locked ? "Gallery protected." : "Protection removed.";
-    await loadPhotos();
-  } catch (_) {
-    errEl.textContent = "Request failed";
-    document.getElementById("setpass-dialog").showModal();
-  }
-});
-
-deleteBtn.addEventListener("click", () => {
-  if (!selected.size) return;
-  confirmText.textContent = "Delete " + selected.size + (selected.size === 1 ? " photo?" : " photos?") + " This cannot be undone.";
-  confirmDialog.showModal();
-});
-confirmForm.addEventListener("submit", async () => {
-  if (document.activeElement && document.activeElement.value === "cancel") return;
-  const names = Array.from(selected);
-  const key = galleryKey;
-  const failures = [];
-  await Promise.all(names.map(async (name) => {
-    try {
-      const res = await fetch("/api/photos/" + encodeURIComponent(name), {
-        method: "DELETE",
-        headers: { "X-Gallery-Key": key },
-      });
-      if (!res.ok) {
-        let msg = res.statusText;
-        try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
-        failures.push(displayName(name) + ": " + msg);
-      }
-    } catch (_) {
-      failures.push(displayName(name) + ": delete failed");
-    }
-  }));
-  uploadStatus.textContent = failures.length ? failures.join("; ") : "";
-  await loadPhotos();
-});
 
 function displayName(stored) {
   const i = stored.indexOf("_");
   const j = stored.indexOf("_", i + 1);
   return j >= 0 ? stored.slice(j + 1) : stored;
-}
-
-function mediaKind(name) {
-  const dot = name.lastIndexOf(".");
-  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : "";
-  if ([".heic", ".heif"].includes(ext)) return "heic";
-  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".svg", ".ico"].includes(ext)) return "image";
-  if ([".mp4", ".webm", ".ogv", ".ogm", ".mov"].includes(ext)) return "video";
-  if ([".mp3", ".wav", ".flac", ".m4a", ".ogg", ".oga", ".opus"].includes(ext)) return "audio";
-  if ([".txt", ".md", ".markdown", ".json", ".csv", ".log", ".xml", ".yaml", ".yml", ""].includes(ext)) return "text";
-  return "file";
 }
 
 // Media URLs carry the viewer password (query) when the gallery is locked;
@@ -240,8 +48,7 @@ function mediaUrl(name) {
   return p ? base + "?pass=" + encodeURIComponent(p) : base;
 }
 
-// Same credential as a header (for fetch(), which unlike <img>/<video>
-// tags can set headers).
+// Same credential as a header (for fetch()).
 function passHeader() {
   const slug = slugFromPath();
   const p = slug ? storedPass(slug) : "";
@@ -251,302 +58,10 @@ function passHeader() {
   return headers;
 }
 
-async function authedFetch(name) {
-  const url = mediaUrl(name);
-  const headers = passHeader();
-  const q = url.indexOf("?pass=");
-  if (q >= 0) return fetch(url.slice(0, q), { headers });
-  return fetch(url, { headers });
-}
-
-
-// --- HEIC thumbnails via vendored WASM (Safari decodes natively) ---
-const heicCache = new Map(); // name -> objectURL (LRU, capped)
-// Cap ≈ two screens of tiles: 36 on desktop grids, 12 on phones.
-function heicCacheMax() {
-  const cols = Math.max(1, Math.floor((grid.clientWidth || 800) / 200));
-  const rows = Math.max(1, Math.ceil((window.innerHeight || 600) / 200));
-  const twoScreens = cols * rows * 2;
-  return Math.min(36, Math.max(12, twoScreens));
-}
-let heicNative = null; // null = untested
-
-function heicSupportedNatively() {
-  if (heicNative !== null) return Promise.resolve(heicNative);
-  // 1px HEIC probe: Safari resolves, others reject.
-  const probe = "data:image/heic;base64,";
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => { heicNative = true; resolve(true); };
-    img.onerror = () => { heicNative = false; resolve(false); };
-    img.src = probe;
-  });
-}
-
-async function heicThumb(name) {
-  if (heicCache.has(name)) {
-    // Refresh LRU position.
-    const url = heicCache.get(name);
-    heicCache.delete(name);
-    heicCache.set(name, url);
-    return url;
-  }
-  if (typeof heic2any === "undefined") throw new Error("decoder unavailable");
-  const res = await authedFetch(name);
-  if (!res.ok) throw new Error("fetch failed");
-  const blob = await res.blob();
-  const out = await heic2any({ blob, toType: "image/jpeg", quality: 0.8 });
-  const url = URL.createObjectURL(Array.isArray(out) ? out[0] : out);
-  heicCache.set(name, url);
-  const max = heicCacheMax();
-  while (heicCache.size > max) {
-    const [oldest, oldUrl] = heicCache.entries().next().value;
-    heicCache.delete(oldest);
-    URL.revokeObjectURL(oldUrl);
-  }
-  return url;
-}
-function tileMedia(photo) {
-  const kind = mediaKind(photo.name);
-  const url = mediaUrl(photo.name);
-  if (kind === "heic") {
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    img.alt = displayName(photo.name);
-    img.dataset.heic = photo.name;
-    img.src = url; // Safari renders natively; others fall to onerror.
-    img.onerror = () => {
-      img.onerror = null;
-      heicSupportedNatively().then((native) => {
-        if (native) return; // transient error, keep broken img.
-        heicThumb(photo.name).then((obj) => {
-          if (img.isConnected && img.dataset.heic === photo.name) img.src = obj;
-          else URL.revokeObjectURL(obj);
-        }).catch(() => {
-          const div = document.createElement("div");
-          div.className = "file-generic";
-          div.textContent = displayName(photo.name);
-          div.title = displayName(photo.name) + " (preview not supported)";
-          img.replaceWith(div);
-        });
-      });
-    };
-    // IntersectionObserver: decode only when the tile nears the viewport.
-    if (typeof IntersectionObserver !== "undefined") {
-      const io = new IntersectionObserver((entries, obs) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          obs.disconnect();
-          if (img.isConnected && !img.complete) { /* native path handles it */ }
-          heicSupportedNatively().then((native) => {
-            if (!native && img.isConnected) {
-              heicThumb(photo.name).then((obj) => {
-                if (img.isConnected && img.dataset.heic === photo.name && !img.complete) img.src = obj;
-              }).catch(() => {});
-            }
-          });
-        }
-      }, { rootMargin: "500px" });
-      io.observe(img);
-    }
-    return img;
-  }
-  if (kind === "image") {
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    img.alt = displayName(photo.name);
-    img.src = url;
-    return img;
-  }
-  if (kind === "video") {
-    const v = document.createElement("video");
-    v.muted = true;
-    v.playsInline = true;
-    v.preload = "metadata";
-    v.src = url;
-    v.onerror = () => {
-      // Codec not playable (e.g. ProRes MOV): filename tile instead.
-      v.onerror = null;
-      const div = document.createElement("div");
-      div.className = "file-generic";
-      div.textContent = displayName(photo.name);
-      div.title = displayName(photo.name) + " (video not playable here — download to view)";
-      v.replaceWith(div);
-    };
-    return v;
-  }
-  const div = document.createElement("div");
-  div.className = "file-generic";
-  div.textContent = displayName(photo.name);
-  div.title = displayName(photo.name);
-  return div;
-}
-
-function renderGrid() {
-  grid.textContent = "";
-  empty.hidden = photos.length > 0;
-  empty.textContent = "Empty gallery.";
-  photos.forEach((photo, i) => {
-    const tile = document.createElement("button");
-    tile.className = "tile" + (selected.has(photo.name) ? " selected" : "");
-    tile.setAttribute("aria-pressed", selected.has(photo.name) ? "true" : "false");
-    tile.appendChild(tileMedia(photo));
-    const tick = document.createElement("span");
-    tick.className = "tick";
-    tick.textContent = "\u2713";
-    tile.appendChild(tick);
-    tile.addEventListener("click", () => {
-      if (editing) {
-        if (selected.has(photo.name)) selected.delete(photo.name);
-        else selected.add(photo.name);
-        updateEditUI();
-      } else {
-        openLightbox(i);
-      }
-    });
-    grid.appendChild(tile);
-  });
-}
-
-function render() {
-  counter.textContent = (index + 1) + " / " + photos.length;
-}
-
-/// Show photo i in the overlay by adopting its (already loaded) grid
-/// thumbnail: no second fetch, no src swap, no black frame.
-function openLightbox(i) {
-  if (!photos.length) { closeLightbox(); return; }
-  index = Math.min(Math.max(i, 0), photos.length - 1);
-  showInViewport(index);
-  lightbox.hidden = false;
-  render();
-}
-
-function showInViewport(i) {
-  stopViewportMedia();
-  viewport.textContent = "";
-  const name = photos[i].name;
-  const kind = mediaKind(name);
-  const url = mediaUrl(name);
-  if (kind === "heic") {
-    viewport.textContent = "Converting…";
-    heicThumb(name).then((obj) => {
-      if (index !== i || photos[i].name !== name) return;
-      viewport.textContent = "";
-      const img = new Image();
-      img.alt = displayName(name);
-      img.src = obj;
-      viewport.appendChild(img);
-    }).catch(() => {
-      viewport.textContent = "";
-      const div = document.createElement("div");
-      div.className = "file-generic";
-      div.textContent = displayName(name);
-      viewport.appendChild(div);
-    });
-    return;
-  }
-  if (kind === "audio") {
-    const a = document.createElement("audio");
-    a.controls = true;
-    a.src = url;
-    viewport.appendChild(a);
-    return;
-  }
-  if (kind === "text") {
-    viewport.textContent = "Loading…";
-    authedFetch(name).then((r) => {
-      if (!r.ok) throw new Error("fetch failed");
-      return r.text();
-    }).then((text) => {
-      if (index !== i || photos[i].name !== name) return;
-      viewport.textContent = "";
-      const pre = document.createElement("pre");
-      pre.textContent = text;
-      viewport.appendChild(pre);
-    }).catch(() => {
-      viewport.textContent = "";
-      viewport.appendChild(tileMedia(photos[i]));
-    });
-    return;
-  }
-  const tile = grid.children[i];
-  const media = tile ? tile.querySelector("img, video, .file-generic") : null;
-  if (media && (media.tagName !== "IMG" || (media.complete && media.naturalWidth))) {
-    viewport.appendChild(media);
-    if (media.tagName === "VIDEO") { media.controls = true; }
-  } else if (media) {
-    // Not decoded yet: re-create at full size, swap when ready.
-    viewport.appendChild(media);
-  } else {
-    viewport.appendChild(tileMedia(photos[i]));
-  }
-  const v = viewport.querySelector("video");
-  if (v) { v.controls = true; v.muted = false; }
-  // Non-renderable file: offer a download link under the filename.
-  const g = viewport.querySelector(".file-generic");
-  if (g && !g.querySelector("a")) {
-    const a = document.createElement("a");
-    a.href = mediaUrl(photos[i].name);
-    a.textContent = "Download";
-    g.appendChild(a);
-  }
-}
-
-function stopViewportMedia() {
-  const v = viewport.querySelector("video");
-  if (v) { try { v.pause(); } catch (_) {} }
-}
-
-function restoreThumbnails() {
-  // Move any adopted media back to its tile.
-  stopViewportMedia();
-  const media = viewport.querySelector("img, video, .file-generic");
-  if (media) {
-    if (media.tagName === "VIDEO") { media.controls = false; media.muted = true; }
-    const src = media.currentSrc || media.src;
-    const tile = Array.from(grid.children).find((t) => {
-      const o = t.querySelector("img, video, .file-generic");
-      return o && src && (o.currentSrc === src || o.src === src);
-    });
-    if (tile && !tile.querySelector("img, video, .file-generic")) tile.prepend(media);
-    else {
-      const name = Array.from(photos).find((p) =>
-        src && src.endsWith("/photos/" + encodeURIComponent(p.name)))?.name;
-      const idx = name ? photos.findIndex((p) => p.name === name) : -1;
-      if (idx >= 0 && grid.children[idx] && !grid.children[idx].querySelector("img, video, .file-generic"))
-        grid.children[idx].prepend(media);
-    }
-  }
-  viewport.textContent = "";
-}
-
-function closeLightbox() {
-  restoreThumbnails();
-  lightbox.hidden = true;
-}
-
-function step(d) {
-  if (!photos.length) { closeLightbox(); return; }
-  index = (index + d + photos.length) % photos.length;
-  restoreThumbnails();
-  showInViewport(index);
-  render();
-}
-
-prevBtn.addEventListener("click", () => step(-1));
-nextBtn.addEventListener("click", () => step(1));
-closeBtn.addEventListener("click", closeLightbox);
-document.addEventListener("keydown", (e) => {
-  if (lightbox.hidden) return;
-  if (e.key === "ArrowLeft") step(-1);
-  else if (e.key === "ArrowRight") step(1);
-  else if (e.key === "Escape") closeLightbox();
-});
-
 /** Resolve the gallery key: memory/session, else prompt once.
     Landing page (no slug) always prompts: returning here means a new gallery. */
 function needKey(forcePrompt) {
-  if (!forcePrompt && galleryKey && galleryKey.length >= 12) return Promise.resolve(galleryKey);
+  if (!forcePrompt && galleryKey && galleryKey.length >= 6) return Promise.resolve(galleryKey);
   keyError.textContent = "";
   keyInput.value = "";
   resetKeyDialog();
@@ -609,8 +124,8 @@ document.getElementById("pass-dialog").addEventListener("close", () => {
 });
 
 // Invite code for NEW galleries: memory-only, asked once per batch when the
-// server answers "invite required". Contributing to an existing gallery
-// never needs it.
+// server answers "invite required". Uploading into an existing gallery never
+// needs it.
 let inviteCode = "";
 let invitePrompt = false;
 /** Prompt for the invite code (reuses the key dialog UI). */
@@ -630,11 +145,25 @@ document.getElementById("private-check").addEventListener("change", (e) => {
   if (e.target.checked) document.getElementById("key-pass-input").focus();
 });
 
+/** New galleries: 6+ chars, one capital, one symbol. Signing in to an
+    existing gallery accepts any 6+ key, so keys made before this rule work. */
+function keyPolicyError(v, creating) {
+  if (v.length < 6) return "Key must be at least 6 characters";
+  if (!creating) return "";
+  if (!/[A-Z]/.test(v)) return "Key needs at least one capital letter";
+  if (!/[^A-Za-z0-9\s]/.test(v)) return "Key needs at least one symbol (like ! or #)";
+  return "";
+}
+
 keyForm.addEventListener("submit", (e) => {
   const v = keyInput.value.trim();
-  if (v.length < 12) {
+  // The invite code is server-configured: only reject an empty one.
+  const err = invitePrompt
+    ? (v ? "" : "Invite code required")
+    : keyPolicyError(v, !slugFromPath());
+  if (err) {
     e.preventDefault(); // keep the dialog open (Esc still cancels)
-    keyError.textContent = "Key must be at least 12 characters";
+    keyError.textContent = err;
     keyInput.focus();
     return;
   }
@@ -764,6 +293,8 @@ fileInput.addEventListener("change", async () => {
     return;
   }
   pendingPass = "";
+  // New files must show up in the block picker without a reload.
+  if (firstSlug) await loadPhotos();
   uploadStatus.textContent = failures.length ? failures.join("; ") : "";
 });
 
@@ -773,4 +304,568 @@ themeBtn.addEventListener("click", () => {
   try { localStorage.setItem("theme", next); } catch (_) { /* private mode */ }
 });
 
-loadPhotos();
+// --- canvas (the gallery page itself) ---
+
+const canvasEl = document.getElementById("canvas");
+const canvasBar = document.getElementById("canvas-bar");
+const canvasTools = document.getElementById("canvas-tools");
+const canvasEmpty = document.getElementById("canvas-empty");
+const canvasStatus = document.getElementById("canvas-status");
+const surface = document.getElementById("canvas-surface");
+const modeBtn = document.getElementById("canvas-mode");
+const addTextBtn = document.getElementById("add-text");
+const mediaTray = document.getElementById("media-tray");
+const organizeBy = document.getElementById("organize-by");
+const organizeBtn = document.getElementById("organize");
+const lockBtn = document.getElementById("lock-btn");
+
+let canvasBlocks = [];
+// Owners land in the editor; viewers only ever see the rendered canvas.
+let canvasEditing = true;
+
+function clamp(v, lo, hi) {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+function newBlockId() {
+  const raw = typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : String(Date.now()) + Math.random();
+  return raw.replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 32);
+}
+
+function isOwner() {
+  return !!galleryKey && !!slugFromPath();
+}
+
+/** Below everything currently rendered: measured, so nothing overlaps. */
+function nextBlockY() {
+  let y = 20;
+  for (const el of surface.children) y = Math.max(y, el.offsetTop + el.offsetHeight + 16);
+  return Math.min(Math.round(y), 100000);
+}
+
+// Only what an <img>/<audio> block can actually play in a browser.
+const IMAGE_EXT = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".svg", ".ico"];
+const AUDIO_EXT = [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".oga", ".opus"];
+function blockKindFor(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : "";
+  if (IMAGE_EXT.includes(ext)) return "image";
+  if (AUDIO_EXT.includes(ext)) return "audio";
+  return "";
+}
+
+// Escape first, then format. Only http(s) links, safe under innerHTML.
+function mdLine(s) {
+  return s
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" rel="noopener noreferrer nofollow" target="_blank">$1</a>');
+}
+
+function markdownNode(text) {
+  const div = document.createElement("div");
+  div.className = "md";
+  div.innerHTML = String(text).split("\n").map(mdLine).join("<br>");
+  return div;
+}
+
+function brokenMediaEl(b) {
+  const d = document.createElement("div");
+  d.className = "file-generic";
+  d.textContent = displayName(b.src) + " (missing)";
+  return d;
+}
+
+/** Pointer gestures on a handle: start/move/end with shared start state. */
+function dragFrom(handle, onStart, onMove, onEnd) {
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const start = { x: e.clientX, y: e.clientY };
+    onStart(start);
+    const move = (ev) => onMove(ev, start);
+    const end = (ev) => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      onEnd(ev, start);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  });
+}
+
+/** Continuous placement, rounded so saved documents stay readable. */
+function settleBlock(b, place) {
+  b.x = Math.round(b.x * 10) / 10;
+  b.y = Math.round(b.y);
+  b.w = Math.round(b.w * 10) / 10;
+  place();
+}
+
+/** The block you just grabbed paints on top, and stays there after the drop. */
+function raiseBlock(el, b) {
+  if (surface.lastElementChild === el) return;
+  surface.appendChild(el);
+  const i = canvasBlocks.indexOf(b);
+  if (i >= 0) canvasBlocks.push(...canvasBlocks.splice(i, 1));
+}
+
+function canvasBlockEl(b) {
+  const width = () => Math.max(1, surface.getBoundingClientRect().width);
+  const el = document.createElement("div");
+  el.className = "block";
+  el.dataset.id = b.id;
+  el.style.left = b.x + "%";
+  el.style.top = b.y + "px";
+  el.style.width = b.w + "%";
+  const place = () => {
+    el.style.left = b.x + "%";
+    el.style.top = b.y + "px";
+    el.style.width = b.w + "%";
+  };
+
+  if (canvasEditing) {
+    const grip = document.createElement("div");
+    grip.className = "grip";
+    grip.title = "Drag to move";
+    // Only the grip drags: audio controls, links and text stay clickable.
+    dragFrom(grip,
+      (s) => { s.bx = b.x; s.by = b.y; el.classList.add("dragging"); },
+      (ev, s) => {
+        b.x = clamp(s.bx + ((ev.clientX - s.x) / width()) * 100, 0, 100 - b.w);
+        b.y = clamp(s.by + ev.clientY - s.y, 0, 100000);
+        place();
+      },
+      () => {
+        el.classList.remove("dragging");
+        settleBlock(b, place);
+        raiseBlock(el, b);
+        resizeSurface();
+        saveCanvas();
+      });
+    el.appendChild(grip);
+  }
+
+  if (b.kind === "text") {
+    if (canvasEditing) {
+      const ta = document.createElement("textarea");
+      ta.rows = 3;
+      ta.value = b.text || "";
+      ta.addEventListener("input", () => {
+        b.text = ta.value;
+        autosize(ta);
+      });
+      ta.addEventListener("change", () => saveCanvas());
+      el.appendChild(ta);
+    } else {
+      el.appendChild(markdownNode(b.text || ""));
+    }
+  } else if (b.kind === "image") {
+    const img = document.createElement("img");
+    // Eager: heights are measured for layout (organize, next block position).
+    img.loading = "eager";
+    img.alt = "";
+    img.src = mediaUrl(b.src);
+    img.addEventListener("load", resizeSurface);
+    img.addEventListener("error", () => { img.replaceWith(brokenMediaEl(b)); resizeSurface(); });
+    el.appendChild(img);
+  } else {
+    const a = document.createElement("audio");
+    a.controls = true;
+    a.preload = "metadata";
+    a.src = mediaUrl(b.src);
+    // Blocks never pause each other: no shared playback state, by design.
+    el.appendChild(a);
+  }
+
+  if (canvasEditing) {
+    const resize = document.createElement("div");
+    resize.className = "resize";
+    resize.title = "Drag to resize width";
+    dragFrom(resize,
+      (s) => { s.bw = b.w; el.classList.add("dragging"); },
+      (ev, s) => { b.w = clamp(s.bw + ((ev.clientX - s.x) / width()) * 100, 5, 100); place(); },
+      () => {
+        el.classList.remove("dragging");
+        settleBlock(b, place);
+        raiseBlock(el, b);
+        resizeSurface();
+        saveCanvas();
+      });
+    el.appendChild(resize);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "block-del";
+    del.textContent = "\u00d7";
+    del.setAttribute("aria-label", "Remove block");
+    del.addEventListener("click", () => {
+      canvasBlocks = canvasBlocks.filter((x) => x !== b);
+      el.remove();
+      canvasEmpty.hidden = canvasBlocks.length > 0;
+      resizeSurface();
+      saveCanvas();
+    });
+    el.appendChild(del);
+  }
+  return el;
+}
+
+function resizeSurface() {
+  if (canvasEl.hidden) return;
+  let bottom = 0;
+  for (const el of surface.children) bottom = Math.max(bottom, el.offsetTop + el.offsetHeight);
+  // Blocks are absolute: the surface needs an explicit height to scroll.
+  surface.style.height = Math.max(bottom + 40, Math.round(window.innerHeight * 0.6)) + "px";
+}
+
+/** Textareas show all their text: layout heights match the content. */
+function autosize(ta) {
+  ta.style.height = "auto";
+  ta.style.height = ta.scrollHeight + "px";
+}
+
+/** Resolve once the image is decoded (or failed), so heights are final. */
+function imageReady(img) {
+  const done = () => img.decode?.().catch(() => {}).then(() => {});
+  if (img.complete && img.naturalWidth) return done();
+  return new Promise((resolve) => {
+    const finish = () => resolve();
+    img.addEventListener("load", finish, { once: true });
+    img.addEventListener("error", finish, { once: true });
+    // Lazy images may never start on their own: nudge a fetch.
+    img.loading = "eager";
+    const src = img.getAttribute("src");
+    img.removeAttribute("src");
+    if (src) img.setAttribute("src", src);
+    setTimeout(finish, 8000);
+  }).then(done);
+}
+
+function renderCanvas() {
+  surface.textContent = "";
+  surface.classList.toggle("editing", canvasEditing);
+  for (const b of canvasBlocks) surface.appendChild(canvasBlockEl(b));
+  // Mounted, so scrollHeight (hence the real height) is available.
+  for (const ta of surface.querySelectorAll("textarea")) autosize(ta);
+  canvasEmpty.hidden = canvasBlocks.length > 0;
+  canvasEmpty.textContent = canvasEditing ? "Add your first block." : "No canvas yet.";
+  canvasTools.hidden = !canvasEditing;
+  mediaTray.hidden = !canvasEditing;
+  resizeSurface();
+}
+
+/** Replace the canvas with a message (no blocks): load errors, locked, etc. */
+function canvasMessage(text) {
+  canvasBlocks = [];
+  canvasEl.hidden = false;
+  surface.textContent = "";
+  surface.style.height = "";
+  canvasEmpty.hidden = false;
+  canvasEmpty.textContent = text;
+  canvasTools.hidden = true;
+  mediaTray.hidden = true;
+}
+
+async function loadCanvas(slug) {
+  let res;
+  try {
+    res = await fetch("/api/galleries/" + slug + "/canvas", { headers: passHeader() });
+  } catch (_) {
+    canvasMessage("Could not load canvas");
+    return;
+  }
+  if (res.status === 401) {
+    if (await needPass(slug)) return loadCanvas(slug);
+    canvasMessage("This gallery is locked.");
+    return;
+  }
+  if (!res.ok) {
+    canvasMessage("Could not load canvas");
+    return;
+  }
+  const data = await res.json().catch(() => null);
+  canvasBlocks = data && Array.isArray(data.blocks) ? data.blocks : [];
+  canvasEl.hidden = false;
+  renderCanvas();
+}
+
+async function saveCanvas() {
+  const slug = slugFromPath();
+  // Viewers and preview mode never write.
+  if (!slug || !galleryKey || !canvasEditing) return;
+  canvasStatus.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/galleries/" + slug + "/canvas", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-Gallery-Key": galleryKey },
+      body: JSON.stringify({ blocks: canvasBlocks }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) { /* keep status */ }
+      // Keep the editor content: the owner can fix and save again.
+      canvasStatus.textContent = "Save failed: " + msg;
+      return;
+    }
+    canvasStatus.textContent = "";
+  } catch (_) {
+    canvasStatus.textContent = "Save failed";
+  }
+}
+
+/** Every uploaded image/audio, one click away. No "add media" picking. */
+function renderMediaTray() {
+  mediaTray.textContent = "";
+  const items = photos.filter((p) => blockKindFor(p.name));
+  if (!items.length) {
+    const p = document.createElement("span");
+    p.className = "tray-empty";
+    p.textContent = "No media yet — use Upload.";
+    mediaTray.appendChild(p);
+    return;
+  }
+  for (const p of items) {
+    const kind = blockKindFor(p.name);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tray-item";
+    btn.title = "Add " + displayName(p.name);
+    btn.setAttribute("aria-label", "Add " + displayName(p.name));
+    if (kind === "image") {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = "";
+      img.src = mediaUrl(p.name);
+      btn.appendChild(img);
+    } else {
+      const glyph = document.createElement("span");
+      glyph.className = "tray-glyph";
+      glyph.textContent = "\u266b";
+      btn.appendChild(glyph);
+      const label = document.createElement("span");
+      label.className = "tray-label";
+      label.textContent = displayName(p.name);
+      btn.appendChild(label);
+    }
+    btn.addEventListener("click", () => addMediaBlock(p.name, kind));
+    mediaTray.appendChild(btn);
+  }
+}
+
+function addMediaBlock(name, kind) {
+  canvasBlocks.push({
+    id: newBlockId(),
+    kind,
+    // Same column geometry Organize produces, so new blocks line up.
+    x: 4,
+    y: nextBlockY(),
+    w: 44,
+    src: name,
+    created: Date.now(),
+  });
+  renderCanvas();
+  saveCanvas();
+}
+
+/** Reading order per block, for "by name". */
+function blockLabel(b) {
+  return b.kind === "text" ? (b.text || "").split("\n")[0] : displayName(b.src || "");
+}
+
+const KIND_ORDER = ["text", "image", "audio"];
+const ORGANIZE = {
+  date: (a, b) => (a.created || 0) - (b.created || 0),
+  name: (a, b) => blockLabel(a).localeCompare(blockLabel(b)),
+  kind: (a, b) =>
+    KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || (a.created || 0) - (b.created || 0),
+};
+
+/** Sort the blocks, then pack them into aligned rows: one column on narrow screens. */
+async function organizeCanvas(by) {
+  if (!canvasBlocks.length) return;
+  const wasEditing = canvasEditing;
+  canvasBlocks.sort(ORGANIZE[by] || ORGANIZE.date);
+  const cols = surface.clientWidth < 700 ? 1 : 2;
+  const widthPct = cols === 1 ? 92 : 44;
+  const colX = cols === 1 ? [4] : [4, 52];
+  const GAP = 16;
+  // Text wraps differently in a textarea than in rendered markdown, so both
+  // renderings are measured and the taller one wins: no overlap in either mode.
+  const measure = async (editing) => {
+    canvasEditing = editing;
+    renderCanvas();
+    const els = [...surface.children];
+    els.forEach((el) => { el.style.width = widthPct + "%"; });
+    await Promise.all(els.flatMap((el) => [...el.querySelectorAll("img")]).map(imageReady));
+    return els.map((el) => el.offsetHeight);
+  };
+  const viewH = await measure(false);
+  const editH = await measure(true);
+  const heights = viewH.map((h, i) => Math.max(h, editH[i] || 0));
+  const els = [...surface.children];
+  let y = 20;
+  for (let i = 0; i < els.length; i += cols) {
+    const rowH = Math.max(...heights.slice(i, i + cols));
+    els.slice(i, i + cols).forEach((el, j) => {
+      el.style.left = colX[j] + "%";
+      el.style.top = y + "px";
+    });
+    y += rowH + GAP;
+  }
+  for (const [i, b] of canvasBlocks.entries()) {
+    b.x = parseFloat(els[i].style.left);
+    b.y = parseFloat(els[i].style.top);
+    b.w = widthPct;
+  }
+  canvasEditing = wasEditing;
+  renderCanvas();
+  saveCanvas();
+}
+
+/** Non-owners get one button (key entry); owners get the full editor chrome. */
+function syncOwnerUI() {
+  if (!isOwner()) canvasEditing = false;
+  canvasTools.hidden = !canvasEditing;
+  mediaTray.hidden = !canvasEditing;
+  modeBtn.textContent = canvasEditing ? "Preview" : "Edit";
+  modeBtn.setAttribute("aria-pressed", canvasEditing ? "true" : "false");
+}
+
+modeBtn.addEventListener("click", async () => {
+  if (!isOwner()) {
+    const key = await needKey();
+    if (!key) return;
+    canvasEditing = true;
+  } else {
+    canvasEditing = !canvasEditing;
+  }
+  syncOwnerUI();
+  renderCanvas();
+});
+
+organizeBtn.addEventListener("click", () => organizeCanvas(organizeBy.value));
+
+addTextBtn.addEventListener("click", () => {
+  canvasBlocks.push({
+    id: newBlockId(),
+    kind: "text",
+    x: 4,
+    y: nextBlockY(),
+    w: 44,
+    text: "",
+    created: Date.now(),
+  });
+  renderCanvas();
+  saveCanvas();
+});
+
+lockBtn.addEventListener("click", async () => {
+  const slug = slugFromPath();
+  if (!slug) return;
+  const key = await needKey();
+  if (!key) return;
+  const input = document.getElementById("setpass-input");
+  const errEl = document.getElementById("setpass-error");
+  const help = document.getElementById("setpass-help");
+  const removeBtn = document.getElementById("setpass-remove");
+  errEl.textContent = "";
+  input.value = "";
+  // Keyless probe: the owner key bypasses the lock, so only an
+  // unauthenticated listing 401s when the gallery is protected.
+  let locked = false;
+  try {
+    const probe = await fetch("/api/galleries/" + slug + "/photos");
+    locked = probe.status === 401;
+  } catch (_) {}
+  removeBtn.hidden = !locked;
+  help.textContent = locked
+    ? "This gallery is protected. Enter a new password to change it, or remove protection below."
+    : "Viewers will need this password to open the gallery.";
+  document.getElementById("setpass-dialog").showModal();
+  input.focus();
+});
+
+document.getElementById("setpass-form").addEventListener("submit", async () => {
+  const clicked = document.activeElement && document.activeElement.value;
+  if (clicked === "cancel") return;
+  const slug = slugFromPath();
+  const input = document.getElementById("setpass-input");
+  const errEl = document.getElementById("setpass-error");
+  if (clicked !== "remove" && !input.value) return; // empty = keep, no request
+  const key = galleryKey;
+  try {
+    const res = await fetch("/api/galleries/" + slug + "/lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
+      body: JSON.stringify({ password: clicked === "remove" ? "" : input.value }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+      errEl.textContent = msg;
+      document.getElementById("setpass-dialog").showModal();
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    uploadStatus.textContent = data && data.locked ? "Gallery protected." : "Protection removed.";
+    renderCanvas();
+  } catch (_) {
+    errEl.textContent = "Request failed";
+    document.getElementById("setpass-dialog").showModal();
+  }
+});
+
+window.addEventListener("resize", resizeSurface);
+
+/** Gallery metadata for the block picker; also the existence + lock gate. */
+async function loadPhotos() {
+  const slug = slugFromPath();
+  if (!slug) return false;
+  galleryLabel.textContent = slug;
+  try {
+    const res = await fetch("/api/galleries/" + slug + "/photos", { headers: passHeader() });
+    if (res.status === 404) {
+      // Gallery deleted: back to the landing page.
+      location.assign("/");
+      return false;
+    }
+    if (res.status === 401) {
+      // Locked: prompt for the viewer password (owner key also accepted).
+      if (await needPass(slug)) return loadPhotos();
+      canvasMessage("This gallery is locked.");
+      return false;
+    }
+    if (!res.ok) throw new Error("bad status " + res.status);
+    const data = await res.json();
+    photos = data.photos || [];
+    renderMediaTray();
+    return true;
+  } catch (_) {
+    canvasMessage("Could not load gallery");
+    return false;
+  }
+}
+
+async function boot() {
+  const slug = slugFromPath();
+  if (!slug) {
+    // Landing page: uploads mint a gallery, nothing else to show.
+    canvasEl.hidden = true;
+    canvasBar.hidden = true;
+    return;
+  }
+  canvasBar.hidden = false;
+  syncOwnerUI();
+  if (await loadPhotos()) await loadCanvas(slug);
+}
+
+boot();

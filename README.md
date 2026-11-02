@@ -15,3 +15,13 @@ gallery never needs it), `ADMIN_PASS` (enables `/api/admin/*`), `RUST_LOG`
 
 Run tests: `cargo test` (unit + API), `cargo test --release --test stress`
 (live-server stress suite, needs a release build first).
+
+Each gallery page is one freeform canvas: `GET|PUT /api/galleries/{slug}/canvas`
+(JSON `{"blocks":[...]}` with image/text/audio blocks and absolute positions;
+writes need the owner `X-Gallery-Key`). Media is uploaded from the same page and
+served under `/photos/`; owners edit the canvas in place, anyone with the link
+sees it rendered.
+
+Galleries that never got content (no media files, no canvas blocks) are
+deleted 5 minutes after creation, on a 10-minute timer: unused links do not
+accumulate. The key is not banned, so it can mint a new gallery.

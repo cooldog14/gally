@@ -4,7 +4,7 @@
 // (no imports: uuid provides the thread-safe randomness)
 
 pub const MAX_NAME_LEN: usize = 100;
-pub const KEY_MIN: usize = 12;
+pub const KEY_MIN: usize = 6;
 pub const KEY_MAX: usize = 128;
 
 pub static ADJ: &[&str] = &[
@@ -71,6 +71,64 @@ pub fn photo_slug(name: &str) -> Option<&str> {
         return None;
     }
     Some(slug)
+}
+
+/// Canvas document caps. Body cap is enforced by the route (413/422 before
+/// this parser runs); the rest here. See plan: raise in one place.
+pub const CANVAS_MAX_BODY: usize = 256 * 1024;
+pub const CANVAS_MAX_BLOCKS: usize = 200;
+pub const CANVAS_TEXT_MAX: usize = 20_000;
+
+/// Structural validation of a canvas document owned by `slug`.
+/// `None` = invalid; `Some(srcs)` = valid, listing the media filenames the
+/// caller must confirm exist on disk.
+pub fn canvas_media(doc: &str, slug: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(doc).ok()?;
+    let obj = v.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let blocks = obj.get("blocks")?.as_array()?;
+    if blocks.len() > CANVAS_MAX_BLOCKS {
+        return None;
+    }
+    let mut srcs = Vec::new();
+    for b in blocks {
+        let b = b.as_object()?;
+        if b.keys().any(|k| !matches!(k.as_str(), "id" | "kind" | "x" | "y" | "w" | "src" | "text" | "created")) {
+            return None;
+        }
+        let id = b.get("id")?.as_str()?;
+        if id.is_empty() || id.len() > 64 {
+            return None;
+        }
+        let num = |k: &str, lo: f64, hi: f64| {
+            b.get(k).and_then(|v| v.as_f64()).filter(|v| (lo..=hi).contains(v))
+        };
+        if num("x", 0.0, 100.0).is_none()
+            || num("y", 0.0, 100_000.0).is_none()
+            || num("w", 5.0, 100.0).is_none()
+        {
+            return None;
+        }
+        match b.get("kind")?.as_str()? {
+            // Media must belong to this gallery: no cross-gallery references.
+            "image" | "audio" => {
+                let src = b.get("src")?.as_str()?;
+                if photo_slug(src)? != slug {
+                    return None;
+                }
+                srcs.push(src.to_string());
+            }
+            "text" => {
+                if b.get("text")?.as_str()?.chars().count() > CANVAS_TEXT_MAX {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(srcs)
 }
 
 pub fn sanitize_filename(raw: &str) -> (String, String) {
@@ -221,8 +279,8 @@ mod tests {
 
     #[test]
     fn normalize_key_bounds() {
-        assert!(normalize_key("abcdefghijkl").is_some());
-        assert!(normalize_key("abcdefghijk").is_none());
+        assert!(normalize_key("abcdef").is_some());
+        assert!(normalize_key("abcde").is_none());
         assert!(normalize_key(&"k".repeat(128)).is_some());
         assert!(normalize_key(&"k".repeat(129)).is_none());
         assert_eq!(normalize_key("  a-long-secret-key  "), Some("a-long-secret-key".to_string()));
@@ -253,6 +311,71 @@ mod tests {
         // Old short galleries no longer resolve.
         assert!(photo_slug("happy-otter-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
         assert!(photo_slug("happy-otter-calm-pond-123_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+    }
+
+    #[test]
+    fn canvas_accepts_text_and_media() {
+        let slug = "velvet-lagoon-quiet-river-1a2b";
+        let media = format!("{slug}_{}_photo.jpg", "a".repeat(32));
+        let doc = canvas_doc(&format!(
+            r#"{{"id":"a","kind":"text","x":5,"y":20,"w":50,"text":"hello","created":1700000000000}},{{"id":"b","kind":"image","x":0,"y":0,"w":100,"src":"{media}"}}"#
+        ));
+        assert_eq!(canvas_media(&doc, slug), Some(vec![media.clone()]));
+        // Audio references validate the same way (same filename shape).
+        let doc = canvas_doc(&format!(
+            r#"{{"id":"c","kind":"audio","x":0,"y":0,"w":50,"src":"{media}"}}"#
+        ));
+        assert_eq!(canvas_media(&doc, slug), Some(vec![media]));
+    }
+
+    fn canvas_doc(blocks: &str) -> String {
+        format!(r#"{{"blocks":[{blocks}]}}"#)
+    }
+
+    #[test]
+    fn canvas_rejects_bad_documents() {
+        let slug = "velvet-lagoon-quiet-river-1a2b";
+        let foreign = format!("plain-otter-calm-pond-9f9f_{}_x.jpg", "a".repeat(32));
+        let cases = [
+            String::new(),
+            "[]".to_string(),
+            r#"{"blocks":{}}"#.to_string(),
+            r#"{"blocks":[],"extra":1}"#.to_string(),
+            canvas_doc(r#"{"id":"a","kind":"video","x":0,"y":0,"w":50}"#),
+            canvas_doc(r#"{"id":"a","kind":"text","x":101,"y":0,"w":50,"text":"hi"}"#),
+            canvas_doc(r#"{"id":"a","kind":"text","x":0,"y":100001,"w":50,"text":"hi"}"#),
+            canvas_doc(r#"{"id":"a","kind":"text","x":0,"y":0,"w":4,"text":"hi"}"#),
+            canvas_doc(r#"{"id":"a","kind":"text","x":0,"y":0,"w":50}"#),
+            canvas_doc(r#"{"id":"a","kind":"image","x":0,"y":0,"w":50}"#),
+            canvas_doc(r#"{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":"hi","z":1}"#),
+            canvas_doc(&format!(
+                r#"{{"id":"a","kind":"image","x":0,"y":0,"w":50,"src":"{foreign}"}}"#
+            )),
+            canvas_doc(&format!(
+                r#"{{"id":"{}","kind":"text","x":0,"y":0,"w":50,"text":"hi"}}"#,
+                "i".repeat(65)
+            )),
+        ];
+        for c in cases {
+            assert!(canvas_media(&c, slug).is_none(), "should reject: {c}");
+        }
+        // Text cap: exactly at the cap passes, one char over fails.
+        let at = canvas_doc(&format!(
+            r#"{{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":{:?}}}"#,
+            "x".repeat(CANVAS_TEXT_MAX)
+        ));
+        assert!(canvas_media(&at, slug).is_some());
+        let over = canvas_doc(&format!(
+            r#"{{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":{:?}}}"#,
+            "x".repeat(CANVAS_TEXT_MAX + 1)
+        ));
+        assert!(canvas_media(&over, slug).is_none());
+        // Block cap: 200 blocks pass, 201 fail.
+        let one = r#"{"id":"a","kind":"text","x":0,"y":0,"w":50,"text":"hi"}"#;
+        let at = canvas_doc(&vec![one; CANVAS_MAX_BLOCKS].join(","));
+        assert!(canvas_media(&at, slug).is_some());
+        let over = canvas_doc(&vec![one; CANVAS_MAX_BLOCKS + 1].join(","));
+        assert!(canvas_media(&over, slug).is_none());
     }
 
     #[test]

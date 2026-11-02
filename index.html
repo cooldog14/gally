@@ -3,9 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Photos</title>
+<title>Canvas</title>
 <link rel="stylesheet" href="./styles.css">
-<script src="./vendor-heic2any.min.js" defer></script>
 <script>
 try {
   var saved = localStorage.getItem("theme");
@@ -19,22 +18,32 @@ try {
 <header id="topbar">
   <button id="upload-btn" type="button">Upload</button>
   <input type="file" id="file-input" multiple hidden>
-  <button id="edit-btn" type="button" hidden>Edit</button>
   <span id="gallery-label"></span>
   <div id="actions">
     <button id="theme-btn" type="button" aria-label="Toggle theme">&#9789;</button>
   </div>
 </header>
-<div id="editbar" hidden>
-  <span id="sel-count">0 selected</span>
-  <button id="lock-btn" type="button">Protect</button>
-  <button id="delete-btn" type="button">Delete</button>
-  <button id="done-btn" type="button">Done</button>
-</div>
 <main id="main">
   <p id="upload-status" role="status"></p>
-  <p id="empty" hidden>Empty gallery.</p>
-  <div id="grid"></div>
+  <div id="canvas-bar" hidden>
+    <button id="canvas-mode" type="button" aria-pressed="false">Edit</button>
+    <div id="canvas-tools" hidden>
+      <button id="add-text" type="button">Text block</button>
+      <select id="organize-by" aria-label="Organize order">
+        <option value="date">by date</option>
+        <option value="name">by name</option>
+        <option value="kind">by kind</option>
+      </select>
+      <button id="organize" type="button">Organize</button>
+      <button id="lock-btn" type="button">Protect</button>
+    </div>
+    <span id="canvas-status" role="status"></span>
+    <div id="media-tray" aria-label="Uploaded media" hidden></div>
+  </div>
+  <p id="canvas-empty" hidden></p>
+  <section id="canvas" hidden>
+    <div id="canvas-surface"></div>
+  </section>
 </main>
 <dialog id="key-dialog" aria-labelledby="key-title">
   <form method="dialog" id="key-form">
@@ -73,23 +82,6 @@ try {
     </div>
   </form>
 </dialog>
-<dialog id="confirm-dialog" aria-labelledby="confirm-title">
-  <form method="dialog" id="confirm-form">
-    <h2 id="confirm-title">Delete photos?</h2>
-    <p id="confirm-text">This cannot be undone.</p>
-    <div id="key-actions">
-      <button value="cancel" formnovalidate type="submit">Cancel</button>
-      <button id="confirm-yes" value="default" type="submit">Delete</button>
-    </div>
-  </form>
-</dialog>
-<div id="lightbox" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>
-  <button id="close" aria-label="Close">&times;</button>
-  <button id="prev" aria-label="Previous">&lsaquo;</button>
-  <div id="viewport"></div>
-  <button id="next" aria-label="Next">&rsaquo;</button>
-  <div id="counter"></div>
-</div>
 <script src="./app.js"></script>
 </body>
 </html>

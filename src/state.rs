@@ -58,13 +58,6 @@ impl AppState {
                     ),
                 ),
                 (
-                    "/vendor-heic2any.min.js",
-                    (
-                        &include_bytes!("../vendor-heic2any.min.js")[..],
-                        "application/javascript",
-                    ),
-                ),
-                (
                     "/styles.css",
                     (&include_bytes!("../styles.css")[..], "text/css"),
                 ),

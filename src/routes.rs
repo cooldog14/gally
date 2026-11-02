@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::db::{key_hash, GalleryDb, MintError};
 use crate::state::{is_admin, rate_limited, AppState};
-use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename};
+use crate::validate::{is_slug, normalize_key, percent_decode, photo_slug, sanitize_filename, canvas_media, CANVAS_MAX_BODY};
 
 /// Max upload size. `GALLY_MAX_BYTES` overrides (default 10 GiB).
 pub fn max_bytes() -> usize {
@@ -186,6 +186,98 @@ fn invite_ok(state: &AppState, headers: &HeaderMap) -> bool {
         .unwrap_or_default();
     use subtle::ConstantTimeEq;
     got.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+}
+
+// --- canvas document ---
+
+/// One freeform canvas per gallery. Viewers need the same credentials as the
+/// photo listing (the owner key bypasses the viewer lock).
+pub async fn get_canvas(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    if !is_slug(&slug) {
+        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    let doc = {
+        let db = state.db.lock().unwrap();
+        if !db.gallery_exists(&slug) {
+            return err(StatusCode::NOT_FOUND, "unknown gallery");
+        }
+        db.get_canvas(&slug)
+    };
+    let key_ok = request_key(&headers)
+        .map(|k| {
+            let db = state.db.lock().unwrap();
+            db.key_owns_slug(&k, &slug)
+        })
+        .unwrap_or(false);
+    if !key_ok {
+        let query = raw.unwrap_or_default();
+        let pass = request_pass(&headers, &query);
+        if let Some(deny) = check_locked(&state, &slug, &pass).await {
+            return deny;
+        }
+    }
+    let body = doc.unwrap_or_else(|| r#"{"blocks":[]}"#.to_string());
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Owner-only canvas write. Stores the validated document verbatim.
+pub async fn put_canvas(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+    body: Body,
+) -> Response {
+    if !is_slug(&slug) {
+        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    let key = match request_key(&headers) {
+        Some(k) => k,
+        None => return ApiError::Unauthorized.into_response(),
+    };
+    let owns = {
+        let db = state.db.lock().unwrap();
+        db.key_owns_slug(&key, &slug)
+    };
+    if !owns {
+        return err(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let bytes = match axum::body::to_bytes(body, CANVAS_MAX_BODY).await {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "canvas too large"),
+    };
+    let doc = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "invalid canvas"),
+    };
+    let Some(srcs) = canvas_media(doc, &slug) else {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "invalid canvas");
+    };
+    // Referenced media must be real files of this gallery. Canonicalized, so
+    // a crafted filename cannot reach outside the photos dir.
+    for src in srcs {
+        let ok = match tokio::fs::canonicalize(state.dir.join(&src)).await {
+            Ok(c) if c.starts_with(&state.canon_dir) => {
+                tokio::fs::metadata(&c).await.map(|m| m.is_file()).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !ok {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "unknown media");
+        }
+    }
+    let ok = {
+        let db = state.db.lock().unwrap();
+        db.set_canvas(&slug, doc)
+    };
+    if !ok {
+        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    (StatusCode::OK, Json(json!({ "saved": true }))).into_response()
 }
 
 // --- gallery photo listing ---
@@ -467,7 +559,7 @@ pub async fn static_path(State(state): State<Arc<AppState>>, uri: axum::http::Ur
                 (header::CONTENT_TYPE, *ctype),
                 (
                     header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
+                    "no-cache",
                 ),
             ],
             bytes.to_vec(),

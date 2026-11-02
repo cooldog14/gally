@@ -15,6 +15,16 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let state: Arc<AppState> = AppState::new(&root).await?;
+    // Empty galleries (minted but never used) must not accumulate links.
+    // First tick fires immediately, so startup also cleans up.
+    let sweep_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            gally_uring::purge::sweep(&sweep_state).await;
+        }
+    });
     let app = router(state);
     let port: u16 = std::env::var("PORT")
         .ok()
