@@ -7,16 +7,31 @@ use axum::{
     http::{Request, StatusCode},
     response::Response,
 };
-use gally_uring::{router, validate::is_slug, AppState};
+use gally_uring::db::GalleryDb;
+use gally_uring::{router, state::Limits, validate::is_slug, AppState};
 use tower::ServiceExt;
 
 const KEY_A: &str = "test-key-alpha";
 const KEY_B: &str = "test-key-other";
 
 async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+    test_state_with(Limits::defaults()).await
+}
+
+async fn test_state_with(limits: Limits) -> (Arc<AppState>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let state = AppState::new(tmp.path()).await.expect("AppState::new");
+    let state = AppState::new_with(tmp.path(), limits).await.expect("AppState::new_with");
     (state, tmp)
+}
+
+/// Publish a gallery (new galleries start private).
+async fn publish(state: &Arc<AppState>, slug: &str, public: bool) -> StatusCode {
+    let r = post_json(
+        &format!("/api/galleries/{slug}/visibility"),
+        &[key_header(KEY_A)],
+        &format!(r#"{{"public":{public}}}"#),
+    );
+    router(state.clone()).oneshot(r).await.unwrap().status()
 }
 
 fn sock() -> SocketAddr {
@@ -241,14 +256,14 @@ async fn new_gallery_needs_invite_when_configured() {
     );
 
     // Wrong invite: still refused.
-    let mut h = vec![("content-type", "image/jpeg"), key_header(KEY_A), invite_header("nope")];
+    let h = vec![("content-type", "image/jpeg"), key_header(KEY_A), invite_header("nope")];
     let uri = "/api/photos/gated.jpg".to_string();
     let r = request("PUT", &uri, &h, Body::from(jpeg()));
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // Right invite: gallery mints.
-    let mut h = vec![
+    let h = vec![
         ("content-type", "image/jpeg"),
         key_header(KEY_A),
         invite_header("amber-fox-glade-ridge"),
@@ -341,7 +356,7 @@ async fn gallery_listing_empty_then_contains_upload() {
 
     let uri = format!("/api/galleries/{slug}/photos");
     let resp = router(state.clone())
-        .oneshot(get(&uri, &[]))
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -355,7 +370,7 @@ async fn gallery_listing_empty_then_contains_upload() {
     let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
 
     let resp = router(state.clone())
-        .oneshot(get(&uri, &[]))
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -379,7 +394,10 @@ async fn put_roundtrip_bytes_identical() {
     let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
 
     let uri = format!("/photos/{name}");
-    let resp = router(state).oneshot(get(&uri, &[])).await.unwrap();
+    let resp = router(state)
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("x-content-type-options").unwrap(),
@@ -413,12 +431,11 @@ async fn put_any_extension_accepted() {
 
 #[tokio::test]
 async fn put_oversize_body_is_413() {
-    // SAFETY: single-threaded test binary; no other test reads GALLY_MAX_BYTES concurrently.
-    unsafe { std::env::set_var("GALLY_MAX_BYTES", "16"); }
-    let (state, _tmp) = test_state().await;
+    // Limits are per-state now: no process-wide env to race with.
+    let (state, _tmp) =
+        test_state_with(Limits { max_file: 16, ..Limits::defaults() }).await;
     let big = vec![0u8; 17];
     let (status, _) = put_photo(&state, "big.jpg", Some(KEY_A), None, "image/jpeg", big).await;
-    unsafe { std::env::remove_var("GALLY_MAX_BYTES"); }
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -463,9 +480,9 @@ async fn delete_last_photo_keeps_gallery() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await.get("gallery_gone"), Some(&serde_json::Value::Bool(false)));
 
-    // Gallery row stays: empty listing is 200 with no photos.
+    // Gallery row stays: owner's empty listing is 200 with no photos.
     let resp = router(state.clone())
-        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[]))
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -478,6 +495,7 @@ async fn lock_unlock_cycle() {
     let (state, _tmp) = test_state().await;
     let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
     let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
     let uri = format!("/api/galleries/{slug}/lock");
     // Lock with the owner key.
     let r = post_json(&uri, &[key_header(KEY_A)], r#"{"password":"s3cret-pass"}"#);
@@ -544,7 +562,7 @@ async fn delete_keeps_gallery_when_photos_remain() {
     assert_eq!(body_json(resp).await.get("gallery_gone"), Some(&serde_json::Value::Bool(false)));
 
     let resp = router(state)
-        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[]))
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -560,9 +578,12 @@ async fn delete_by_stranger_is_403() {
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // Still there.
+    // Still there (private gallery: the owner key is the only reader).
     let uri = format!("/photos/{name}");
-    let resp = router(state).oneshot(get(&uri, &[])).await.unwrap();
+    let resp = router(state)
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -701,6 +722,7 @@ async fn fix_c_malformed_lock_body_is_400_and_keeps_state() {
     let (state, _tmp) = test_state().await;
     let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
     let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
     let uri = format!("/api/galleries/{slug}/lock");
     // Malformed JSON must not clear (or set) the lock: 400, gallery stays open.
     let r = post_json(&uri, &[key_header(KEY_A)], "not json{{{");
@@ -807,7 +829,10 @@ async fn fix_b_svg_sandboxed() {
     assert_eq!(status, StatusCode::CREATED);
     let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
     let uri = format!("/photos/{name}");
-    let resp = router(state).oneshot(get(&uri, &[])).await.unwrap();
+    let resp = router(state)
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("content-security-policy").unwrap(),
@@ -906,6 +931,7 @@ async fn viewer_password_lockout_after_ten_failures() {
     let (state, _tmp) = test_state().await;
     let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
     let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
     let r = post_json(
         &format!("/api/galleries/{slug}/lock"),
         &[key_header(KEY_A)],
@@ -948,4 +974,645 @@ async fn delete_key_lockout_after_ten_failures() {
     let r = request("DELETE", &uri, &[key_header(KEY_A)], Body::empty());
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// --- private by default + owner media cookie ---
+
+#[tokio::test]
+async fn new_gallery_is_private_until_published() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "secret.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+    let listing = format!("/api/galleries/{slug}/photos");
+    let photo = format!("/photos/{name}");
+
+    // No credential: the gallery does not exist for viewers.
+    let resp = router(state.clone()).oneshot(get(&listing, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = router(state.clone()).oneshot(get(&photo, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Owner key: 200, public:false, and a media cookie for <img> tags.
+    let resp = router(state.clone())
+        .oneshot(get(&listing, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("owner cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.contains(&format!("galowner_{slug}=")), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    let v = body_json(resp).await;
+    assert_eq!(v["public"], serde_json::Value::Bool(false));
+
+    // That cookie alone authorizes the photo (no header needed).
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A forged cookie is not an owner.
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[("cookie", "galowner_x=deadbeef")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // A cookie for another slug does not transfer.
+    let resp = router(state.clone())
+        .oneshot(get(
+            &photo,
+            &[("cookie", format!("galowner_quiet-river-calm-pond-1a2b={}", &cookie[20..]).as_str())],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn visibility_endpoint_publishes_and_hides() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let listing = format!("/api/galleries/{slug}/photos");
+    let uri = format!("/api/galleries/{slug}/visibility");
+
+    // No key: 401. Wrong key: 403. Missing field: 400.
+    let r = post_json(&uri, &[], r#"{"public":true}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let r = post_json(&uri, &[key_header(KEY_B)], r#"{"public":true}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let r = post_json(&uri, &[key_header(KEY_A)], r#"{}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Publish: viewers can list it, the response echoes the state.
+    let r = post_json(&uri, &[key_header(KEY_A)], r#"{"public":true}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["public"], serde_json::Value::Bool(true));
+    let resp = router(state.clone()).oneshot(get(&listing, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["public"], serde_json::Value::Bool(true));
+
+    // Hide again: back to invisible.
+    let r = post_json(&uri, &[key_header(KEY_A)], r#"{"public":false}"#);
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let resp = router(state.clone()).oneshot(get(&listing, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn photo_cache_control_never_public_for_owners() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+    let photo = format!("/photos/{name}");
+
+    // Private gallery, owner key: no shared cache may keep the bytes.
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "private, no-store");
+
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    // Public gallery, anonymous viewer: cacheable.
+    let resp = router(state.clone()).oneshot(get(&photo, &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    // Owner key on a public gallery still stays out of shared caches.
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "private, no-store");
+}
+
+// --- quotas, free space, read limit ---
+
+#[tokio::test]
+async fn gallery_byte_quota_rejects_and_recovers() {
+    let (state, _tmp) =
+        test_state_with(Limits { gallery_bytes: 60, ..Limits::defaults() }).await;
+    let (status, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", vec![7u8; 40]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let first = v["name"].as_str().unwrap().to_string();
+    // Second 40 bytes would exceed 60: refused, nothing stored.
+    let (status, _) =
+        put_photo(&state, "b.jpg", Some(KEY_A), Some(&slug), "image/jpeg", vec![7u8; 40]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let files: usize = std::fs::read_dir(state.dir.clone()).unwrap().count();
+    assert_eq!(files, 1, "oversize upload must not leave a file");
+    let meta = state.db.lock().unwrap().gallery_meta(&slug).unwrap();
+    assert_eq!((meta.bytes, meta.photos), (40, 1));
+    // Deleting frees the space again.
+    let r = request("DELETE", &format!("/api/photos/{first}"), &[key_header(KEY_A)], Body::empty());
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let (status, _) =
+        put_photo(&state, "c.jpg", Some(KEY_A), Some(&slug), "image/jpeg", vec![7u8; 40]).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn gallery_photo_count_quota() {
+    let (state, _tmp) =
+        test_state_with(Limits { gallery_photos: 2, ..Limits::defaults() }).await;
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", b"a".to_vec()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let (status, _) =
+        put_photo(&state, "b.jpg", Some(KEY_A), Some(&slug), "image/jpeg", b"b".to_vec()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, v) =
+        put_photo(&state, "c.jpg", Some(KEY_A), Some(&slug), "image/jpeg", b"c".to_vec()).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(v["error"], serde_json::Value::String("photo limit reached".into()));
+}
+
+#[tokio::test]
+async fn min_free_bytes_guard_is_507() {
+    // Demand more free space than any volume has.
+    let (state, _tmp) =
+        test_state_with(Limits { min_free: u64::MAX, ..Limits::defaults() }).await;
+    let (status, v) =
+        put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", b"x".to_vec()).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(v["error"], serde_json::Value::String("storage full".into()));
+    assert_eq!(std::fs::read_dir(state.dir.clone()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn read_limit_trips_third_request() {
+    let (state, _tmp) =
+        test_state_with(Limits { read_max: 2, ..Limits::defaults() }).await;
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let listing = format!("/api/galleries/{slug}/photos");
+    for _ in 0..2 {
+        let resp = router(state.clone())
+            .oneshot(get(&listing, &[key_header(KEY_A)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = router(state.clone())
+        .oneshot(get(&listing, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// --- non-ASCII viewer passwords + wrong-key lockout ---
+
+#[tokio::test]
+async fn non_ascii_viewer_password_works() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"päss"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // UTF-8 percent-encoded query, raw UTF-8 header: both accepted.
+    for req in [
+        get(&format!("/api/galleries/{slug}/photos?pass=p%C3%A4ss"), &[]),
+        get(&format!("/api/galleries/{slug}/photos"), &[("x-gallery-pass", "päss")]),
+        get(&format!("/photos/{name}?pass=p%C3%A4ss"), &[]),
+    ] {
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // Invalid UTF-8 in the query cannot match.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos?pass=%FF%FE"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wrong_key_on_locked_gallery_locks_out() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"s3cret-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let listing = format!("/api/galleries/{slug}/photos");
+    for _ in 0..10 {
+        let resp = router(state.clone())
+            .oneshot(get(&listing, &[key_header(KEY_B)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = router(state.clone())
+        .oneshot(get(&listing, &[key_header(KEY_B)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// --- range + disposition ---
+
+#[tokio::test]
+async fn range_requests_slice_the_file() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "big.jpg", Some(KEY_A), None, "image/jpeg", vec![9u8; 1000]).await;
+    let name = v["name"].as_str().unwrap().to_string();
+    let uri = format!("/photos/{name}");
+
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=10-19")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes 10-19/1000"
+    );
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(body_bytes(resp).await.len(), 10);
+
+    // Suffix range: last 10 bytes.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=-10")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes 990-999/1000"
+    );
+
+    // Out of range: 416 with the real length, no body.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=9999-")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes */1000"
+    );
+    assert!(body_bytes(resp).await.is_empty());
+
+    // Malformed spec: 416 too, never a silent full body.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=abc-def")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+    // Multi-range: served whole (a media probe, not an error).
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=0-9,20-29")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await.len(), 1000);
+
+    // No range: full body + Accept-Ranges.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(body_bytes(resp).await.len(), 1000);
+}
+
+#[tokio::test]
+async fn non_media_downloads_as_attachment() {
+    let (state, _tmp) = test_state().await;
+    let (_, pdf) = put_photo(&state, "doc.pdf", Some(KEY_A), None, "application/pdf", b"%PDF".to_vec()).await;
+    let (_, txt) = put_photo(&state, "note.txt", Some(KEY_A), None, "text/plain", b"hi".to_vec()).await;
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/photos/{}", pdf["name"].as_str().unwrap()),
+            &[key_header(KEY_A)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-disposition").unwrap(), "attachment");
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/photos/{}", txt["name"].as_str().unwrap()),
+            &[key_header(KEY_A)],
+        ))
+        .await
+        .unwrap();
+    assert!(resp.headers().get("content-disposition").is_none(), "text stays inline");
+}
+
+// --- admin abuse tooling ---
+
+/// Delete a gallery by slug as admin; returns (status, json).
+async fn admin_delete(state: &Arc<AppState>, cookie: &str, slug: &str) -> (StatusCode, serde_json::Value) {
+    let r = request(
+        "POST",
+        &format!("/api/admin/galleries/{slug}/delete"),
+        &[("cookie", cookie)],
+        Body::empty(),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    let s = resp.status();
+    (s, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn ban_sweep_removes_every_gallery_of_the_key() {
+    let (state, _tmp) = test_state().await;
+    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug_a = a["slug"].as_str().unwrap().to_string();
+    let name_a = a["name"].as_str().unwrap().to_string();
+    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug_b = b["slug"].as_str().unwrap().to_string();
+    let name_b = b["name"].as_str().unwrap().to_string();
+
+    let cookie = admin_cookie(&state);
+    let (status, v) = admin_delete(&state, &cookie, &slug_a).await;
+    assert_eq!(status, StatusCode::OK);
+    let slugs: Vec<&str> = v["slugs"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert_eq!(slugs.len(), 2, "{v}");
+    assert!(slugs.contains(&slug_a.as_str()) && slugs.contains(&slug_b.as_str()));
+    assert_eq!(v["files"], serde_json::Value::from(2));
+    // Both files and both rows are gone.
+    assert!(!state.dir.join(&name_a).exists());
+    assert!(!state.dir.join(&name_b).exists());
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug_a));
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug_b));
+
+    // The ban is listed with a readable label.
+    let resp = router(state.clone())
+        .oneshot(get("/api/admin/banned", &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let first = &v["banned"][0];
+    assert!(first["label"].as_str().is_some(), "{v}");
+
+    // Unknown slug: 404.
+    let (status, _) = admin_delete(&state, &cookie, "quiet-river-calm-pond-1a2b").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_remove_deletes_one_gallery_and_keeps_the_key() {
+    let (state, _tmp) = test_state().await;
+    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug_a = a["slug"].as_str().unwrap().to_string();
+    let name_a = a["name"].as_str().unwrap().to_string();
+    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug_b = b["slug"].as_str().unwrap().to_string();
+
+    let cookie = admin_cookie(&state);
+    let r = request(
+        "POST",
+        &format!("/api/admin/galleries/{slug_a}/remove"),
+        &[("cookie", cookie.as_str())],
+        Body::empty(),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["files"], serde_json::Value::from(1));
+    assert!(!state.dir.join(&name_a).exists());
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug_a));
+    assert!(state.db.lock().unwrap().gallery_exists(&slug_b));
+    // Key still works: the gallery is not banned.
+    let (status, _) =
+        put_photo(&state, "c.jpg", Some(KEY_A), Some(&slug_b), "image/jpeg", jpeg()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Non-admin refused.
+    let r = request(
+        "POST",
+        &format!("/api/admin/galleries/{slug_a}/remove"),
+        &[],
+        Body::empty(),
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn admin_sweep_removes_only_orphans() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "keep.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let kept = v["name"].as_str().unwrap().to_string();
+    let hex = "c".repeat(32);
+    let orphan = format!("quiet-river-calm-pond-1a2b_{hex}_junk.jpg");
+    std::fs::write(state.dir.join(&orphan), b"junk").unwrap();
+
+    let cookie = admin_cookie(&state);
+    let r = request("POST", "/api/admin/sweep", &[("cookie", cookie.as_str())], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["deleted"], serde_json::Value::from(1));
+    assert_eq!(v["failed"], serde_json::Value::from(0));
+    assert!(!state.dir.join(&orphan).exists());
+    assert!(state.dir.join(&kept).exists());
+}
+
+#[tokio::test]
+async fn admin_logout_clears_cookie_and_token() {
+    let (state, _tmp) = test_state().await;
+    let cookie = admin_cookie(&state);
+    let r = request("POST", "/api/admin/logout", &[("cookie", cookie.as_str())], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
+    // The revoked token no longer works.
+    let resp = router(state.clone())
+        .oneshot(get("/api/admin/galleries", &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Not an admin: refused.
+    let r = request("POST", "/api/admin/logout", &[], Body::empty());
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn security_headers_on_every_response() {
+    let (state, _tmp) = test_state().await;
+    for uri in ["/app.js", "/gally/admin/", "/api/admin/galleries"] {
+        let resp = router(state.clone()).oneshot(get(uri, &[])).await.unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff", "{uri}");
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer", "{uri}");
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY", "{uri}");
+        assert_eq!(
+            h.get("content-security-policy").unwrap(),
+            "frame-ancestors 'none'",
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_unlock_lockout_survives_unlimited_rate() {
+    let _env = lock_admin_env();
+    // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
+    unsafe { std::env::set_var("ADMIN_PASS", "lockout-admin"); }
+    // SAFETY: ADMIN_ENV_LOCK is held; GALLY_RATE_MAX is also process-global.
+    unsafe { std::env::set_var("GALLY_RATE_MAX", "0"); }
+    let (state, _tmp) = test_state().await;
+    for _ in 0..10 {
+        let r = post_json("/api/admin/unlock", &[], r#"{"password":"wrong"}"#);
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    // 11th wrong guess trips the failure lockout even with uploads unlimited.
+    let r = post_json("/api/admin/unlock", &[], r#"{"password":"wrong"}"#);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    unsafe { std::env::remove_var("GALLY_RATE_MAX"); }
+    unsafe { std::env::remove_var("ADMIN_PASS"); }
+}
+
+#[tokio::test]
+async fn wrong_key_on_private_listing_locks_out() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let uri = format!("/api/galleries/{slug}/photos");
+    for _ in 0..10 {
+        let resp = router(state.clone())
+            .oneshot(get(&uri, &[key_header(KEY_B)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_B)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The real key still works: lockout only stops guessing.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn resolve_with_header_key_and_body_slug_resolves() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    // Header key + body slug: must resolve, not mint a stray gallery.
+    let r = post_json(
+        "/api/galleries/resolve",
+        &[key_header(KEY_A)],
+        &format!(r#"{{"slug":{slug:?}}}"#),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["slug"].as_str(), Some(slug.as_str()));
+    // Present-but-invalid slug: 400, never a fresh gallery.
+    let r = post_json(
+        "/api/galleries/resolve",
+        &[key_header(KEY_A)],
+        r#"{"slug":"bogus!!!"}"#,
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invalid_slug_header_is_400_not_mint() {
+    let (state, _tmp) = test_state().await;
+    let (status, _) =
+        put_photo(&state, "x.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Hand-rolled PUT with a mistyped slug header: 400, no new gallery.
+    let mut h = vec![("content-type", "image/jpeg"), key_header(KEY_A)];
+    h.push(("x-gallery-slug", "Happy-Otter-Bogus"));
+    let r = request("PUT", "/api/photos/x.jpg", &h, Body::from(jpeg()));
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- listing lock state + failed-mint cleanup ---
+
+#[tokio::test]
+async fn listing_reports_lock_state() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "p.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let uri = format!("/api/galleries/{slug}/photos");
+
+    let resp = router(state.clone()).oneshot(get(&uri, &[key_header(KEY_A)])).await.unwrap();
+    assert_eq!(body_json(resp).await["locked"], serde_json::Value::Bool(false));
+
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"pw-1234"}"#,
+    );
+    assert_eq!(router(state.clone()).oneshot(r).await.unwrap().status(), StatusCode::OK);
+
+    // The owner still sees the gallery, and must be told it is locked: an
+    // unauthenticated probe cannot (private galleries answer 404 first).
+    let resp = router(state.clone()).oneshot(get(&uri, &[key_header(KEY_A)])).await.unwrap();
+    assert_eq!(body_json(resp).await["locked"], serde_json::Value::Bool(true));
+}
+
+#[tokio::test]
+async fn failed_home_upload_leaves_no_gallery() {
+    let (state, _tmp) = test_state().await;
+    // A home PUT mints before the body is read; an empty body must not leave
+    // an empty gallery behind in the admin list.
+    let (status, _) = put_photo(&state, "empty.jpg", Some(KEY_A), None, "image/jpeg", Vec::new()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let rows: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "minted gallery must be rolled back");
 }

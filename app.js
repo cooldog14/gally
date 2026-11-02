@@ -14,6 +14,11 @@ const keyDialog = document.getElementById("key-dialog");
 const keyForm = document.getElementById("key-form");
 const keyInput = document.getElementById("key-input");
 const keyError = document.getElementById("key-error");
+const keyHelp = document.getElementById("key-help");
+const publicCheck = document.getElementById("public-check");
+const editStatus = document.getElementById("edit-status");
+const keyBanner = document.getElementById("key-banner");
+const keyBannerKey = document.getElementById("key-banner-key");
 
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
 
@@ -21,6 +26,11 @@ const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-
 
 let photos = [];
 let index = 0;
+// Whole-gallery visibility; new galleries start private server-side.
+let galleryPublic = true;
+// Viewer password set? Comes from the listing: an unauthenticated probe gets
+// 404 on a private gallery, so it cannot tell whether a lock exists.
+let galleryLocked = false;
 // Gallery key: kept in memory + sessionStorage (per-tab). Never in the URL.
 let galleryKey = sessionStorage.getItem("gallery-key") || "";
 let keyResolver = null;
@@ -45,12 +55,28 @@ const confirmDialog = document.getElementById("confirm-dialog");
 const confirmText = document.getElementById("confirm-text");
 const confirmForm = document.getElementById("confirm-form");
 
+document.getElementById("key-banner-close").addEventListener("click", () => {
+  keyBanner.hidden = true;
+});
+
+/** One-shot "this is your key" strip: shown once, right after a mint. */
+function showKeyBannerOnce(slug) {
+  let key = "";
+  try {
+    key = sessionStorage.getItem("show-key:" + slug) || "";
+    if (key) sessionStorage.removeItem("show-key:" + slug);
+  } catch (_) { return; }
+  if (!key) return;
+  keyBannerKey.textContent = key;
+  keyBanner.hidden = false;
+}
+
 function slugFromPath() {
   const seg = location.pathname.split("/").filter(Boolean)[0] || "";
   return SLUG_RE.test(seg) ? seg : "";
 }
 
-async function loadPhotos() {
+async function loadPhotos(retry = false) {
   const slug = slugFromPath();
   if (!slug) {
     // Landing page: no gallery yet. Upload prompts for a key.
@@ -58,21 +84,31 @@ async function loadPhotos() {
     editBtn.hidden = true;
     setEditing(false);
     photos = [];
+    publicCheck.checked = true;
+    galleryLocked = false;
     renderGrid();
     return;
   }
   galleryLabel.textContent = slug;
   editBtn.hidden = false;
+  showKeyBannerOnce(slug);
   try {
     const headers = {};
-    if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
-    else {
-      const p = storedPass(slug);
-      if (p) headers["X-Gallery-Pass"] = p;
+    let url = "/api/galleries/" + slug + "/photos";
+    if (galleryKey) {
+      headers["X-Gallery-Key"] = galleryKey;
     }
-    const res = await fetch("/api/galleries/" + slug + "/photos", { headers });
+    // Query too: <img>/<video> cannot send headers, and latin-1 headers
+    // mangle non-ASCII passwords (?pass= is percent-encoded UTF-8).
+    const p = storedPass(slug);
+    if (p) url += "?pass=" + encodeURIComponent(p);
+    const res = await fetch(url, { headers });
     if (res.status === 404) {
-      // Gallery deleted/emptied away: back to the landing page.
+      // Private (or deleted): a key is the only door. Ask once, then leave.
+      if (!retry) {
+        const key = await needKey(true, "enter");
+        if (key) return loadPhotos(true);
+      }
       location.assign("/");
       return;
     }
@@ -88,6 +124,9 @@ async function loadPhotos() {
     }
     if (!res.ok) throw new Error("bad status " + res.status);
     const data = await res.json();
+    galleryPublic = data.public !== false;
+    galleryLocked = data.locked === true;
+    publicCheck.checked = galleryPublic;
     photos = data.photos || [];
     // Drop selection for photos that no longer exist.
     for (const name of Array.from(selected)) {
@@ -103,7 +142,16 @@ async function loadPhotos() {
 
 function setEditing(on) {
   editing = on;
-  if (!on) selected.clear();
+  editStatus.textContent = "";
+  document.body.classList.toggle("editing", on);
+  if (!on) {
+    selected.clear();
+    // Unmark tiles in place: never rebuild the grid (media would reload).
+    for (const tile of grid.children) {
+      tile.classList.remove("selected");
+      tile.setAttribute("aria-pressed", "false");
+    }
+  }
   editBar.hidden = !on;
   editBtn.textContent = on ? "Editing…" : "Edit";
   uploadBtn.hidden = on;
@@ -113,7 +161,6 @@ function setEditing(on) {
 function updateEditUI() {
   selCount.textContent = selected.size + " selected";
   deleteBtn.disabled = selected.size === 0;
-  renderGrid();
 }
 
 editBtn.addEventListener("click", async () => {
@@ -121,17 +168,45 @@ editBtn.addEventListener("click", async () => {
     setEditing(false);
     return;
   }
-  const key = await needKey();
+  const key = await needKey(false, "enter");
   if (!key) return;
   setEditing(true);
 });
 
 doneBtn.addEventListener("click", () => setEditing(false));
 
+// Publish/unpublish the whole gallery. Reverts the tick if the server refuses.
+publicCheck.addEventListener("change", async () => {
+  const slug = slugFromPath();
+  if (!slug) return;
+  const want = publicCheck.checked;
+  publicCheck.disabled = true;
+  editStatus.textContent = "";
+  try {
+    const res = await fetch("/api/galleries/" + slug + "/visibility", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Gallery-Key": galleryKey },
+      body: JSON.stringify({ public: want }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+      throw new Error(msg);
+    }
+    galleryPublic = want;
+    editStatus.textContent = want ? "Gallery is public" : "Gallery is private";
+  } catch (e) {
+    publicCheck.checked = galleryPublic;
+    editStatus.textContent = e.message;
+  } finally {
+    publicCheck.disabled = false;
+  }
+});
+
 lockBtn.addEventListener("click", async () => {
   const slug = slugFromPath();
   if (!slug) return;
-  const key = await needKey();
+  const key = await needKey(false, "enter");
   if (!key) return;
   const input = document.getElementById("setpass-input");
   const errEl = document.getElementById("setpass-error");
@@ -139,23 +214,16 @@ lockBtn.addEventListener("click", async () => {
   const removeBtn = document.getElementById("setpass-remove");
   errEl.textContent = "";
   input.value = "";
-  // Keyless probe: the owner key bypasses the lock, so only an
-  // unauthenticated listing 401s when the gallery is protected.
-  let locked = false;
-  try {
-    const probe = await fetch("/api/galleries/" + slug + "/photos");
-    locked = probe.status === 401;
-  } catch (_) {}
-  removeBtn.hidden = !locked;
-  help.textContent = locked
+  removeBtn.hidden = !galleryLocked;
+  help.textContent = galleryLocked
     ? "This gallery is protected. Enter a new password to change it, or remove protection below."
     : "Viewers will need this password to open the gallery.";
   document.getElementById("setpass-dialog").showModal();
   input.focus();
 });
 
-document.getElementById("setpass-form").addEventListener("submit", async () => {
-  const clicked = document.activeElement && document.activeElement.value;
+document.getElementById("setpass-form").addEventListener("submit", async (e) => {
+  const clicked = e.submitter?.value;
   if (clicked === "cancel") return;
   const slug = slugFromPath();
   const input = document.getElementById("setpass-input");
@@ -193,8 +261,8 @@ deleteBtn.addEventListener("click", () => {
   confirmText.textContent = "Delete " + selected.size + (selected.size === 1 ? " photo?" : " photos?") + " This cannot be undone.";
   confirmDialog.showModal();
 });
-confirmForm.addEventListener("submit", async () => {
-  if (document.activeElement && document.activeElement.value === "cancel") return;
+confirmForm.addEventListener("submit", async (e) => {
+  if (!e.submitter || e.submitter.value === "cancel") return;
   const names = Array.from(selected);
   const key = galleryKey;
   const failures = [];
@@ -243,23 +311,11 @@ function mediaUrl(name) {
   return p ? base + "?pass=" + encodeURIComponent(p) : base;
 }
 
-// Same credential as a header (for fetch(), which unlike <img>/<video>
-// tags can set headers).
-function passHeader() {
-  const slug = slugFromPath();
-  const p = slug ? storedPass(slug) : "";
+// Owner key as a header (ASCII-safe); viewer password travels in mediaUrl.
+async function authedFetch(name) {
   const headers = {};
   if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
-  else if (p) headers["X-Gallery-Pass"] = p;
-  return headers;
-}
-
-async function authedFetch(name) {
-  const url = mediaUrl(name);
-  const headers = passHeader();
-  const q = url.indexOf("?pass=");
-  if (q >= 0) return fetch(url.slice(0, q), { headers });
-  return fetch(url, { headers });
+  return fetch(mediaUrl(name), { headers });
 }
 
 
@@ -399,8 +455,11 @@ function renderGrid() {
     tile.appendChild(tick);
     tile.addEventListener("click", () => {
       if (editing) {
-        if (selected.has(photo.name)) selected.delete(photo.name);
-        else selected.add(photo.name);
+        const now = !selected.has(photo.name);
+        if (now) selected.add(photo.name);
+        else selected.delete(photo.name);
+        tile.classList.toggle("selected", now);
+        tile.setAttribute("aria-pressed", String(now));
         updateEditUI();
       } else {
         openLightbox(i);
@@ -424,9 +483,13 @@ function openLightbox(i) {
   render();
 }
 
+// Tile index whose media is currently adopted by the lightbox (-1 = none).
+let adoptedTile = -1;
+
 function showInViewport(i) {
   stopViewportMedia();
   viewport.textContent = "";
+  adoptedTile = -1;
   const name = photos[i].name;
   const kind = mediaKind(name);
   const url = mediaUrl(name);
@@ -476,10 +539,12 @@ function showInViewport(i) {
   const media = tile ? tile.querySelector("img, video, .file-generic") : null;
   if (media && (media.tagName !== "IMG" || (media.complete && media.naturalWidth))) {
     viewport.appendChild(media);
+    adoptedTile = i;
     if (media.tagName === "VIDEO") { media.controls = true; }
   } else if (media) {
     // Not decoded yet: re-create at full size, swap when ready.
     viewport.appendChild(media);
+    adoptedTile = i;
   } else {
     viewport.appendChild(tileMedia(photos[i]));
   }
@@ -501,25 +566,17 @@ function stopViewportMedia() {
 }
 
 function restoreThumbnails() {
-  // Move any adopted media back to its tile.
+  // Put the adopted media back where it came from (by index, not by URL).
   stopViewportMedia();
-  const media = viewport.querySelector("img, video, .file-generic");
-  if (media) {
-    if (media.tagName === "VIDEO") { media.controls = false; media.muted = true; }
-    const src = media.currentSrc || media.src;
-    const tile = Array.from(grid.children).find((t) => {
-      const o = t.querySelector("img, video, .file-generic");
-      return o && src && (o.currentSrc === src || o.src === src);
-    });
-    if (tile && !tile.querySelector("img, video, .file-generic")) tile.prepend(media);
-    else {
-      const name = Array.from(photos).find((p) =>
-        src && src.endsWith("/photos/" + encodeURIComponent(p.name)))?.name;
-      const idx = name ? photos.findIndex((p) => p.name === name) : -1;
-      if (idx >= 0 && grid.children[idx] && !grid.children[idx].querySelector("img, video, .file-generic"))
-        grid.children[idx].prepend(media);
+  if (adoptedTile >= 0) {
+    const media = viewport.querySelector("img, video, .file-generic");
+    const tile = grid.children[adoptedTile];
+    if (media && tile && !tile.querySelector("img, video, .file-generic")) {
+      if (media.tagName === "VIDEO") { media.controls = false; media.muted = true; }
+      tile.prepend(media);
     }
   }
+  adoptedTile = -1;
   viewport.textContent = "";
 }
 
@@ -546,29 +603,41 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") closeLightbox();
 });
 
+// The key is hand-typed, never generated: the user must remember (or note)
+// what they wrote. Keys are 12-128 visible ASCII chars (header-safe);
+// new keys also need a capital and a symbol.
+
+/** Why a *new* key is not acceptable yet ("" = fine). */
+function newKeyProblem(v) {
+  if (!/^[\x21-\x7e]{12,128}$/.test(v)) return "Key must be 12-128 ASCII characters (no spaces/accents)";
+  if (!/\p{Lu}/u.test(v)) return "Key needs a capital letter";
+  if (!/[^\p{L}\p{N}]/u.test(v)) return "Key needs a symbol, like ! - _ #";
+  return "";
+}
+
 /** Resolve the gallery key: memory/session, else prompt once.
     Landing page (no slug) always prompts: returning here means a new gallery. */
-function needKey(forcePrompt) {
-  if (!forcePrompt && galleryKey && galleryKey.length >= 12) return Promise.resolve(galleryKey);
-  keyError.textContent = "";
-  keyInput.value = "";
+let keyMode = "enter";
+function needKey(forcePrompt, mode = "enter") {
+  if (!forcePrompt && galleryKey && galleryKey.length >= 12) {
+    return Promise.resolve(galleryKey);
+  }
   resetKeyDialog();
+  keyMode = mode;
+  const create = mode === "create";
+  document.getElementById("key-title").textContent = create ? "New gallery key" : "Gallery key";
+  keyHelp.textContent = create
+    ? "At least 6 characters, with a capital letter and a symbol (like Sunset-42). Save it; it is the only way to edit this gallery."
+    : "Enter the key for this gallery.";
+  keyInput.value = "";
+  keyError.textContent = "";
   keyDialog.showModal();
   keyInput.focus();
   return new Promise((resolve) => { keyResolver = resolve; });
 }
 
-// Creation-time lock: ticking Private reveals the password field; the value
-// is applied via /lock right after the gallery's first upload lands.
-let pendingPass = "";
 function resetKeyDialog() {
   invitePrompt = false;
-  document.getElementById("key-title").textContent = "Gallery key";
-  document.getElementById("private-check").checked = false;
-  document.getElementById("private-row").hidden = false;
-  document.getElementById("key-pass-input").hidden = true;
-  document.getElementById("key-pass-input").value = "";
-  pendingPass = "";
 }
 
 let passResolver = null;
@@ -584,11 +653,11 @@ function needPass(slug) {
   return new Promise((resolve) => { passResolver = { resolve, slug }; });
 }
 
-document.getElementById("pass-form").addEventListener("submit", () => {
+document.getElementById("pass-form").addEventListener("submit", (e) => {
   if (!passResolver) return;
   const { resolve, slug } = passResolver;
   const input = document.getElementById("pass-input");
-  if (document.activeElement && document.activeElement.value === "cancel") {
+  if (e.submitter?.value === "cancel") {
     passResolver = null;
     resolve(false);
     return;
@@ -603,6 +672,12 @@ document.getElementById("pass-form").addEventListener("submit", () => {
   passResolver = null;
   resolve(true);
 });
+document.getElementById("pass-cancel").addEventListener("click", () => {
+  document.getElementById("pass-dialog").close();
+});
+document.getElementById("setpass-cancel").addEventListener("click", () => {
+  document.getElementById("setpass-dialog").close();
+});
 document.getElementById("pass-dialog").addEventListener("close", () => {
   if (passResolver) {
     const { resolve } = passResolver;
@@ -610,7 +685,6 @@ document.getElementById("pass-dialog").addEventListener("close", () => {
     resolve(false);
   }
 });
-
 // Invite code for NEW galleries: memory-only, asked once per batch when the
 // server answers "invite required". Contributing to an existing gallery
 // never needs it.
@@ -619,43 +693,42 @@ let invitePrompt = false;
 /** Prompt for the invite code (reuses the key dialog UI). */
 function needInvite() {
   if (inviteCode) return Promise.resolve(inviteCode);
+  resetKeyDialog();
   invitePrompt = true;
   document.getElementById("key-title").textContent = "Invite code";
-  keyError.textContent = "";
+  keyHelp.textContent = "Ask the gallery owner for the invite code.";
   keyInput.value = "";
+  keyError.textContent = "";
   keyDialog.showModal();
   keyInput.focus();
   return new Promise((resolve) => { keyResolver = resolve; });
 }
 
-document.getElementById("private-check").addEventListener("change", (e) => {
-  document.getElementById("key-pass-input").hidden = !e.target.checked;
-  if (e.target.checked) document.getElementById("key-pass-input").focus();
-});
-
 keyForm.addEventListener("submit", (e) => {
   const v = keyInput.value.trim();
-  if (v.length < 12) {
+  if (invitePrompt) {
+    if (!/^[\x21-\x7e]{1,128}$/.test(v)) {
+      e.preventDefault();
+      keyError.textContent = !v ? "Invite code required" : "Invite code must be ASCII (no spaces/accents)";
+      keyInput.focus();
+      return;
+    }
+    inviteCode = v;
+    resetKeyDialog();
+    if (keyResolver) keyResolver(v);
+    keyResolver = null;
+    return;
+  }
+  // Strong rules only for keys we create; an existing key just has to be one.
+  const problem = keyMode === "create" ? newKeyProblem(v) : (!/^[\x21-\x7e]{12,128}$/.test(v) ? "Key must be 12-128 ASCII characters (no spaces/accents)" : "");
+  if (problem) {
     e.preventDefault(); // keep the dialog open (Esc still cancels)
-    keyError.textContent = "Key must be at least 12 characters";
+    keyError.textContent = problem;
     keyInput.focus();
     return;
   }
-  const wantPrivate = document.getElementById("private-check").checked;
-  const passVal = document.getElementById("key-pass-input").value;
-  if (wantPrivate && !passVal) {
-    e.preventDefault();
-    keyError.textContent = "Set a viewer password, or untick Private";
-    document.getElementById("key-pass-input").focus();
-    return;
-  }
-  pendingPass = wantPrivate ? passVal : "";
-  if (invitePrompt) {
-    inviteCode = v;
-  } else {
-    galleryKey = v;
-    try { sessionStorage.setItem("gallery-key", v); } catch (_) { /* private mode */ }
-  }
+  galleryKey = v;
+  try { sessionStorage.setItem("gallery-key", v); } catch (_) { /* private mode */ }
   resetKeyDialog();
   if (keyResolver) keyResolver(v);
   keyResolver = null;
@@ -669,21 +742,43 @@ keyDialog.addEventListener("close", () => {
 
 uploadBtn.addEventListener("click", () => fileInput.click());
 
+/** Mint one gallery for a whole home upload batch (invite asked once). */
+async function newGallery(key) {
+  for (;;) {
+    const headers = { "Content-Type": "application/json", "X-Gallery-Key": key };
+    if (inviteCode) headers["X-Invite-Code"] = inviteCode;
+    let res;
+    try {
+      res = await fetch("/api/galleries/resolve", { method: "POST", headers, body: "{}" });
+    } catch (_) {
+      return "";
+    }
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.slug) return data.slug;
+    if (res.status !== 403 || !data || data.error !== "invite required") return "";
+    if (!(await needInvite())) return "";
+  }
+}
+
 fileInput.addEventListener("change", async () => {
-  const key = await needKey(!slugFromPath());
+  const key = await needKey(!slugFromPath(), slugFromPath() ? "enter" : "create");
   if (!key) { fileInput.value = ""; return; }
   const files = Array.from(fileInput.files);
   fileInput.value = "";
+  if (!files.length) return;
   const failures = [];
-  let firstSlug = "";
-  let queued = [];
-  // Gallery page: tell the server which gallery this targets (scoped auth).
-  // Home: omit it, the server mints a fresh gallery for the key.
+  // One gallery per batch, picked before the first byte: if one upload's
+  // reply is lost, the next file must not mint a second gallery that the
+  // browser never navigates to.
   const pageSlug = slugFromPath();
-  async function putFile(file, extra) {
-    const headers = { "X-Gallery-Key": key, ...extra };
-    const target = pageSlug || firstSlug;
-    if (target) headers["X-Gallery-Slug"] = target;
+  const target = pageSlug || (await newGallery(key));
+  if (!target) {
+    uploadStatus.textContent = "Could not create gallery";
+    return;
+  }
+  let stored = 0;
+  async function putFile(file) {
+    const headers = { "X-Gallery-Key": key, "X-Gallery-Slug": target };
     if (file.type) headers["Content-Type"] = file.type;
     try {
       return await fetch("/api/photos/" + encodeURIComponent(file.name), {
@@ -700,18 +795,10 @@ fileInput.addEventListener("change", async () => {
       failures.push(file.name + ": file is too large (10GB max)");
       continue;
     }
-    let res = await putFile(file, inviteCode ? { "X-Invite-Code": inviteCode } : null);
+    const res = await putFile(file);
     if (!res) {
       failures.push(file.name + ": upload failed");
       continue;
-    }
-    if (res.status === 403) {
-      const err = await res.json().catch(() => null);
-      if (err && err.error === "invite required") {
-        // Unknown gallery key: one invite prompt covers the whole batch.
-        queued.push(file);
-        continue;
-      }
     }
     if (!res.ok) {
       let msg = res.statusText;
@@ -722,53 +809,23 @@ fileInput.addEventListener("change", async () => {
       failures.push(file.name + ": " + msg);
       continue;
     }
-    const data = await res.json().catch(() => null);
-    if (data && data.slug) firstSlug = data.slug;
+    stored += 1;
   }
-  if (queued.length) {
-    const invite = await needInvite();
-    if (!invite) {
-      for (const file of queued) failures.push(file.name + ": invite required");
-    } else {
-      for (const file of queued) {
-        const res = await putFile(file, { "X-Invite-Code": invite });
-        if (!res) {
-          failures.push(file.name + ": upload failed");
-          continue;
-        }
-        if (!res.ok) {
-          let msg = res.statusText;
-          try {
-            const err = await res.json();
-            if (err.error) msg = err.error;
-          } catch (_) { /* keep status text */ }
-          failures.push(file.name + ": " + msg);
-          continue;
-        }
-        const data = await res.json().catch(() => null);
-        if (data && data.slug) firstSlug = data.slug;
-      }
-    }
-  }
-  if (firstSlug && pendingPass) {
-    // Private ticked: lock the new gallery before leaving.
-    try {
-      await fetch("/api/galleries/" + firstSlug + "/lock", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
-        body: JSON.stringify({ password: pendingPass }),
-      });
-      try { sessionStorage.setItem("gallery-pass:" + firstSlug, pendingPass); } catch (_) {}
-    } catch (_) {}
-    pendingPass = "";
-  }
-  if (firstSlug && !slugFromPath()) {
-    // First upload created the gallery: navigate to its public link.
-    location.assign("/" + firstSlug);
+  if (pageSlug) {
+    // Gallery page: show the new tiles without a manual reload.
+    await loadPhotos(true);
+    uploadStatus.textContent = failures.length ? failures.join("; ") : "";
     return;
   }
-  pendingPass = "";
-  uploadStatus.textContent = failures.length ? failures.join("; ") : "";
+  if (!stored) {
+    // Nothing landed: stay put so the errors stay visible.
+    uploadStatus.textContent = failures.join("; ") || "upload failed";
+    return;
+  }
+  // Carry the key to the next page so the banner can show it once (the field
+  // itself is never prefilled again).
+  try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
+  location.assign("/" + target);
 });
 
 themeBtn.addEventListener("click", () => {

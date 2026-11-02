@@ -4,7 +4,7 @@
 // (no imports: uuid provides the thread-safe randomness)
 
 pub const MAX_NAME_LEN: usize = 100;
-pub const KEY_MIN: usize = 12;
+pub const KEY_MIN: usize = 6;
 pub const KEY_MAX: usize = 128;
 
 pub static ADJ: &[&str] = &[
@@ -121,19 +121,21 @@ pub fn normalize_key(raw: &str) -> Option<String> {
     }
 }
 
-pub fn percent_decode(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
+/// Percent-decode to raw bytes: `%41` → `A`, invalid escapes kept verbatim.
+/// Bytes are NOT widened to chars: a UTF-8 password survives the trip.
+pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
+    let mut o = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
             if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                o.push((h * 16 + l) as char);
+                o.push(h * 16 + l);
                 i += 3;
                 continue;
             }
         }
-        o.push(b[i] as char);
+        o.push(b[i]);
         i += 1;
     }
     o
@@ -221,8 +223,10 @@ mod tests {
 
     #[test]
     fn normalize_key_bounds() {
-        assert!(normalize_key("abcdefghijkl").is_some());
-        assert!(normalize_key("abcdefghijk").is_none());
+        assert!(normalize_key("Abc!x1").is_some());
+        assert!(normalize_key("Abc!x").is_none());
+        // Longer keys (old style, e.g. random hex) stay valid.
+        assert!(normalize_key(&"k".repeat(12)).is_some());
         assert!(normalize_key(&"k".repeat(128)).is_some());
         assert!(normalize_key(&"k".repeat(129)).is_none());
         assert_eq!(normalize_key("  a-long-secret-key  "), Some("a-long-secret-key".to_string()));
@@ -230,11 +234,13 @@ mod tests {
 
     #[test]
     fn decode_percent() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%41%42"), "AB");
-        assert_eq!(percent_decode("100%25"), "100%");
-        assert_eq!(percent_decode("%ZZ"), "%ZZ"); // invalid kept
-        assert_eq!(percent_decode("trail%"), "trail%");
+        assert_eq!(percent_decode_bytes("a%20b"), b"a b");
+        assert_eq!(percent_decode_bytes("%41%42"), b"AB");
+        assert_eq!(percent_decode_bytes("100%25"), b"100%");
+        assert_eq!(percent_decode_bytes("%ZZ"), b"%ZZ"); // invalid kept
+        assert_eq!(percent_decode_bytes("trail%"), b"trail%");
+        // Multi-byte UTF-8 must survive: bytes, not widened chars.
+        assert_eq!(percent_decode_bytes("%C3%A4"), [0xC3, 0xA4]);
     }
 
     #[test]

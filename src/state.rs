@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::db::{self, GalleryDb};
+use crate::db;
 
 pub const RATE_MAX: usize = 60;
 pub const RATE_WINDOW_SECS: u64 = 60;
@@ -25,6 +25,59 @@ pub fn rate_max() -> usize {
 
 // (Listing cache removed: plain directory scans never go stale.)
 
+/// Upload/read limits, snapshotted at startup so hot paths never read env.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Single request cap (`GALLY_MAX_BYTES`).
+    pub max_file: usize,
+    /// Per-gallery byte cap (`GALLY_GALLERY_MAX_BYTES`); 0 = off.
+    pub gallery_bytes: u64,
+    /// Per-gallery photo cap (`GALLY_GALLERY_MAX_PHOTOS`); 0 = off.
+    pub gallery_photos: i64,
+    /// Free space the data volume must keep (`GALLY_MIN_FREE_BYTES`); 0 = off.
+    pub min_free: u64,
+    /// Listing + photo reads per IP per window (`GALLY_READ_RATE_MAX`);
+    /// 0 = off. Keep it above `gallery_photos`: one gallery view costs one
+    /// listing plus one request per photo, all from the same bucket.
+    pub read_max: usize,
+    /// Concurrent uploads (`GALLY_UPLOAD_SLOTS`), clamped to >= 1.
+    pub upload_slots: usize,
+    /// Concurrent Argon2 hashes (`GALLY_ARGON2_SLOTS`), clamped to >= 1.
+    pub argon2_slots: usize,
+}
+
+impl Limits {
+    pub fn defaults() -> Self {
+        Limits {
+            max_file: 10 * 1024 * 1024 * 1024,
+            gallery_bytes: 5 * 1024 * 1024 * 1024,
+            gallery_photos: 5000,
+            min_free: 2 * 1024 * 1024 * 1024,
+            read_max: 12_000,
+            upload_slots: 32,
+            argon2_slots: 4,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let d = Limits::defaults();
+        let num = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        Limits {
+            max_file: num("GALLY_MAX_BYTES").unwrap_or(d.max_file as u64) as usize,
+            gallery_bytes: num("GALLY_GALLERY_MAX_BYTES").unwrap_or(d.gallery_bytes),
+            gallery_photos: num("GALLY_GALLERY_MAX_PHOTOS").unwrap_or(d.gallery_photos as u64) as i64,
+            min_free: num("GALLY_MIN_FREE_BYTES").unwrap_or(d.min_free),
+            read_max: num("GALLY_READ_RATE_MAX").unwrap_or(d.read_max as u64) as usize,
+            upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize).max(1),
+            argon2_slots: (num("GALLY_ARGON2_SLOTS").unwrap_or(d.argon2_slots as u64) as usize).max(1),
+        }
+    }
+}
+
 pub struct AppState {
     pub dir: PathBuf,
     pub canon_dir: PathBuf,
@@ -41,12 +94,32 @@ pub struct AppState {
     /// startup; `None` = open creation). Contributing to an existing
     /// gallery never needs it.
     pub invite: Mutex<Option<String>>,
+    pub limits: Limits,
+    /// Owner media cookies: token → (gallery slug, issued at). `<img>` tags
+    /// cannot send the key header, so private galleries need this cookie.
+    pub owner_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    pub uploads: tokio::sync::Semaphore,
+    pub argon2: tokio::sync::Semaphore,
+    /// Read requests per IP (listing + photo), separate from uploads.
+    pub read: Mutex<HashMap<IpAddr, Vec<Instant>>>,
 }
 
 impl AppState {
     pub async fn new(root: &Path) -> anyhow::Result<Arc<AppState>> {
+        Self::new_with(root, Limits::from_env()).await
+    }
+
+    pub async fn new_with(root: &Path, limits: Limits) -> anyhow::Result<Arc<AppState>> {
         let dir = root.join("photos");
         tokio::fs::create_dir_all(&dir).await?;
+        // Data dir holds every uploaded file and the SQLite file: owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [root, dir.as_path()] {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         // An upload that died mid-stream leaves a `.part-` temp behind; they
         // are never listed, so drop them here rather than let them pile up.
         if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
@@ -56,13 +129,16 @@ impl AppState {
                 }
             }
         }
-        // db::open is synchronous but fast (local SQLite open + DDL); run
-        // it blocking so we never stall the runtime.
+        // db::open + recount are synchronous but fast (local SQLite); run
+        // them blocking so we never stall the runtime.
         let db_path = root.join("galleries.db");
-        let conn = tokio::task::spawn_blocking(move || db::open(&db_path))
-            .await??;
-        // Touch GalleryDb trait so method resolution is checked here too.
-        let _ = conn.gallery_exists("");
+        let scan_dir = dir.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let mut conn = db::open(&db_path)?;
+            db::recount(&mut conn, &scan_dir)?;
+            Ok::<_, anyhow::Error>(conn)
+        })
+        .await??;
         let statics: HashMap<&'static str, (&'static [u8], &'static str)> =
             HashMap::from([
                 ("/", (&include_bytes!("../index.html")[..], "text/html")),
@@ -131,33 +207,52 @@ impl AppState {
             pass_fail: Mutex::new(HashMap::new()),
             statics,
             invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
+            limits,
+            owner_tokens: Mutex::new(HashMap::new()),
+            uploads: tokio::sync::Semaphore::new(limits.upload_slots),
+            argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
+            read: Mutex::new(HashMap::new()),
         }))
     }
 }
 
-/// Fixed-window rate limit: at most `rate_max()` hits per window (0 = off).
+/// Fixed-window rate limit: at most `max` hits per window (0 = off).
 /// Returns true when the caller is over the limit (hit NOT recorded).
 /// shortcut: hard cap at 10k IPs, evicts oldest — switch to LRU when NAT-heavy.
-pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
-    let max = rate_max();
+pub fn window_hit(
+    map: &Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    ip: &IpAddr,
+    max: usize,
+    window_secs: u64,
+) -> bool {
     if max == 0 {
         return false;
     }
     let now = Instant::now();
-    let mut rate = state.rate.lock().unwrap();
+    let mut hits_map = map.lock().unwrap();
     // Bound memory: drop the oldest entry when full (dead IPs never return).
-    if !rate.contains_key(ip) && rate.len() >= 10_000 {
-        if let Some(oldest) = rate.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
-            rate.remove(&oldest);
+    if !hits_map.contains_key(ip) && hits_map.len() >= 10_000 {
+        if let Some(oldest) = hits_map.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
+            hits_map.remove(&oldest);
         }
     }
-    let hits = rate.entry(*ip).or_default();
-    hits.retain(|t| now.duration_since(*t).as_secs() < RATE_WINDOW_SECS);
+    let hits = hits_map.entry(*ip).or_default();
+    hits.retain(|t| now.duration_since(*t).as_secs() < window_secs);
     if hits.len() >= max {
         return true;
     }
     hits.push(now);
     false
+}
+
+/// Upload throttle (per IP).
+pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
+    window_hit(&state.rate, ip, rate_max(), RATE_WINDOW_SECS)
+}
+
+/// Read throttle for listings and photo serving (per IP).
+pub fn read_limited(state: &AppState, ip: &IpAddr) -> bool {
+    window_hit(&state.read, ip, state.limits.read_max, RATE_WINDOW_SECS)
 }
 
 /// True when `ip` already burned `PASS_FAIL_MAX` attempts in the window.
@@ -192,31 +287,53 @@ pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
 /// Admin tokens live 24h from issue; expired ones are dropped on sight.
 pub const ADMIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// Owner media cookies outlive a browsing session but not a day.
+pub const OWNER_TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
+
+/// Value of `name` in the request's `Cookie` header.
+pub fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Raw `admin=` token, without validating it (logout needs it to revoke).
+pub fn admin_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    cookie_value(headers, "admin").map(str::to_string)
+}
+
 /// True when the request carries a live `admin=` cookie value.
 pub fn is_admin(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
-    let raw = match headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(c) => c,
-        None => return false,
+    let Some(tok) = admin_token(headers) else {
+        return false;
     };
-    let tok = raw
-        .split(';')
-        .map(str::trim)
-        .find_map(|p| p.strip_prefix("admin="));
-    match tok {
-        Some(t) => {
-            let mut tokens = state.admin_tokens.lock().unwrap();
-            match tokens.get(t) {
-                Some(issued) if issued.elapsed() < ADMIN_TOKEN_TTL => true,
-                // Expired (or just removed): drop it so the map never grows.
-                _ => {
-                    tokens.remove(t);
-                    false
-                }
-            }
+    let mut tokens = state.admin_tokens.lock().unwrap();
+    match tokens.get(&tok) {
+        Some(issued) if issued.elapsed() < ADMIN_TOKEN_TTL => true,
+        // Expired (or just removed): drop it so the map never grows.
+        _ => {
+            tokens.remove(&tok);
+            false
         }
-        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One gallery view (listing + one request per photo) comes out of the
+    /// same bucket: a cap above `gallery_photos` is what keeps a big gallery
+    /// from 429-ing its own viewer halfway through.
+    #[test]
+    fn read_limit_covers_a_full_gallery() {
+        let d = Limits::defaults();
+        assert!(
+            d.read_max as i64 > d.gallery_photos,
+            "read_max {} must exceed gallery_photos {}",
+            d.read_max,
+            d.gallery_photos
+        );
     }
 }

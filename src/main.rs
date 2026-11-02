@@ -1,20 +1,35 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gally_uring::{router, state::AppState};
+use gally_uring::{backup, router, state::AppState};
+
+/// Same resolution as the server: `GALLY_ROOT`, else the working directory.
+/// Not the compile-time crate dir: a copied binary must not look for its data
+/// on the build machine.
+fn root() -> PathBuf {
+    std::env::var("GALLY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--backup") {
+        let Some(dest) = args.get(1) else {
+            eprintln!("usage: gally-uring --backup <destination-dir>");
+            std::process::exit(2);
+        };
+        // Backup runs before any state is built: no locks, no server.
+        return backup::run(&root(), &PathBuf::from(dest));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("gally_uring=info")),
         )
         .init();
-    let root = std::env::var("GALLY_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let state: Arc<AppState> = AppState::new(&root).await?;
+    let state: Arc<AppState> = AppState::new(&root()).await?;
     let app = router(state);
     let port: u16 = std::env::var("PORT")
         .ok()

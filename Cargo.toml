@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 argon2 = "0.5"
+libc = "0.2"
 axum = "0.8.9"
 futures = "0.3.34"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -29,6 +30,13 @@ strip = true
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-futures = "0.3.34"
 tempfile = "3.27.0"
-tokio-test = "0.4.6"
+
+[features]
+# Live-server suite: spawns target/release/gally-uring. Off by default so a
+# plain `cargo test` neither needs a release build nor runs it in debug.
+stress = []
+
+[[test]]
+name = "stress"
+required-features = ["stress"]

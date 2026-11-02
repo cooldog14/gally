@@ -11,8 +11,11 @@ input, button { font: inherit; padding: 6px 10px; }
 ul { list-style: none; padding: 0; }
 li { padding: 6px 0; border-bottom: 1px solid #e5e5e5; }
 li a { margin-right: 12px; }
-li button { margin-left: 12px; }
-#panel[hidden] { display: none; }
+li button { margin-left: 8px; }
+#panel[hidden], [hidden] { display: none; }
+#tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+#tools button, li button { cursor: pointer; }
+#sweep-status, .meta { color: #666; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -23,8 +26,21 @@ li button { margin-left: 12px; }
   <p id="error" role="alert"></p>
 </div>
 <div id="panel" hidden>
+  <div id="tools">
+    <button id="sweep" type="button">Clean orphaned files</button>
+    <button id="logout" type="button">Log out</button>
+    <span id="sweep-status" role="status"></span>
+  </div>
   <h2>Galleries</h2>
   <ul id="galleries"></ul>
+  <h2>Banned keys</h2>
+  <ul id="banned"></ul>
+  <div id="tools">
+    <input id="unban-key" placeholder="Key to unban" autocomplete="off">
+    <button id="unban" type="button">Unban</button>
+    <span id="unban-status" role="status"></span>
+  </div>
+  <p id="panel-error" role="alert"></p>
 </div>
 <script>
 "use strict";
@@ -32,7 +48,11 @@ const password = document.getElementById("password");
 const unlockBtn = document.getElementById("unlock");
 const errorEl = document.getElementById("error");
 const panel = document.getElementById("panel");
+const panelError = document.getElementById("panel-error");
 const list = document.getElementById("galleries");
+const bannedList = document.getElementById("banned");
+const sweepStatus = document.getElementById("sweep-status");
+const unbanStatus = document.getElementById("unban-status");
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -44,25 +64,77 @@ async function api(path, opts) {
   return res.json();
 }
 
+function formatBytes(n) {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return (v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)) + " " + units[i];
+}
+
+function post(path) {
+  return api(path, { method: "POST" });
+}
+
 async function load() {
+  panelError.textContent = "";
   const data = await api("/api/admin/galleries");
   list.textContent = "";
   for (const g of data.galleries || []) {
     const li = document.createElement("li");
     const a = document.createElement("a");
     a.href = "/" + g.slug;
-    a.textContent = g.slug + " (" + g.photos + ")";
-    const del = document.createElement("button");
-    del.textContent = "Delete + ban";
-    del.addEventListener("click", async () => {
-      if (!confirm("Delete " + g.slug + " and ban its key?")) return;
+    a.textContent = g.slug;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent =
+      " (" + g.photos + " photos, " + formatBytes(g.bytes) + (g.public ? ", public" : ", private") + ")";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", async () => {
+      // One gallery goes; the uploader key keeps working.
+      if (!confirm("Delete gallery " + g.slug + " and its files? The key is not banned.")) return;
       try {
-        await api("/api/admin/galleries/" + g.slug + "/delete", { method: "POST" });
+        await post("/api/admin/galleries/" + g.slug + "/remove");
         await load();
-      } catch (e) { errorEl.textContent = e.message; }
+      } catch (e) { panelError.textContent = e.message; }
     });
-    li.append(a, del);
+    const ban = document.createElement("button");
+    ban.type = "button";
+    ban.textContent = "Delete + ban";
+    ban.addEventListener("click", async () => {
+      // Every gallery of that key goes, and the key can never upload again.
+      if (!confirm("Delete EVERY gallery of " + g.slug + "'s key and ban the key?")) return;
+      try {
+        const r = await post("/api/admin/galleries/" + g.slug + "/delete");
+        await load();
+        panelError.textContent = "Banned " + (r.slugs || []).length + " gallery/galleries, " + r.files + " files";
+      } catch (e) { panelError.textContent = e.message; }
+    });
+    li.append(a, meta, remove, ban);
     list.appendChild(li);
+  }
+  if (!(data.galleries || []).length) {
+    const li = document.createElement("li");
+    li.className = "meta";
+    li.textContent = "No galleries.";
+    list.appendChild(li);
+  }
+
+  const bans = await api("/api/admin/banned");
+  bannedList.textContent = "";
+  for (const b of bans.banned || []) {
+    const li = document.createElement("li");
+    li.textContent = (b.label || "unknown gallery") + " — banned " + new Date(b.created * 1000).toLocaleString();
+    bannedList.appendChild(li);
+  }
+  if (!(bans.banned || []).length) {
+    const li = document.createElement("li");
+    li.className = "meta";
+    li.textContent = "No banned keys.";
+    bannedList.appendChild(li);
   }
 }
 
@@ -78,6 +150,36 @@ unlockBtn.addEventListener("click", async () => {
     panel.hidden = false;
     await load();
   } catch (e) { errorEl.textContent = e.message; }
+});
+
+document.getElementById("sweep").addEventListener("click", async () => {
+  try {
+    const r = await post("/api/admin/sweep");
+    sweepStatus.textContent = "Removed " + r.deleted + " orphaned file(s)" + (r.failed ? ", " + r.failed + " failed" : "");
+  } catch (e) { panelError.textContent = e.message; }
+});
+
+document.getElementById("unban").addEventListener("click", async () => {
+  const key = document.getElementById("unban-key").value.trim();
+  unbanStatus.textContent = "";
+  if (!key) { unbanStatus.textContent = "Enter a key"; return; }
+  try {
+    await api("/api/admin/unban", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    });
+    document.getElementById("unban-key").value = "";
+    unbanStatus.textContent = "Unbanned";
+    await load();
+  } catch (e) { unbanStatus.textContent = e.message; }
+});
+
+document.getElementById("logout").addEventListener("click", async () => {
+  try { await post("/api/admin/logout"); } catch (_) { /* already gone */ }
+  panel.hidden = true;
+  document.getElementById("login").hidden = false;
+  password.value = "";
 });
 </script>
 </body>

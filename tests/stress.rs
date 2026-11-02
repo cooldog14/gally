@@ -44,20 +44,25 @@ impl Server {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn server");
-        // wait for readiness
+        // Wait for readiness on a plain thread: the blocking client builds its
+        // own runtime, and dropping that inside an async test panics.
         let url = format!("http://127.0.0.1:{port}/app.js");
-        let t0 = Instant::now();
-        loop {
-            if t0.elapsed() > Duration::from_secs(10) {
-                panic!("server on {port} never came up");
-            }
-            if let Ok(r) = reqwest::blocking::get(&url) {
-                if r.status() == StatusCode::OK {
-                    break;
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            loop {
+                if t0.elapsed() > Duration::from_secs(10) {
+                    panic!("server on {port} never came up");
                 }
+                if let Ok(r) = reqwest::blocking::get(&url) {
+                    if r.status() == StatusCode::OK {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        })
+        .join()
+        .expect("readiness thread");
         Self { child, port, _tmp: tmp }
     }
 
@@ -143,6 +148,7 @@ async fn concurrent_uploads_same_key() {
     // listing must contain all 800 (slug minted up front)
     let list: serde_json::Value = client
         .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+        .header("X-Gallery-Key", "stresskey-001")
         .send()
         .await
         .unwrap()
@@ -181,8 +187,7 @@ async fn concurrent_uploads_with_listings_stay_correct() {
         let (c, b, u, s) = (client.clone(), body.clone(), url.clone(), slug.clone());
         handles.push(tokio::spawn(async move {
             for i in 0..PER_WRITER {
-                let r = c
-                    .put(format!("{u}race{t}-{i}.jpg"))
+                c.put(format!("{u}race{t}-{i}.jpg"))
                     .header("X-Gallery-Key", "racekey-0001")
                     .header("X-Gallery-Slug", s.clone())
                     .header("Content-Type", "image/jpeg")
@@ -201,7 +206,7 @@ async fn concurrent_uploads_with_listings_stay_correct() {
         let (c, u, s) = (client.clone(), srv.url(&format!("/api/galleries/{slug}/photos")), stop.clone());
         readers.push(tokio::spawn(async move {
             while !s.load(std::sync::atomic::Ordering::Relaxed) {
-                let r = c.get(&u).send().await.unwrap();
+                let r = c.get(&u).header("X-Gallery-Key", "racekey-0001").send().await.unwrap();
                 assert_eq!(r.status(), StatusCode::OK);
                 assert!(r.json::<serde_json::Value>().await.unwrap()["photos"].is_array());
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -218,6 +223,7 @@ async fn concurrent_uploads_with_listings_stay_correct() {
     // Quiesced: final listing contains exactly N photos, no more, no fewer.
     let list: serde_json::Value = client
         .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+        .header("X-Gallery-Key", "racekey-0001")
         .send()
         .await
         .unwrap()
@@ -247,7 +253,15 @@ async fn concurrent_downloads_one_file() {
         handles.push(tokio::spawn(async move {
             let mut oks = 0;
             for _ in 0..10 {
-                let b = c.get(&u).send().await.unwrap().bytes().await.unwrap();
+                let b = c
+                    .get(&u)
+                    .header("X-Gallery-Key", "dlkey-000001")
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
                 assert_eq!(b.len(), 1_000_000);
                 assert!(b.iter().all(|v| *v == 0xCD));
                 oks += 1;
@@ -326,6 +340,7 @@ async fn mixed_read_write_churn() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let l: serde_json::Value = c
                     .get(srv.url(&format!("/api/galleries/{s}/photos")))
+                    .header("X-Gallery-Key", "churnkey-0001")
                     .send()
                     .await
                     .unwrap()
@@ -432,6 +447,7 @@ async fn large_directory_degradation() {
     let t1 = std::time::Instant::now();
     let list: serde_json::Value = client
         .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+        .header("X-Gallery-Key", "bigdir-000001")
         .send()
         .await
         .unwrap()

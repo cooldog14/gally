@@ -54,6 +54,32 @@ body {
 button { font: inherit; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+#key-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--accent);
+  font-size: 13px;
+}
+#key-banner[hidden] { display: none; }
+#key-banner span { flex: 1 1 auto; }
+#key-banner code {
+  font-family: ui-monospace, monospace;
+  padding: 2px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+#key-banner button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+#key-banner button:hover { background: var(--bg); }
 #topbar {
   display: flex;
   align-items: center;
@@ -70,7 +96,7 @@ button { font: inherit; }
 #gallery-label:empty { display: none; }
 #actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
 
-input[type="password"] {
+input[type="password"], #key-input {
   font: inherit;
   color: var(--fg);
   background: var(--input-bg);
@@ -103,23 +129,34 @@ input[type="password"] {
 }
 #main { flex: 1; padding: 16px; }
 
-#private-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 4px 0; }
-#private-row input { accent-color: var(--fg); }
-#key-pass-input { width: 100%; margin: 4px 0 8px; }
-#key-pass-input[hidden], #private-row[hidden] { display: none; }
+#key-help { margin: 0 0 4px; }
 #empty { color: var(--muted); margin: 12vh auto; text-align: center; }
 #empty[hidden] { display: none; }
+/* Fixed banner: edit controls are always reachable, never scrolled away. */
 #editbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.08);
   font-size: 13px;
   color: var(--muted);
 }
 #editbar[hidden] { display: none; }
-#sel-count { flex: 1; }
+#sel-count { flex: 1 1 auto; }
+#public-row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+#public-row input { accent-color: var(--accent); }
+#edit-status { color: var(--muted); }
+#edit-status:empty { display: none; }
+body.editing #main { padding-bottom: 150px; }
 #editbar button, #edit-btn {
   background: transparent;
   color: var(--fg);
@@ -165,7 +202,7 @@ input[type="password"] {
 #key-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 #key-dialog h2 { font-size: 16px; margin: 0 0 8px; }
 #key-dialog p { font-size: 13px; color: var(--muted); }
-#key-input { width: 100%; margin: 8px 0; }
+#key-input { width: 100%; margin: 8px 0; font-family: ui-monospace, monospace; letter-spacing: 0.02em; }
 #key-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 
 #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }

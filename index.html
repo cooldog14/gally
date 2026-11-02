@@ -16,6 +16,10 @@ try {
 </script>
 </head>
 <body>
+<div id="key-banner" role="status" hidden>
+  <span>Your key: <code id="key-banner-key"></code> &mdash; save it; it is the only way to edit this gallery.</span>
+  <button id="key-banner-close" type="button" aria-label="Dismiss">&times;</button>
+</div>
 <header id="topbar">
   <button id="upload-btn" type="button">Upload</button>
   <input type="file" id="file-input" multiple hidden>
@@ -27,6 +31,10 @@ try {
 </header>
 <div id="editbar" hidden>
   <span id="sel-count">0 selected</span>
+  <label id="public-row" title="Anyone with the link can view this gallery">
+    <input type="checkbox" id="public-check"> Public
+  </label>
+  <span id="edit-status" role="status"></span>
   <button id="lock-btn" type="button">Protect</button>
   <button id="delete-btn" type="button">Delete</button>
   <button id="done-btn" type="button">Done</button>
@@ -39,10 +47,9 @@ try {
 <dialog id="key-dialog" aria-labelledby="key-title">
   <form method="dialog" id="key-form">
     <h2 id="key-title">Gallery key</h2>
-    <input type="password" id="key-input" autocomplete="off" maxlength="128">
+    <input type="text" id="key-input" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="128">
+    <p id="key-help">12-128 ASCII characters, no spaces or accents. For a new key add a capital letter and a symbol (like Sunset-42-Key!). Save it; it is the only way to edit this gallery.</p>
     <p id="key-error" role="alert"></p>
-    <label id="private-row"><input type="checkbox" id="private-check"> Private gallery</label>
-    <input type="password" id="key-pass-input" placeholder="Viewer password" autocomplete="new-password" hidden>
     <div id="key-actions">
       <button id="key-confirm" value="default" type="submit">Continue</button>
     </div>
@@ -55,8 +62,8 @@ try {
     <input type="password" id="pass-input" placeholder="Gallery password" autocomplete="off">
     <p id="pass-error" role="alert"></p>
     <div id="key-actions">
-      <button value="cancel" formnovalidate type="submit">Cancel</button>
-      <button id="pass-confirm" value="default" type="submit">Unlock</button>
+      <button id="pass-cancel" value="cancel" type="button">Cancel</button>
+      <button id="pass-confirm" value="unlock" type="submit">Unlock</button>
     </div>
   </form>
 </dialog>
@@ -67,7 +74,7 @@ try {
     <input type="password" id="setpass-input" placeholder="New password" autocomplete="new-password">
     <p id="setpass-error" role="alert"></p>
     <div id="key-actions">
-      <button value="cancel" formnovalidate type="submit">Cancel</button>
+      <button id="setpass-cancel" value="cancel" type="button">Cancel</button>
       <button id="setpass-remove" value="remove" formnovalidate type="submit" hidden>Remove protection</button>
       <button id="setpass-confirm" value="default" type="submit">Save</button>
     </div>
