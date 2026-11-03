@@ -11,7 +11,8 @@ cookie issued to it) is the only way to see them until the owner ticks
 cargo run --release
 ```
 
-Env: `PORT` (default 8000), `GALLY_ROOT` (data dir, default the working
+Env: `PORT` (default 8000), `HOST` (bind address, default 127.0.0.1),
+`GALLY_ROOT` (data dir, default the working
 directory),
 `GALLY_RATE_MAX` (uploads per IP per minute, default 60, 0 = unlimited),
 `GALLY_READ_RATE_MAX` (listings + photo reads per IP per minute, default 12000,

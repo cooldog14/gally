@@ -1553,12 +1553,6 @@ pub async fn delete_photo(
     }
 }
 
-// --- compat stubs ---
-
-pub async fn gone_compat() -> Response {
-    err(StatusCode::GONE, "gone")
-}
-
 pub async fn fallback_404() -> Response {
     err(StatusCode::NOT_FOUND, "not found")
 }
