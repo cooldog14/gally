@@ -1208,9 +1208,15 @@ pub async fn put_photo(
         return err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached");
     }
     // Bounded concurrency: refuse outright instead of queueing disk writers.
+    // The global cap is shared; the per-IP cap stops one slow client from
+    // pinning every global slot (global first, then per-IP: fixed order).
     let _permit = match state.uploads.try_acquire() {
         Ok(p) => p,
         Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+    };
+    let _ip_permit = match crate::state::UploadSlotGuard::try_acquire(&state.upload_ips, &ip, limits.upload_slots_per_ip) {
+        Some(g) => g,
+        None => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
     };
     if let Some(free) = free_bytes(&state.dir) {
         if limits.min_free > 0 && free < limits.min_free {

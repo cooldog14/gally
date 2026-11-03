@@ -99,7 +99,7 @@ async fn put(client: &Client, srv: &Server, key: &str, name: &str, bytes: &[u8])
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_uploads_same_key() {
-    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0")]);
+    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
     let client = client();
     let body = vec![0xABu8; 200_000];
     // Mint one gallery first; writers target it via slug header (scoped auth).
@@ -165,7 +165,7 @@ async fn concurrent_uploads_with_listings_stay_correct() {
     const WRITERS: usize = 8;
     const PER_WRITER: usize = 25;
     const N: usize = WRITERS * PER_WRITER;
-    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0")]);
+    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
     let client = client();
     let body = vec![0x5Au8; 20_000];
     let url = srv.url("/api/photos/");
@@ -280,7 +280,7 @@ async fn concurrent_downloads_one_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_read_write_churn() {
-    let srv = Server::boot_with_env(Some("s3cret"), &[("GALLY_RATE_MAX", "0")]);
+    let srv = Server::boot_with_env(Some("s3cret"), &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
     let client = client();
     // unlock admin
     let r = client

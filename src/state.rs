@@ -42,6 +42,10 @@ pub struct Limits {
     pub read_max: usize,
     /// Concurrent uploads (`GALLY_UPLOAD_SLOTS`), clamped to >= 1.
     pub upload_slots: usize,
+    /// Concurrent uploads per IP (`GALLY_UPLOAD_SLOTS_PER_IP`), clamped to >= 1.
+    /// Sits alongside the global semaphore: one slow client cannot pin all
+    /// 32 global slots while everyone else gets 503.
+    pub upload_slots_per_ip: usize,
     /// Concurrent Argon2 hashes (`GALLY_ARGON2_SLOTS`), clamped to >= 1.
     pub argon2_slots: usize,
 }
@@ -55,6 +59,7 @@ impl Limits {
             min_free: 2 * 1024 * 1024 * 1024,
             read_max: 12_000,
             upload_slots: 32,
+            upload_slots_per_ip: 4,
             argon2_slots: 4,
         }
     }
@@ -73,6 +78,7 @@ impl Limits {
             min_free: num("GALLY_MIN_FREE_BYTES").unwrap_or(d.min_free),
             read_max: num("GALLY_READ_RATE_MAX").unwrap_or(d.read_max as u64) as usize,
             upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize).max(1),
+            upload_slots_per_ip: (num("GALLY_UPLOAD_SLOTS_PER_IP").unwrap_or(d.upload_slots_per_ip as u64) as usize).max(1),
             argon2_slots: (num("GALLY_ARGON2_SLOTS").unwrap_or(d.argon2_slots as u64) as usize).max(1),
         }
     }
@@ -99,6 +105,9 @@ pub struct AppState {
     /// cannot send the key header, so private galleries need this cookie.
     pub owner_tokens: Mutex<HashMap<String, (String, Instant)>>,
     pub uploads: tokio::sync::Semaphore,
+    /// Live upload streams per IP. Guarded by `UploadSlotGuard`: a slow
+    /// client pins at most `limits.upload_slots_per_ip` global slots.
+    pub upload_ips: Mutex<HashMap<IpAddr, usize>>,
     pub argon2: tokio::sync::Semaphore,
     /// Read requests per IP (listing + photo), separate from uploads.
     pub read: Mutex<HashMap<IpAddr, Vec<Instant>>>,
@@ -210,9 +219,48 @@ impl AppState {
             limits,
             owner_tokens: Mutex::new(HashMap::new()),
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
+            upload_ips: Mutex::new(HashMap::new()),
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
             read: Mutex::new(HashMap::new()),
         }))
+    }
+}
+
+/// RAII guard for one live upload slot from `ip`: `try_acquire` refuses when
+/// that IP already holds `cap` concurrent uploads, otherwise the count bumps
+/// and `Drop` releases it. The global `uploads` semaphore is acquired
+/// separately (first), so ordering is fixed: global, then per-IP.
+pub struct UploadSlotGuard<'a> {
+    ips: &'a Mutex<HashMap<IpAddr, usize>>,
+    ip: IpAddr,
+}
+
+impl<'a> UploadSlotGuard<'a> {
+    /// `cap` of 0 means unlimited (direct callers only; from_env clamps to >= 1).
+    pub fn try_acquire(ips: &'a Mutex<HashMap<IpAddr, usize>>, ip: &IpAddr, cap: usize) -> Option<Self> {
+        if cap > 0 {
+            let mut guard = ips.lock().unwrap();
+            let n = guard.get(ip).copied().unwrap_or(0);
+            if n >= cap {
+                return None;
+            }
+            guard.insert(*ip, n + 1);
+        }
+        Some(Self { ips, ip: *ip })
+    }
+}
+
+impl Drop for UploadSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.ips.lock().unwrap();
+        match guard.get(&self.ip).copied() {
+            Some(n) if n > 1 => {
+                guard.insert(self.ip, n - 1);
+            }
+            _ => {
+                guard.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -335,5 +383,21 @@ mod tests {
             d.read_max,
             d.gallery_photos
         );
+    }
+
+    #[test]
+    fn upload_slot_guard_caps_one_ip_and_releases() {
+        let ips = Mutex::new(HashMap::new());
+        let a: IpAddr = "127.0.0.1".parse().unwrap();
+        let b: IpAddr = "127.0.0.2".parse().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(UploadSlotGuard::try_acquire(&ips, &a, 4).expect("slot"));
+        }
+        assert!(UploadSlotGuard::try_acquire(&ips, &a, 4).is_none());
+        // Another IP is unaffected.
+        assert!(UploadSlotGuard::try_acquire(&ips, &b, 4).is_some());
+        drop(held.pop());
+        assert!(UploadSlotGuard::try_acquire(&ips, &a, 4).is_some());
     }
 }
