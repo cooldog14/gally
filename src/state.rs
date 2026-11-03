@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use crate::db;
 
-pub const RATE_MAX: usize = 60;
 pub const RATE_WINDOW_SECS: u64 = 60;
 
 /// How long a verified (hash, password) pair stays accepted.
@@ -14,14 +13,6 @@ pub const PASS_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Failed password/key attempts allowed per IP per window.
 pub const PASS_FAIL_MAX: usize = 10;
 pub const PASS_FAIL_WINDOW_SECS: u64 = 60;
-
-/// Upload cap per IP per window. `GALLY_RATE_MAX` overrides (0 = unlimited).
-pub fn rate_max() -> usize {
-    std::env::var("GALLY_RATE_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(RATE_MAX)
-}
 
 // (Listing cache removed: plain directory scans never go stale.)
 
@@ -36,6 +27,8 @@ pub struct Limits {
     pub gallery_photos: i64,
     /// Free space the data volume must keep (`GALLY_MIN_FREE_BYTES`); 0 = off.
     pub min_free: u64,
+    /// Uploads per IP per window (`GALLY_RATE_MAX`); 0 = off.
+    pub rate_max: usize,
     /// Listing + photo reads per IP per window (`GALLY_READ_RATE_MAX`);
     /// 0 = off. Keep it above `gallery_photos`: one gallery view costs one
     /// listing plus one request per photo, all from the same bucket.
@@ -57,6 +50,7 @@ impl Limits {
             gallery_bytes: 5 * 1024 * 1024 * 1024,
             gallery_photos: 5000,
             min_free: 2 * 1024 * 1024 * 1024,
+            rate_max: 60,
             read_max: 12_000,
             upload_slots: 32,
             upload_slots_per_ip: 4,
@@ -76,6 +70,7 @@ impl Limits {
             gallery_bytes: num("GALLY_GALLERY_MAX_BYTES").unwrap_or(d.gallery_bytes),
             gallery_photos: num("GALLY_GALLERY_MAX_PHOTOS").unwrap_or(d.gallery_photos as u64) as i64,
             min_free: num("GALLY_MIN_FREE_BYTES").unwrap_or(d.min_free),
+            rate_max: num("GALLY_RATE_MAX").unwrap_or(d.rate_max as u64) as usize,
             read_max: num("GALLY_READ_RATE_MAX").unwrap_or(d.read_max as u64) as usize,
             upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize).max(1),
             upload_slots_per_ip: (num("GALLY_UPLOAD_SLOTS_PER_IP").unwrap_or(d.upload_slots_per_ip as u64) as usize).max(1),
@@ -296,7 +291,7 @@ pub fn window_hit(
 
 /// Upload throttle (per IP).
 pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
-    window_hit(&state.rate, ip, rate_max(), RATE_WINDOW_SECS)
+    window_hit(&state.rate, ip, state.limits.rate_max, RATE_WINDOW_SECS)
 }
 
 /// Read throttle for listings and photo serving (per IP).

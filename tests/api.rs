@@ -667,7 +667,7 @@ async fn delete_keeps_gallery_when_photos_remain() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 #[tokio::test]
-async fn delete_by_stranger_is_403() {
+async fn delete_by_stranger_is_404() {
     let (state, _tmp) = test_state().await;
     let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
     let name = v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
@@ -792,27 +792,6 @@ async fn unknown_gallery_slug_redirects_home() {
     let resp = router(state).oneshot(get("/quiet-river-calm-pond-1a2b", &[])).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(resp.headers().get("location").unwrap(), "/");
-}
-
-// --- compat stubs ---
-
-#[tokio::test]
-async fn compat_register_is_gone() {
-    let (state, _tmp) = test_state().await;
-    let r = post_json("/api/register", &[], "{}");
-    let resp = router(state).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::GONE);
-}
-
-#[tokio::test]
-async fn compat_login_logout_are_gone() {
-    let (state, _tmp) = test_state().await;
-    for uri in ["/api/login", "/api/logout"] {
-        let r = post_json(uri, &[], "{}");
-        let resp = router(state.clone()).oneshot(r).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::GONE);
-        assert_eq!(body_json(resp).await.get("error"), Some(&serde_json::Value::String("gone".into())));
-    }
 }
 
 // --- stream C findings ---
@@ -1607,9 +1586,7 @@ async fn admin_unlock_lockout_survives_unlimited_rate() {
     let _env = lock_admin_env();
     // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
     unsafe { std::env::set_var("ADMIN_PASS", "lockout-admin"); }
-    // SAFETY: ADMIN_ENV_LOCK is held; GALLY_RATE_MAX is also process-global.
-    unsafe { std::env::set_var("GALLY_RATE_MAX", "0"); }
-    let (state, _tmp) = test_state().await;
+    let (state, _tmp) = test_state_with(Limits { rate_max: 0, ..Limits::defaults() }).await;
     for _ in 0..10 {
         let r = post_json("/api/admin/unlock", &[], r#"{"password":"wrong"}"#);
         let resp = router(state.clone()).oneshot(r).await.unwrap();
@@ -1619,7 +1596,6 @@ async fn admin_unlock_lockout_survives_unlimited_rate() {
     let r = post_json("/api/admin/unlock", &[], r#"{"password":"wrong"}"#);
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    unsafe { std::env::remove_var("GALLY_RATE_MAX"); }
     unsafe { std::env::remove_var("ADMIN_PASS"); }
 }
 
