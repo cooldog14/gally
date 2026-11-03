@@ -576,7 +576,8 @@ async fn delete_by_stranger_is_403() {
     let uri = format!("/api/photos/{name}");
     let r = request("DELETE", &uri, &[key_header(KEY_B)], Body::empty());
     let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Unknown and not-yours answer identically (404): no existence oracle.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // Still there (private gallery: the owner key is the only reader).
     let uri = format!("/photos/{name}");
@@ -965,7 +966,8 @@ async fn delete_key_lockout_after_ten_failures() {
     for _ in 0..10 {
         let r = request("DELETE", &uri, &[key_header(KEY_B)], Body::empty());
         let resp = router(state.clone()).oneshot(r).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Unknown and not-yours answer identically (404): no existence oracle.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
     let r = request("DELETE", &uri, &[key_header(KEY_B)], Body::empty());
     let resp = router(state.clone()).oneshot(r).await.unwrap();
@@ -1615,4 +1617,154 @@ async fn failed_home_upload_leaves_no_gallery() {
         .query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "minted gallery must be rolled back");
+}
+
+// --- H1/H2: no existence oracle on upload/delete ---
+
+#[tokio::test]
+async fn put_upload_unknown_slug_matches_not_yours() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    // Unknown-slug upload: 404.
+    let r = request(
+        "PUT",
+        "/api/photos/probe.jpg",
+        &[("content-type", "image/jpeg"), key_header(KEY_A), ("x-gallery-slug", "quiet-river-calm-pond-1a2b")],
+        Body::from(jpeg()),
+    );
+    let unknown = router(state.clone()).oneshot(r).await.unwrap().status();
+    assert_eq!(unknown, StatusCode::NOT_FOUND);
+    // Existing slug, wrong key: same 404 (not 403).
+    let r = request(
+        "PUT",
+        "/api/photos/probe.jpg",
+        &[("content-type", "image/jpeg"), key_header(KEY_B), ("x-gallery-slug", slug.as_str())],
+        Body::from(jpeg()),
+    );
+    let wrong = router(state.clone()).oneshot(r).await.unwrap().status();
+    assert_eq!(wrong, unknown);
+}
+
+#[tokio::test]
+async fn delete_unknown_photo_matches_not_yours() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let name = v["name"].as_str().unwrap().to_string();
+    let hex = "c".repeat(32);
+    let ghost = format!("quiet-river-calm-pond-1a2b_{hex}_ghost.jpg");
+    let unknown = router(state.clone())
+        .oneshot(request("DELETE", &format!("/api/photos/{ghost}"), &[key_header(KEY_A)], Body::empty()))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(unknown, StatusCode::NOT_FOUND);
+    let wrong = router(state.clone())
+        .oneshot(request("DELETE", &format!("/api/photos/{name}"), &[key_header(KEY_B)], Body::empty()))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(wrong, unknown);
+}
+
+#[tokio::test]
+async fn wrong_key_on_private_photo_locks_out() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "mine.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let name = v["name"].as_str().unwrap().to_string();
+    let uri = format!("/photos/{name}");
+    for _ in 0..10 {
+        let resp = router(state.clone())
+            .oneshot(get(&uri, &[key_header(KEY_B)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_B)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // No-key requests never burn the bucket (only supplied-but-wrong keys do),
+    // so the owner's key still serves: lockout only stops guessing.
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn resolve_slug_verify_wrong_key_locks_out() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, KEY_A).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    for _ in 0..10 {
+        let r = post_json(
+            "/api/galleries/resolve",
+            &[key_header(KEY_B)],
+            &format!(r#"{{"slug":{slug:?}}}"#),
+        );
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    let r = post_json(
+        "/api/galleries/resolve",
+        &[key_header(KEY_B)],
+        &format!(r#"{{"slug":{slug:?}}}"#),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The real key still resolves: lockout only stops guessing.
+    let r = post_json(
+        "/api/galleries/resolve",
+        &[key_header(KEY_A)],
+        &format!(r#"{{"slug":{slug:?}}}"#),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn public_listing_with_incidental_key_burns_nothing() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug_a = v["slug"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug_a, true).await, StatusCode::OK);
+    // KEY_B owns a different gallery: it is an incidental stored key here.
+    let (_, _) = put_photo(&state, "b.jpg", Some(KEY_B), None, "image/jpeg", jpeg()).await;
+    let uri = format!("/api/galleries/{slug_a}/photos");
+    for _ in 0..11 {
+        let resp = router(state.clone())
+            .oneshot(get(&uri, &[key_header(KEY_B)]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+    }
+    // Gallery page HTML is revalidatable, never stale.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/{slug_a}"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+    // The bucket survived: lock the gallery and a wrong pass still 401s.
+    let r = post_json(
+        &format!("/api/galleries/{slug_a}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"s3cret-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let resp = router(state.clone())
+        .oneshot(get(&format!("{uri}?pass=nope"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
