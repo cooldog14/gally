@@ -408,24 +408,25 @@ pub async fn gallery_photos(
         })
         .unwrap_or(false);
     let owner = key_ok || owner_cookie_ok(&headers, &state, &slug);
-    // A supplied key that owns nothing here is a guess: throttle it before
-    // the 404, so private slugs cannot be probed at read-limit speed.
-    if key.is_some() && !owner {
-        if pass_fail_record(&state, &ip) {
+    // Private gallery: nothing exists for anyone but the owner. A
+    // supplied-but-wrong key is a guess: throttle it before the 404, so
+    // private slugs cannot be probed at read-limit speed.
+    if !meta.public && !owner {
+        if key.is_some() && pass_fail_record(&state, &ip) {
             return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
         }
-    }
-    // Private gallery: nothing exists for anyone but the owner. Includes the
-    // SPA's own listing fetch, so a lost key means a lost gallery.
-    if !meta.public && !owner {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    // Viewer lock: owner bypasses, otherwise require the password. Wrong keys
-    // were already counted above, so a denial here just denies.
+    // Viewer lock: owner bypasses, otherwise require the password. A wrong
+    // key with no pass was not counted yet, so count it once on denial
+    // (check_locked already counted a non-empty wrong pass).
     if !owner {
         let query = raw.unwrap_or_default();
         let pass = request_pass(&headers, &query);
         if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
+            if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
+                return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+            }
             return deny;
         }
     }
@@ -443,12 +444,21 @@ pub async fn gallery_photos(
                 db.gallery_pass_hash(&slug).is_some()
             };
             let body = Json(json!({ "slug": slug, "public": meta.public, "locked": locked, "photos": photos }));
+            // Listings are dynamic + reveal lock state: never cache.
             // The owner's page needs the media cookie for <img> tags.
             if key_ok {
                 let cookie = issue_owner_token(&state, &slug);
-                return (StatusCode::OK, [(header::SET_COOKIE, cookie)], body).into_response();
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CACHE_CONTROL, "private, no-store"),
+                        (header::SET_COOKIE, cookie.as_str()),
+                    ],
+                    body,
+                )
+                    .into_response();
             }
-            (StatusCode::OK, body).into_response()
+            (StatusCode::OK, [(header::CACHE_CONTROL, "private, no-store")], body).into_response()
         }
         Err(_) => ApiError::Internal.into_response(),
     }
@@ -715,7 +725,17 @@ pub async fn resolve_gallery(
         };
         return match ok {
             true => (StatusCode::OK, Json(json!({ "slug": t }))).into_response(),
-            false => err(StatusCode::FORBIDDEN, "forbidden"),
+            false => {
+                // Wrong key on an existing or missing slug answers identically
+                // (403), but a guess still burns the failure bucket so probing
+                // runs at 10/min, not at the generic limit (or unbounded when
+                // GALLY_RATE_MAX=0). Correct keys resolve before this point,
+                // so they can never be locked out.
+                if pass_fail_record(&state, &ip) {
+                    return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+                }
+                err(StatusCode::FORBIDDEN, "forbidden")
+            }
         };
     }
     let slug = {
@@ -811,7 +831,7 @@ pub async fn spa_or_404(
     match state.statics.get("/index.html") {
         Some((bytes, ctype, _)) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, *ctype)],
+            [(header::CONTENT_TYPE, *ctype), (header::CACHE_CONTROL, "no-cache")],
             Body::from(*bytes),
         )
             .into_response(),
@@ -1127,19 +1147,22 @@ pub async fn put_photo(
         Err(resp) => return resp,
     };
     let slug = {
+        // Gallery page: key must own this slug. Unknown and not-yours answer
+        // identically (404), like private listings, so a valid key cannot
+        // enumerate private slugs. Banned keys stay banned.
         let db = state.db.lock().unwrap();
         match (&target, &key) {
-            // Gallery page: key must own this slug. Same password on two
-            // galleries stays two galleries. Banned keys stay banned.
             (Some(t), k) => {
                 if db.is_banned(&key_hash(k)) {
                     return err(StatusCode::FORBIDDEN, "gallery banned");
                 }
-                if !db.gallery_exists(t) {
+                if !(db.gallery_exists(t) && db.key_owns_slug(k, t)) {
+                    drop(db);
+                    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+                    if pass_fail_record(&state, &ip) {
+                        return ApiError::TooMany.into_response();
+                    }
                     return err(StatusCode::NOT_FOUND, "unknown gallery");
-                }
-                if !db.key_owns_slug(k, t) {
-                    return err(StatusCode::FORBIDDEN, "forbidden");
                 }
                 t.clone()
             }
@@ -1342,14 +1365,24 @@ pub async fn get_photo(
         })
         .unwrap_or(false);
     let owner = key_ok || owner_cookie_ok(&headers, &state, &slug);
+    // A supplied-but-wrong key on a private gallery is a guess: throttle it
+    // before the 404, like the private listing, so private photos cannot be
+    // probed at read-limit speed. No key (public probing) burns nothing.
+    if !meta.public && !owner && key.is_some() {
+        if pass_fail_record(&state, &ip) {
+            return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+        }
+    }
     // Private gallery: photos are invisible without the key or its cookie.
     if !meta.public && !owner {
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    // Viewer lock applies per-file too (direct /photos/ links).
+    // Viewer lock applies per-file too (direct /photos/ links). A wrong key
+    // with no pass was not counted yet, so count it once on denial
+    // (check_locked already counted a non-empty wrong pass).
     if !owner {
         if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
-            if key.is_some() && pass_fail_record(&state, &ip) {
+            if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
                 return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
             }
             return deny;
@@ -1453,29 +1486,24 @@ pub async fn delete_photo(
         Some(s) => s.to_string(),
         None => return err(StatusCode::NOT_FOUND, "not found"),
     };
-    let exists = {
-        let db = state.db.lock().unwrap();
-        db.gallery_exists(&slug)
-    };
-    if !exists {
-        return err(StatusCode::NOT_FOUND, "not found");
-    }
     if !is_admin(&headers, &state) {
         let key = request_key(&headers);
         let ok = match key {
             Some(k) => {
                 let db = state.db.lock().unwrap();
-                db.key_owns_slug(&k, slug.as_str())
+                db.gallery_exists(&slug) && db.key_owns_slug(&k, slug.as_str())
             }
             None => false,
         };
         if !ok {
+            // Unknown and not-yours answer identically (404), like private
+            // listings, so a valid key cannot enumerate private slugs.
             // Correct keys are checked first, so they can never be locked out.
             let ip = client_ip(&headers, Some(ConnectInfo(addr)));
             if pass_fail_record(&state, &ip) {
                 return ApiError::TooMany.into_response();
             }
-            return err(StatusCode::FORBIDDEN, "forbidden");
+            return err(StatusCode::NOT_FOUND, "not found");
         }
     }
     let path = state.dir.join(&name);
