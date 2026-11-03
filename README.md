@@ -1,8 +1,8 @@
 # Gally (Rust backend)
 
 Simple gallery to share your photos. Key-scoped galleries, no logins. The key
-is typed by hand: at least 6 characters, and a key you *create* also needs a
-capital letter and a symbol (e.g. `Sunset-42`).
+is typed by hand: at least 6 characters. A key you *create* in the UI asks for
+12+ characters with a capital letter and a symbol (e.g. `Sunset-Beach-42`).
 New galleries are **private by default**: the uploader's key (or the media
 cookie issued to it) is the only way to see them until the owner ticks
 `Public` in edit mode. Galleries created before this behaviour stay public.
