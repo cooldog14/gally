@@ -58,6 +58,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     use routes::*;
     Router::new()
         .route("/api/galleries/{slug}/photos", get(gallery_photos))
+        .route("/api/galleries/{slug}", delete(delete_own_gallery))
         .route("/api/galleries/{slug}/visibility", post(set_visibility))
         .route("/api/admin/galleries", get(admin_galleries))
         .route("/api/admin/sweep", post(admin_sweep))

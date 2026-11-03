@@ -5,7 +5,7 @@ is typed by hand: at least 6 characters. A key you *create* in the UI asks for
 12+ characters with a capital letter and a symbol (e.g. `Sunset-Beach-42`).
 New galleries are **private by default**: the uploader's key (or the media
 cookie issued to it) is the only way to see them until the owner ticks
-`Public` in edit mode. Galleries created before this behaviour stay public.
+`Public` in edit mode; the owner can also delete the gallery there. Galleries created before this behaviour stay public.
 
 ```sh
 cargo run --release
