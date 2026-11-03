@@ -604,8 +604,8 @@ document.addEventListener("keydown", (e) => {
 });
 
 // The key is hand-typed, never generated: the user must remember (or note)
-// what they wrote. Keys are 12-128 visible ASCII chars (header-safe);
-// new keys also need a capital and a symbol.
+// what they wrote. Keys are 6-128 visible ASCII chars (header-safe);
+// new keys also need 12+ chars, a capital and a symbol.
 
 /** Why a *new* key is not acceptable yet ("" = fine). */
 function newKeyProblem(v) {
@@ -619,7 +619,7 @@ function newKeyProblem(v) {
     Landing page (no slug) always prompts: returning here means a new gallery. */
 let keyMode = "enter";
 function needKey(forcePrompt, mode = "enter") {
-  if (!forcePrompt && galleryKey && galleryKey.length >= 12) {
+  if (!forcePrompt && galleryKey && galleryKey.length >= 6) {
     return Promise.resolve(galleryKey);
   }
   resetKeyDialog();
@@ -627,7 +627,7 @@ function needKey(forcePrompt, mode = "enter") {
   const create = mode === "create";
   document.getElementById("key-title").textContent = create ? "New gallery key" : "Gallery key";
   keyHelp.textContent = create
-    ? "At least 6 characters, with a capital letter and a symbol (like Sunset-42). Save it; it is the only way to edit this gallery."
+    ? "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery."
     : "Enter the key for this gallery.";
   keyInput.value = "";
   keyError.textContent = "";
@@ -720,7 +720,7 @@ keyForm.addEventListener("submit", (e) => {
     return;
   }
   // Strong rules only for keys we create; an existing key just has to be one.
-  const problem = keyMode === "create" ? newKeyProblem(v) : (!/^[\x21-\x7e]{12,128}$/.test(v) ? "Key must be 12-128 ASCII characters (no spaces/accents)" : "");
+  const problem = keyMode === "create" ? newKeyProblem(v) : (!/^[\x21-\x7e]{6,128}$/.test(v) ? "Key must be 6-128 ASCII characters (no spaces/accents)" : "");
   if (problem) {
     e.preventDefault(); // keep the dialog open (Esc still cancels)
     keyError.textContent = problem;
