@@ -1,4 +1,4 @@
-//! SQLite gallery metadata: galleries + banned key hashes.
+//! SQLite gallery metadata: galleries.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,8 +63,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;
          CREATE TABLE IF NOT EXISTS galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS idx_galleries_key ON galleries(key_hash);
-         CREATE TABLE IF NOT EXISTS banned_keys(key_hash BLOB PRIMARY KEY, created INTEGER NOT NULL, label TEXT);",
+         CREATE INDEX IF NOT EXISTS idx_galleries_key ON galleries(key_hash);",
     )?;
     // Migrate pre-password databases.
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN pass_hash BLOB", []);
@@ -91,7 +90,6 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN public INTEGER NOT NULL DEFAULT 1", []);
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE galleries ADD COLUMN photos INTEGER NOT NULL DEFAULT 0", []);
-    let _ = conn.execute("ALTER TABLE banned_keys ADD COLUMN label TEXT", []);
     Ok(conn)
 }
 
@@ -132,16 +130,11 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()>
     tx.commit()
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum MintError {
-    Banned,
-    Db,
-}
 pub trait GalleryDb {
-    fn is_banned(&self, digest: &[u8]) -> bool;
     /// Scoped auth: does this key own this slug? Same key may own many slugs.
     fn key_owns_slug(&self, key: &str, slug: &str) -> bool;
-    fn get_or_create_gallery(&mut self, key: &str) -> Result<String, MintError>;
+    /// Home upload: always mint a fresh gallery. `None` on DB failure.
+    fn get_or_create_gallery(&mut self, key: &str) -> Option<String>;
     fn gallery_exists(&self, slug: &str) -> bool;
     /// Visibility + usage counters; `None` when the slug is unknown.
     fn gallery_meta(&self, slug: &str) -> Option<GalleryMeta>;
@@ -154,11 +147,6 @@ pub trait GalleryDb {
     /// Delete the row for `slug` only; the key keeps working.
     fn remove_gallery(&mut self, slug: &str) -> bool;
     /// (Empty galleries keep their row; see delete_photo.)
-    /// Delete every row sharing the slug's key hash and ban the hash
-    /// (same password = same ban). Returns every deleted slug; `None` when
-    /// `slug` is unknown or the transaction failed.
-    fn ban_gallery(&mut self, slug: &str) -> Option<Vec<String>>;
-    fn unban(&mut self, digest: &[u8]) -> bool;
     /// Raw stored password hash, if the gallery is locked.
     fn gallery_pass_hash(&self, slug: &str) -> Option<Vec<u8>>;
     /// Set (Some) or clear (None) the gallery password. False when unknown.
@@ -166,16 +154,8 @@ pub trait GalleryDb {
 }
 
 impl GalleryDb for Connection {
-    fn is_banned(&self, digest: &[u8]) -> bool {
-        self.query_row("SELECT 1 FROM banned_keys WHERE key_hash = ?1", [digest], |_| Ok(()))
-            .is_ok()
-    }
-
     fn key_owns_slug(&self, key: &str, slug: &str) -> bool {
         let d = key_hash(key);
-        if self.is_banned(&d) {
-            return false;
-        }
         self.query_row(
             "SELECT 1 FROM galleries WHERE slug = ?1 AND key_hash = ?2",
             rusqlite::params![slug, d],
@@ -186,24 +166,21 @@ impl GalleryDb for Connection {
 
     /// Home upload: always mint a fresh gallery, never reuse.
     /// Same password, different visit = different gallery.
-    fn get_or_create_gallery(&mut self, key: &str) -> Result<String, MintError> {
+    fn get_or_create_gallery(&mut self, key: &str) -> Option<String> {
         let d = key_hash(key);
-        if self.is_banned(&d) {
-            return Err(MintError::Banned);
-        }
         for _ in 0..50 {
             let slug = crate::validate::gen_slug(self);
             match self.execute(
                 "INSERT INTO galleries(slug, key_hash, created, public) VALUES(?1,?2,?3,0)",
                 rusqlite::params![slug, d, now_secs()],
             ) {
-                Ok(_) => return Ok(slug),
+                Ok(_) => return Some(slug),
                 // Retry only on slug collision; other failures are real errors.
                 Err(_) if self.gallery_exists(&slug) => continue,
-                Err(_) => return Err(MintError::Db),
+                Err(_) => return None,
             }
         }
-        Err(MintError::Db)
+        None
     }
 
     fn gallery_exists(&self, slug: &str) -> bool {
@@ -259,42 +236,6 @@ impl GalleryDb for Connection {
             .unwrap_or(false)
     }
 
-    /// Ban by slug: deletes ALL galleries sharing that key and bans the hash.
-    /// Same password elsewhere = same ban (keys are global secrets). One
-    /// transaction: never ban a key while leaving its rows behind.
-    fn ban_gallery(&mut self, slug: &str) -> Option<Vec<String>> {
-        let tx = self.transaction().ok()?;
-        let digest: Vec<u8> = tx
-            .query_row("SELECT key_hash FROM galleries WHERE slug = ?1", [slug], |r| {
-                r.get::<_, Vec<u8>>(0)
-            })
-            .ok()?;
-        let slugs: Vec<String> = {
-            let mut stmt = tx
-                .prepare("SELECT slug FROM galleries WHERE key_hash = ?1 ORDER BY created")
-                .ok()?;
-            let rows = stmt.query_map([&digest], |r| r.get::<_, String>(0)).ok()?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        if tx.execute("DELETE FROM galleries WHERE key_hash = ?1", [&digest]).is_err() {
-            return None;
-        }
-        let label = slugs.first().cloned();
-        tx.execute(
-            "INSERT OR REPLACE INTO banned_keys(key_hash, created, label) VALUES(?1,?2,?3)",
-            rusqlite::params![digest, now_secs(), label],
-        )
-        .ok()?;
-        tx.commit().ok()?;
-        Some(slugs)
-    }
-
-    fn unban(&mut self, digest: &[u8]) -> bool {
-        self.execute("DELETE FROM banned_keys WHERE key_hash = ?1", [digest])
-            .map(|n| n > 0)
-            .unwrap_or(false)
-    }
-
     fn gallery_pass_hash(&self, slug: &str) -> Option<Vec<u8>> {
         self.query_row("SELECT pass_hash FROM galleries WHERE slug = ?1", [slug], |r| {
             r.get::<_, Option<Vec<u8>>>(0)
@@ -319,8 +260,7 @@ mod tests {
         conn.execute_batch(
             "PRAGMA temp_store=MEMORY;
              CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0);
-             CREATE INDEX idx_galleries_key ON galleries(key_hash);
-             CREATE TABLE banned_keys(key_hash BLOB PRIMARY KEY, created INTEGER NOT NULL, label TEXT);",
+             CREATE INDEX idx_galleries_key ON galleries(key_hash);",
         )
         .expect("schema");
         conn
@@ -336,36 +276,6 @@ mod tests {
         let slug2 = db.get_or_create_gallery("test-gallery-key-01").expect("create");
         assert_ne!(slug, slug2);
         assert!(db.key_owns_slug("test-gallery-key-01", &slug2));
-    }
-
-    #[test]
-    fn banned_blocks_resolve() {
-        let mut db = mem();
-        let slug = db.get_or_create_gallery("test-gallery-key-02").expect("create");
-        assert_eq!(db.ban_gallery(&slug), Some(vec![slug.clone()]));
-        // Key hash moved to banned: ownership checks and creation both blocked.
-        assert!(!db.key_owns_slug("test-gallery-key-02", &slug));
-        assert_eq!(db.get_or_create_gallery("test-gallery-key-02"), Err(MintError::Banned));
-        assert!(!db.gallery_exists(&slug));
-        assert!(db.is_banned(&key_hash("test-gallery-key-02")));
-        // Unban restores ability to create (new slug).
-        assert!(db.unban(&key_hash("test-gallery-key-02")));
-        assert!(!db.is_banned(&key_hash("test-gallery-key-02")));
-        assert!(db.get_or_create_gallery("test-gallery-key-02").is_ok());
-    }
-
-    #[test]
-    fn ban_gallery_moves_row() {
-        let mut db = mem();
-        let slug = db.get_or_create_gallery("test-gallery-key-03").expect("create");
-        assert!(db.key_owns_slug("test-gallery-key-03", &slug));
-        let digest = key_hash("test-gallery-key-03");
-        assert_eq!(db.ban_gallery(&slug), Some(vec![slug.clone()]));
-        assert!(!db.gallery_exists(&slug));
-        assert!(db.is_banned(&digest));
-        // Unknown slug → None.
-        assert_eq!(db.ban_gallery("nope-not-real-slug-aaaa"), None);
-        assert!(!db.unban(&key_hash("never-banned-key-00")));
     }
 
     #[test]
@@ -410,7 +320,6 @@ mod tests {
             c.execute_batch(&format!(
                 "CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL UNIQUE, created INTEGER NOT NULL, pass_hash BLOB);
                  CREATE INDEX idx_galleries_key ON galleries(key_hash);
-                 CREATE TABLE banned_keys(key_hash BLOB PRIMARY KEY, created INTEGER NOT NULL);
                  INSERT INTO galleries(slug, key_hash, created) VALUES('{old_slug}', x'00', 1);"
             ))
             .unwrap();
@@ -450,23 +359,7 @@ mod tests {
         assert!(db.remove_gallery(&slug));
         assert!(!db.gallery_exists(&slug));
         assert!(!db.remove_gallery(&slug));
-        assert!(db.get_or_create_gallery("public-key-0001").is_ok());
-    }
-
-    #[test]
-    fn ban_gallery_returns_every_slug_and_label() {
-        let mut db = mem();
-        let a = db.get_or_create_gallery("ban-key-000001").expect("create");
-        let b = db.get_or_create_gallery("ban-key-000001").expect("create");
-        let other = db.get_or_create_gallery("ban-key-000002").expect("create");
-        let banned = db.ban_gallery(&a).expect("two rows banned");
-        assert_eq!(banned.len(), 2);
-        assert!(banned.contains(&a) && banned.contains(&b));
-        assert!(db.gallery_exists(&other), "other keys untouched");
-        let label: Option<String> = db
-            .query_row("SELECT label FROM banned_keys WHERE key_hash = ?1", [key_hash("ban-key-000001")], |r| r.get(0))
-            .expect("label row");
-        assert!(label.is_some(), "ban keeps a slug for the admin list");
+        assert!(db.get_or_create_gallery("public-key-0001").is_some());
     }
 
     #[test]
