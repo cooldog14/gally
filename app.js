@@ -345,8 +345,11 @@ async function authedFetch(name) {
 }
 
 
-// --- HEIC thumbnails via vendored WASM (Safari decodes natively) ---
-const heicCache = new Map(); // name -> objectURL (LRU, capped)
+// --- HEIC: one fetch, render natively, decode only when the browser can't ---
+const heicCache = new Map();    // name -> displayed objectURL (LRU, capped)
+const heicBlobs = new Map();    // name -> {blob,url} fetched, not yet displayed
+const heicInflight = new Map(); // phase+name -> shared promise (one per photo)
+
 // Cap ≈ two screens of tiles: 36 on desktop grids, 12 on phones.
 function heicCacheMax() {
   const cols = Math.max(1, Math.floor((grid.clientWidth || 800) / 200));
@@ -354,85 +357,140 @@ function heicCacheMax() {
   const twoScreens = cols * rows * 2;
   return Math.min(36, Math.max(12, twoScreens));
 }
-let heicNative = null; // null = untested
 
-function heicSupportedNatively() {
-  if (heicNative !== null) return Promise.resolve(heicNative);
-  // 1px HEIC probe: Safari resolves, others reject.
-  const probe = "data:image/heic;base64,";
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => { heicNative = true; resolve(true); };
-    img.onerror = () => { heicNative = false; resolve(false); };
-    img.src = probe;
-  });
+function heicOnce(key, fn) {
+  let p = heicInflight.get(key);
+  if (!p) {
+    p = fn();
+    heicInflight.set(key, p);
+    p.catch(() => {}).then(() => heicInflight.delete(key));
+  }
+  return p;
 }
 
-async function heicThumb(name) {
-  if (heicCache.has(name)) {
-    // Refresh LRU position.
-    const url = heicCache.get(name);
-    heicCache.delete(name);
-    heicCache.set(name, url);
-    return url;
-  }
-  if (typeof heic2any === "undefined") throw new Error("decoder unavailable");
-  const res = await authedFetch(name);
-  if (!res.ok) throw new Error("fetch failed");
-  const blob = await res.blob();
-  const out = await heic2any({ blob, toType: "image/jpeg", quality: 0.8 });
-  const url = URL.createObjectURL(Array.isArray(out) ? out[0] : out);
+function heicRemember(name, url) {
+  heicCache.delete(name);
   heicCache.set(name, url);
-  const max = heicCacheMax();
-  while (heicCache.size > max) {
+  while (heicCache.size > heicCacheMax()) {
     const [oldest, oldUrl] = heicCache.entries().next().value;
     heicCache.delete(oldest);
     URL.revokeObjectURL(oldUrl);
   }
+}
+
+function heicCached(name) {
+  const url = heicCache.get(name);
+  if (url === undefined) return null;
+  heicRemember(name, url); // refresh LRU position
   return url;
+}
+
+// 1.3 MB decoder: injected only when a HEIC actually needs decoding.
+let heicDecoder = null;
+function loadHeicDecoder() {
+  if (!heicDecoder) {
+    heicDecoder = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "./vendor-heic2any.min.js";
+      s.onload = () => resolve();
+      s.onerror = () => { heicDecoder = null; reject(new Error("decoder unavailable")); };
+      document.head.appendChild(s);
+    });
+  }
+  return heicDecoder;
+}
+
+// Fetched once per photo; heicBlobs owns the blob URL until it is displayed.
+function heicBlob(name) {
+  return heicOnce("blob:" + name, async () => {
+    const res = await authedFetch(name);
+    if (!res.ok) throw new Error("fetch failed");
+    const blob = await res.blob();
+    const entry = { blob, url: URL.createObjectURL(blob) };
+    heicBlobs.delete(name);
+    heicBlobs.set(name, entry);
+    while (heicBlobs.size > heicCacheMax()) {
+      const [oldest, evicted] = heicBlobs.entries().next().value;
+      heicBlobs.delete(oldest);
+      URL.revokeObjectURL(evicted.url);
+    }
+    return entry;
+  });
+}
+
+function heicSource(name) {
+  const cached = heicCached(name);
+  return cached ? Promise.resolve(cached) : heicBlob(name).then((entry) => entry.url);
+}
+
+// Decode the already-fetched blob; cached, so concurrent callers share it.
+function heicDecode(name) {
+  return heicOnce("jpeg:" + name, async () => {
+    const cached = heicCached(name);
+    if (cached) return cached;
+    await loadHeicDecoder();
+    const entry = heicBlobs.get(name) || await heicBlob(name);
+    const out = await heic2any({ blob: entry.blob, toType: "image/jpeg", quality: 0.8 });
+    const jpeg = URL.createObjectURL(Array.isArray(out) ? out[0] : out);
+    if (heicBlobs.get(name) === entry) heicBlobs.delete(name);
+    URL.revokeObjectURL(entry.url); // intermediate: this browser can't show it
+    heicRemember(name, jpeg);
+    return jpeg;
+  });
+}
+
+// <img> for a HEIC. Tiles start on intersect (one observer, no double trigger);
+// `immediate` starts now for the visible lightbox image.
+function heicImage(name, onFail, immediate = false) {
+  const img = document.createElement("img");
+  img.alt = displayName(name);
+  img.dataset.heic = name;
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    heicSource(name).then((url) => {
+      if (!img.isConnected) return; // the URL stays owned by heicBlobs/heicCache
+      img.onload = () => {
+        heicRemember(name, url);
+        const owned = heicBlobs.get(name);
+        if (owned && owned.url === url) heicBlobs.delete(name); // now heicCache's
+      };
+      img.onerror = () => {
+        img.onerror = null;
+        heicDecode(name).then((jpeg) => {
+          img.onload = null; // the JPEG is cached by heicDecode, not this URL
+          img.src = jpeg;
+        }).catch(() => { if (img.isConnected) onFail(); });
+      };
+      img.src = url;
+    }).catch(() => { if (img.isConnected) onFail(); });
+  };
+  if (immediate || typeof IntersectionObserver === "undefined") {
+    start();
+  } else {
+    const io = new IntersectionObserver((entries, obs) => {
+      if (entries.some((e) => e.isIntersecting)) {
+        obs.disconnect();
+        start();
+      }
+    }, { rootMargin: "500px" });
+    io.observe(img);
+  }
+  return img;
 }
 function tileMedia(photo) {
   const kind = mediaKind(photo.name);
   const url = mediaUrl(photo.name);
   if (kind === "heic") {
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    img.alt = displayName(photo.name);
-    img.dataset.heic = photo.name;
-    img.src = url; // Safari renders natively; others fall to onerror.
-    img.onerror = () => {
-      img.onerror = null;
-      heicSupportedNatively().then((native) => {
-        if (native) return; // transient error, keep broken img.
-        heicThumb(photo.name).then((obj) => {
-          if (img.isConnected && img.dataset.heic === photo.name) img.src = obj;
-          else URL.revokeObjectURL(obj);
-        }).catch(() => {
-          const div = document.createElement("div");
-          div.className = "file-generic";
-          div.textContent = displayName(photo.name);
-          div.title = displayName(photo.name) + " (preview not supported)";
-          img.replaceWith(div);
-        });
-      });
-    };
-    // IntersectionObserver: decode only when the tile nears the viewport.
-    if (typeof IntersectionObserver !== "undefined") {
-      const io = new IntersectionObserver((entries, obs) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          obs.disconnect();
-          if (img.isConnected && !img.complete) { /* native path handles it */ }
-          heicSupportedNatively().then((native) => {
-            if (!native && img.isConnected) {
-              heicThumb(photo.name).then((obj) => {
-                if (img.isConnected && img.dataset.heic === photo.name && !img.complete) img.src = obj;
-              }).catch(() => {});
-            }
-          });
-        }
-      }, { rootMargin: "500px" });
-      io.observe(img);
-    }
+    const img = heicImage(photo.name, () => {
+      const div = document.createElement("div");
+      div.className = "file-generic";
+      div.textContent = displayName(photo.name);
+      div.title = displayName(photo.name) + " (preview not supported)";
+      img.replaceWith(div);
+    });
+    img.loading = "lazy"; // off-screen tiles still defer decode/render
     return img;
   }
   if (kind === "image") {
@@ -520,21 +578,14 @@ function showInViewport(i) {
   const kind = mediaKind(name);
   const url = mediaUrl(name);
   if (kind === "heic") {
-    viewport.textContent = "Converting…";
-    heicThumb(name).then((obj) => {
-      if (index !== i || photos[i].name !== name) return;
-      viewport.textContent = "";
-      const img = new Image();
-      img.alt = displayName(name);
-      img.src = obj;
-      viewport.appendChild(img);
-    }).catch(() => {
+    // Native Safari renders the blob; others swap in the decoded JPEG.
+    viewport.appendChild(heicImage(name, () => {
       viewport.textContent = "";
       const div = document.createElement("div");
       div.className = "file-generic";
       div.textContent = displayName(name);
       viewport.appendChild(div);
-    });
+    }, true));
     return;
   }
   if (kind === "audio") {

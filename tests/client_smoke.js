@@ -160,6 +160,49 @@ async function testProtectReflectsLock() {
   assert.strictEqual(openPage.els.get("setpass-remove").hidden, true, "unlocked gallery hides Remove");
 }
 
+async function testNoHeicNeverLoadsDecoder() {
+  // The 1.3 MB decoder is injected on demand; the stub records every
+  // createElement by tag, so a HEIC-free gallery must leave "script" absent.
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    listing: {
+      slug: SLUG,
+      public: true,
+      locked: false,
+      photos: [{ name: "20260101_120000_kitten.jpg" }],
+    },
+    handler: () => {
+      throw new Error("unexpected request");
+    },
+  });
+  await tick();
+  assert(!page.els.has("script"), "no HEIC in the listing: decoder script not injected");
+}
+
+async function testHeicFetchesOnlyWhenVisible() {
+  // The stub's IntersectionObserver never fires, so an off-screen HEIC tile
+  // must not hit the network until it intersects.
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    listing: {
+      slug: SLUG,
+      public: true,
+      locked: false,
+      photos: [{ name: "20260101_120000_kitten.heic" }],
+    },
+    handler: () => {
+      throw new Error("unexpected request");
+    },
+  });
+  await tick();
+  assert(
+    !page.calls.some((c) => c.url.includes(".heic")),
+    "off-screen HEIC is not fetched before the observer fires"
+  );
+}
+
 function homePage(uploadHandler) {
   return makePage({
     pathname: "/",
@@ -223,6 +266,8 @@ async function testLostReplyDoesNotMintAgain() {
 (async () => {
   await testButtonsWithStoredKey();
   await testProtectReflectsLock();
+  await testNoHeicNeverLoadsDecoder();
+  await testHeicFetchesOnlyWhenVisible();
   await testHomeUploadUsesOneSlug();
   await testLostReplyDoesNotMintAgain();
   console.log("client smoke: ok");
