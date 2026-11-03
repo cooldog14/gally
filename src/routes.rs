@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::db::{key_hash, GalleryDb, GalleryMeta, MintError};
+use crate::db::{GalleryDb, GalleryMeta};
 use crate::state::{
     is_admin, pass_fail_exceeded, pass_fail_record, rate_limited, read_limited, AppState,
     OWNER_TOKEN_TTL, PASS_CACHE_TTL,
@@ -544,8 +544,7 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
     if !is_admin(&headers, &state) {
         return err(StatusCode::FORBIDDEN, "forbidden");
     }
-    // Counters come from the DB: a directory scan cannot tell a banned
-    // gallery's orphans from a live one, and it costs O(files).
+    // Counters come from the DB: a directory scan costs O(files).
     let rows: Vec<(String, i64, i64, i64, i64)> = {
         let db = state.db.lock().unwrap();
         match db.prepare("SELECT slug, created, photos, bytes, public FROM galleries ORDER BY created DESC") {
@@ -573,30 +572,7 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
     (StatusCode::OK, Json(json!({ "galleries": galleries }))).into_response()
 }
 
-pub async fn admin_banned(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !is_admin(&headers, &state) {
-        return err(StatusCode::FORBIDDEN, "forbidden");
-    }
-    let rows: Vec<(i64, Option<String>)> = {
-        let db = state.db.lock().unwrap();
-        match db.prepare("SELECT created, label FROM banned_keys ORDER BY created DESC") {
-            Ok(mut stmt) => stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => return ApiError::Internal.into_response(),
-        }
-    };
-    // The label is the banned key's first slug; the key hash itself is never
-    // exposed (it is a credential digest).
-    let banned: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(created, label)| json!({ "created": created, "label": label }))
-        .collect();
-    (StatusCode::OK, Json(json!({ "banned": banned }))).into_response()
-}
-
-/// Drop every banned token; the browser cookie is cleared in the response.
+/// Drop the admin token; the browser cookie is cleared in the response.
 pub async fn admin_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_admin(&headers, &state) {
         return err(StatusCode::FORBIDDEN, "forbidden");
@@ -738,22 +714,16 @@ pub async fn resolve_gallery(
             }
         };
     }
+    if !invite_ok(&state, &headers) {
+        return err(StatusCode::FORBIDDEN, "invite required");
+    }
     let slug = {
-        let db = state.db.lock().unwrap();
-        if db.is_banned(&key_hash(&key)) {
-            return err(StatusCode::FORBIDDEN, "gallery banned");
-        }
-        if !invite_ok(&state, &headers) {
-            return err(StatusCode::FORBIDDEN, "invite required");
-        }
-        drop(db);
         let mut db = state.db.lock().unwrap();
         db.get_or_create_gallery(&key)
     };
     match slug {
-        Ok(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
-        Err(MintError::Banned) => err(StatusCode::FORBIDDEN, "gallery banned"),
-        Err(MintError::Db) => ApiError::Internal.into_response(),
+        Some(s) => (StatusCode::OK, Json(json!({ "slug": s }))).into_response(),
+        None => ApiError::Internal.into_response(),
     }
 }
 
@@ -872,50 +842,6 @@ async fn sweep_files(state: &AppState, slug: &str) -> (usize, usize, bool) {
     (removed, failed, remaining)
 }
 
-pub async fn delete_gallery(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(slug): AxumPath<String>,
-) -> Response {
-    if !is_admin(&headers, &state) {
-        return err(StatusCode::FORBIDDEN, "forbidden");
-    }
-    if !is_slug(&slug) {
-        return err(StatusCode::NOT_FOUND, "unknown gallery");
-    }
-    // The ban removes EVERY gallery of that key: their files must go too.
-    let slugs = {
-        let mut db = state.db.lock().unwrap();
-        db.ban_gallery(&slug)
-    };
-    let Some(slugs) = slugs else {
-        return err(StatusCode::NOT_FOUND, "unknown gallery");
-    };
-    let mut removed: usize = 0;
-    let mut failed: usize = 0;
-    let mut remaining = false;
-    for s in &slugs {
-        let (r, f, more) = sweep_files(&state, s).await;
-        removed += r;
-        failed += f;
-        remaining |= more;
-    }
-    if failed > 0 || remaining {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "deleted": slug,
-                "slugs": slugs,
-                "files": removed,
-                "error": "partial delete",
-            })),
-        )
-            .into_response();
-    }
-    (StatusCode::OK, Json(json!({ "deleted": slug, "slugs": slugs, "files": removed })))
-        .into_response()
-}
-
 /// Admin: delete ONE gallery row (and its files). The key stays valid.
 pub async fn remove_gallery(
     State(state): State<Arc<AppState>>,
@@ -946,7 +872,7 @@ pub async fn remove_gallery(
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
 }
 
-/// Admin: drop files whose gallery row is gone (crashes, old bans).
+/// Admin: drop files whose gallery row is gone (e.g. crashes).
 pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_admin(&headers, &state) {
         return err(StatusCode::FORBIDDEN, "forbidden");
@@ -1067,42 +993,6 @@ pub async fn lock_gallery(
     (StatusCode::OK, Json(json!({ "slug": slug, "locked": hash.is_some() }))).into_response()
 }
 
-#[derive(Deserialize)]
-struct UnbanBody {
-    #[serde(default)]
-    key: String,
-}
-
-pub async fn admin_unban(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    if !is_admin(&headers, &state) {
-        return err(StatusCode::FORBIDDEN, "forbidden");
-    }
-    let bytes = match read_body(body, 8192).await {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-    let key = serde_json::from_slice::<UnbanBody>(&bytes)
-        .ok()
-        .and_then(|b| normalize_key(&b.key));
-    let key = match key {
-        Some(k) => k,
-        None => return err(StatusCode::BAD_REQUEST, "gallery key required"),
-    };
-    let digest = key_hash(&key);
-    let unbanned = {
-        let mut db = state.db.lock().unwrap();
-        db.unban(&digest)
-    };
-    if !unbanned {
-        return err(StatusCode::NOT_FOUND, "key not banned");
-    }
-    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
-}
-
 // --- PUT upload ---
 
 /// Undoes a gallery mint that never received a byte: every early return in
@@ -1149,13 +1039,10 @@ pub async fn put_photo(
     let slug = {
         // Gallery page: key must own this slug. Unknown and not-yours answer
         // identically (404), like private listings, so a valid key cannot
-        // enumerate private slugs. Banned keys stay banned.
+        // enumerate private slugs.
         let db = state.db.lock().unwrap();
         match (&target, &key) {
             (Some(t), k) => {
-                if db.is_banned(&key_hash(k)) {
-                    return err(StatusCode::FORBIDDEN, "gallery banned");
-                }
                 if !(db.gallery_exists(t) && db.key_owns_slug(k, t)) {
                     drop(db);
                     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
@@ -1168,20 +1055,14 @@ pub async fn put_photo(
             }
             // Home: always mint a fresh gallery, never reuse.
             (None, k) => {
-                if db.is_banned(&key_hash(k)) {
-                    return err(StatusCode::FORBIDDEN, "gallery banned");
-                }
                 if !invite_ok(&state, &headers) {
                     return err(StatusCode::FORBIDDEN, "invite required");
                 }
                 drop(db);
                 let mut db = state.db.lock().unwrap();
                 match db.get_or_create_gallery(k) {
-                    Ok(s) => s,
-                    Err(MintError::Banned) => {
-                        return err(StatusCode::FORBIDDEN, "gallery banned");
-                    }
-                    Err(MintError::Db) => return ApiError::Internal.into_response(),
+                    Some(s) => s,
+                    None => return ApiError::Internal.into_response(),
                 }
             }
         }
@@ -1321,7 +1202,7 @@ pub async fn put_photo(
             return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
         }
     } else {
-        // Row vanished mid-upload (ban/reset raced us): drop the orphan file.
+        // Row vanished mid-upload (delete raced us): drop the orphan file.
         let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
@@ -1341,7 +1222,7 @@ pub async fn get_photo(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let t_total = Instant::now();
-    // Orphaned/banned files stay on disk but are unreachable: reject names
+    // Orphaned files stay on disk but are unreachable: reject names
     // outside a known gallery before touching the filesystem.
     let slug = match photo_slug(&name) {
         Some(s) => s.to_string(),

@@ -298,57 +298,6 @@ async fn resolve_needs_invite_for_new_gallery() {
 }
 
 #[tokio::test]
-async fn resolve_banned_key_is_403() {
-    let (state, _tmp) = test_state().await;
-    let (_, v) = resolve(&state, KEY_A).await;
-    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
-
-    let cookie = admin_cookie(&state);
-    let uri = format!("/api/admin/galleries/{slug}/delete");
-    let r = request("DELETE", &uri, &[("cookie", cookie.as_str())], Body::empty());
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let (status, v) = resolve(&state, KEY_A).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(v.get("error").and_then(|e| e.as_str()), Some("gallery banned"));
-}
-
-#[tokio::test]
-async fn banned_key_reports_banned_despite_invite_gate() {
-    let (state, _tmp) = test_state().await;
-    let (_, v) = resolve(&state, KEY_A).await;
-    let slug = v.get("slug").and_then(|s| s.as_str()).unwrap().to_string();
-    let cookie = admin_cookie(&state);
-    let uri = format!("/api/admin/galleries/{slug}/delete");
-    let r = request("DELETE", &uri, &[("cookie", cookie.as_str())], Body::empty());
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    state.invite.lock().unwrap().replace("amber-fox-glade-ridge".to_string());
-    // Ban wins over "invite required": same key stays banned with or
-    // without a valid invite, on both resolve and upload paths.
-    let (status, v) = resolve(&state, KEY_A).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(v.get("error").and_then(|e| e.as_str()), Some("gallery banned"));
-    let r = post_json(
-        "/api/galleries/resolve",
-        &[invite_header("amber-fox-glade-ridge")],
-        &format!(r#"{{"key":{KEY_A:?}}}"#),
-    );
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_json(resp).await.get("error").and_then(|e| e.as_str()),
-        Some("gallery banned")
-    );
-    let (status, v) =
-        put_photo(&state, "banned.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(v.get("error").and_then(|e| e.as_str()), Some("gallery banned"));
-}
-
-#[tokio::test]
 async fn gallery_listing_empty_then_contains_upload() {
     let (state, _tmp) = test_state().await;
     let (_, v) = resolve(&state, KEY_A).await;
@@ -628,7 +577,7 @@ async fn admin_unlock_without_pass_is_404() {
 #[tokio::test]
 async fn admin_endpoints_reject_unauth() {
     let (state, _tmp) = test_state().await;
-    for uri in ["/api/admin/galleries", "/api/admin/banned"] {
+    for uri in ["/api/admin/galleries"] {
         let resp = router(state.clone())
             .oneshot(get(uri, &[]))
             .await
@@ -641,7 +590,7 @@ async fn admin_endpoints_reject_unauth() {
 async fn admin_endpoints_accept_token() {
     let (state, _tmp) = test_state().await;
     let cookie = admin_cookie(&state);
-    for uri in ["/api/admin/galleries", "/api/admin/banned"] {
+    for uri in ["/api/admin/galleries"] {
         let resp = router(state.clone())
             .oneshot(get(uri, &[("cookie", cookie.as_str())]))
             .await
@@ -753,7 +702,7 @@ async fn fix_c_wrong_admin_password_is_403() {
 }
 
 #[tokio::test]
-async fn fix_c_unlock_login_lists_and_unbans() {
+async fn admin_unlock_lists_and_removes() {
     let _env = lock_admin_env();
     // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
     unsafe { std::env::set_var("ADMIN_PASS", "s3cret-admin"); }
@@ -769,20 +718,19 @@ async fn fix_c_unlock_login_lists_and_unbans() {
     // Plain-HTTP server: no `Secure`, or browsers silently drop the cookie.
     assert!(!set_cookie.to_ascii_lowercase().split(';').skip(1).any(|p| p.trim() == "secure"), "{set_cookie}");
     let cookie = set_cookie.split(';').next().unwrap().to_string();
-    // Admin list works with the cookie.
+    // Upload so the list shows a gallery, then remove it via admin.
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
     let resp = router(state.clone())
         .oneshot(get("/api/admin/galleries", &[("cookie", cookie.as_str())]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // Unban with garbage key: 400 (valid JSON, unusable key).
-    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], r#"{"key":"x"}"#);
+    assert!(body_json(resp).await["galleries"].as_array().unwrap().iter().any(|g| g["slug"] == slug.as_str()));
+    let r = request("POST", &format!("/api/admin/galleries/{slug}/remove"), &[("cookie", cookie.as_str())], Body::empty());
     let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    // Unban a well-formed but never-banned key: 404.
-    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], r#"{"key":"never-banned-anywhere"}"#);
-    let resp = router(state).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug));
     unsafe { std::env::remove_var("ADMIN_PASS"); }
 }
 
@@ -809,13 +757,9 @@ async fn fix_c_oversize_admin_bodies_are_413() {
     // SAFETY: ADMIN_ENV_LOCK is held, so no other test touches ADMIN_PASS.
     unsafe { std::env::set_var("ADMIN_PASS", "s3cret-admin"); }
     let (state, _tmp) = test_state().await;
-    let cookie = admin_cookie(&state);
     let big = "x".repeat(9000);
     let big_json = format!(r#"{{"password":"{big}"}}"#);
     let r = post_json("/api/admin/unlock", &[], &big_json);
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let r = post_json("/api/admin/unban", &[("cookie", cookie.as_str())], &big_json.replace("password", "key"));
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     unsafe { std::env::remove_var("ADMIN_PASS"); }
@@ -1344,56 +1288,6 @@ async fn non_media_downloads_as_attachment() {
 
 // --- admin abuse tooling ---
 
-/// Delete a gallery by slug as admin; returns (status, json).
-async fn admin_delete(state: &Arc<AppState>, cookie: &str, slug: &str) -> (StatusCode, serde_json::Value) {
-    let r = request(
-        "POST",
-        &format!("/api/admin/galleries/{slug}/delete"),
-        &[("cookie", cookie)],
-        Body::empty(),
-    );
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    let s = resp.status();
-    (s, body_json(resp).await)
-}
-
-#[tokio::test]
-async fn ban_sweep_removes_every_gallery_of_the_key() {
-    let (state, _tmp) = test_state().await;
-    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
-    let slug_a = a["slug"].as_str().unwrap().to_string();
-    let name_a = a["name"].as_str().unwrap().to_string();
-    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
-    let slug_b = b["slug"].as_str().unwrap().to_string();
-    let name_b = b["name"].as_str().unwrap().to_string();
-
-    let cookie = admin_cookie(&state);
-    let (status, v) = admin_delete(&state, &cookie, &slug_a).await;
-    assert_eq!(status, StatusCode::OK);
-    let slugs: Vec<&str> = v["slugs"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
-    assert_eq!(slugs.len(), 2, "{v}");
-    assert!(slugs.contains(&slug_a.as_str()) && slugs.contains(&slug_b.as_str()));
-    assert_eq!(v["files"], serde_json::Value::from(2));
-    // Both files and both rows are gone.
-    assert!(!state.dir.join(&name_a).exists());
-    assert!(!state.dir.join(&name_b).exists());
-    assert!(!state.db.lock().unwrap().gallery_exists(&slug_a));
-    assert!(!state.db.lock().unwrap().gallery_exists(&slug_b));
-
-    // The ban is listed with a readable label.
-    let resp = router(state.clone())
-        .oneshot(get("/api/admin/banned", &[("cookie", cookie.as_str())]))
-        .await
-        .unwrap();
-    let v = body_json(resp).await;
-    let first = &v["banned"][0];
-    assert!(first["label"].as_str().is_some(), "{v}");
-
-    // Unknown slug: 404.
-    let (status, _) = admin_delete(&state, &cookie, "quiet-river-calm-pond-1a2b").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
 #[tokio::test]
 async fn admin_remove_deletes_one_gallery_and_keeps_the_key() {
     let (state, _tmp) = test_state().await;
@@ -1416,7 +1310,7 @@ async fn admin_remove_deletes_one_gallery_and_keeps_the_key() {
     assert!(!state.dir.join(&name_a).exists());
     assert!(!state.db.lock().unwrap().gallery_exists(&slug_a));
     assert!(state.db.lock().unwrap().gallery_exists(&slug_b));
-    // Key still works: the gallery is not banned.
+    // Key still works after the remove.
     let (status, _) =
         put_photo(&state, "c.jpg", Some(KEY_A), Some(&slug_b), "image/jpeg", jpeg()).await;
     assert_eq!(status, StatusCode::CREATED);
