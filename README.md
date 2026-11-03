@@ -20,8 +20,8 @@ directory),
 `GALLY_GALLERY_MAX_BYTES` (per gallery, default 5 GiB, 0 = off),
 `GALLY_GALLERY_MAX_PHOTOS` (per gallery, default 5000, 0 = off),
 `GALLY_MIN_FREE_BYTES` (free space always kept on the data volume, default
-2 GiB, 0 = off), `GALLY_UPLOAD_SLOTS` / `GALLY_ARGON2_SLOTS` (concurrent
-uploads / password hashes, default 32 / 4, minimum 1),
+2 GiB, 0 = off), `GALLY_UPLOAD_SLOTS` / `GALLY_UPLOAD_SLOTS_PER_IP` / `GALLY_ARGON2_SLOTS` (concurrent
+uploads total / per IP / password hashes, default 32 / 4 / 4, minimum 1),
 `GALLY_INVITE_CODE` (when set, new galleries require this code via the
 `X-Invite-Code` header; unset = open creation; contributing to an existing
 gallery never needs it), `ADMIN_PASS` (enables `/api/admin/*`),
