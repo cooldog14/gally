@@ -872,6 +872,54 @@ pub async fn remove_gallery(
     (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
 }
 
+/// Owner: delete ONE gallery row (and its files). Requires the gallery key.
+pub async fn delete_own_gallery(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    if !is_slug(&slug) {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if !is_admin(&headers, &state) {
+        let key = request_key(&headers);
+        let ok = match key {
+            Some(k) => {
+                let db = state.db.lock().unwrap();
+                db.gallery_exists(&slug) && db.key_owns_slug(&k, &slug)
+            }
+            None => false,
+        };
+        if !ok {
+            // Unknown and not-yours answer identically (404), like private
+            // listings, so a valid key cannot enumerate private slugs.
+            // Correct keys are checked first, so they can never be locked out.
+            let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+            if pass_fail_record(&state, &ip) {
+                return ApiError::TooMany.into_response();
+            }
+            return err(StatusCode::NOT_FOUND, "not found");
+        }
+    }
+    let ok = {
+        let mut db = state.db.lock().unwrap();
+        db.remove_gallery(&slug)
+    };
+    if !ok {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    let (removed, failed, remaining) = sweep_files(&state, &slug).await;
+    if failed > 0 || remaining {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "deleted": slug, "files": removed, "error": "partial delete" })),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
+}
+
 /// Admin: drop files whose gallery row is gone (e.g. crashes).
 pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_admin(&headers, &state) {

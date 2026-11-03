@@ -1289,6 +1289,69 @@ async fn non_media_downloads_as_attachment() {
 // --- admin abuse tooling ---
 
 #[tokio::test]
+async fn delete_gallery_by_owner_removes_row_and_files() {
+    let (state, _tmp) = test_state().await;
+    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = a["slug"].as_str().unwrap().to_string();
+    let name_a = a["name"].as_str().unwrap().to_string();
+    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_A), Some(&slug), "image/jpeg", jpeg()).await;
+    let name_b = b["name"].as_str().unwrap().to_string();
+    let r = request("DELETE", &format!("/api/galleries/{slug}"), &[key_header(KEY_A)], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["files"], serde_json::Value::from(2));
+    assert!(!state.dir.join(&name_a).exists());
+    assert!(!state.dir.join(&name_b).exists());
+    // Row gone: the owner listing answers like an unknown gallery.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Admin list no longer contains the slug.
+    let cookie = admin_cookie(&state);
+    let resp = router(state.clone())
+        .oneshot(get("/api/admin/galleries", &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert!(!v["galleries"].as_array().unwrap().iter().any(|g| g["slug"] == slug.as_str()));
+}
+
+#[tokio::test]
+async fn delete_gallery_by_stranger_is_404_and_keeps_gallery() {
+    let (state, _tmp) = test_state().await;
+    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = a["slug"].as_str().unwrap().to_string();
+    let r = request("DELETE", &format!("/api/galleries/{slug}"), &[key_header(KEY_B)], Body::empty());
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Owner listing still works with both photos listed (second upload reuses slug).
+    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_A), Some(&slug), "image/jpeg", jpeg()).await;
+    assert_eq!(b["slug"].as_str().unwrap(), slug);
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["photos"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn delete_unknown_gallery_is_404() {
+    let (state, _tmp) = test_state().await;
+    for (key, slug) in [(KEY_A, "quiet-river-calm-pond-1a2b"), (KEY_B, "no-such-gallery-zzz")] {
+        let r = request("DELETE", &format!("/api/galleries/{slug}"), &[key_header(key)], Body::empty());
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{slug}");
+    }
+    // No key either: same 404, no oracle.
+    let r = request("DELETE", "/api/galleries/quiet-river-calm-pond-1a2b", &[], Body::empty());
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn admin_remove_deletes_one_gallery_and_keeps_the_key() {
     let (state, _tmp) = test_state().await;
     let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;

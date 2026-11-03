@@ -169,7 +169,9 @@ body.editing #main { padding-bottom: 150px; }
 #editbar button:hover, #edit-btn:hover { background: var(--surface); }
 #editbar button:disabled { opacity: 0.4; cursor: default; }
 #delete-btn { border-color: #dc2626; color: #dc2626; }
+#delete-gallery-btn { border-color: #dc2626; color: #dc2626; }
 :root[data-theme="dark"] #delete-btn { border-color: #f87171; color: #f87171; }
+:root[data-theme="dark"] #delete-gallery-btn { border-color: #f87171; color: #f87171; }
 
 .tile { position: relative; }
 .tile .tick {

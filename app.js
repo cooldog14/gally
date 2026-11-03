@@ -258,11 +258,38 @@ document.getElementById("setpass-form").addEventListener("submit", async (e) => 
 
 deleteBtn.addEventListener("click", () => {
   if (!selected.size) return;
+  pendingGalleryDelete = false;
   confirmText.textContent = "Delete " + selected.size + (selected.size === 1 ? " photo?" : " photos?") + " This cannot be undone.";
   confirmDialog.showModal();
 });
+// Gallery delete ignores the selection: confirm once, then leave for home.
+let pendingGalleryDelete = false;
+document.getElementById("delete-gallery-btn").addEventListener("click", () => {
+  pendingGalleryDelete = true;
+  confirmText.textContent = "Delete this gallery and all " + photos.length + (photos.length === 1 ? " photo?" : " photos?") + " This cannot be undone.";
+  confirmDialog.showModal();
+});
 confirmForm.addEventListener("submit", async (e) => {
-  if (!e.submitter || e.submitter.value === "cancel") return;
+  if (!e.submitter || e.submitter.value === "cancel") { pendingGalleryDelete = false; return; }
+  if (pendingGalleryDelete) {
+    pendingGalleryDelete = false;
+    try {
+      const res = await fetch("/api/galleries/" + slugFromPath(), {
+        method: "DELETE",
+        headers: { "X-Gallery-Key": galleryKey },
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+        uploadStatus.textContent = msg;
+        return;
+      }
+      location.assign("/");
+    } catch (_) {
+      uploadStatus.textContent = "delete failed";
+    }
+    return;
+  }
   const names = Array.from(selected);
   const key = galleryKey;
   const failures = [];
