@@ -101,9 +101,10 @@ pub struct AppState {
     /// gallery never needs it.
     pub invite: Mutex<Option<String>>,
     pub limits: Limits,
-    /// Owner media cookies: token → (gallery slug, issued at). `<img>` tags
-    /// cannot send the key header, so private galleries need this cookie.
-    pub owner_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// Media cookies: token → (gallery slug, issued at, what it authorises).
+    /// `<img>` tags cannot send a header, so private and locked galleries
+    /// both need a cookie.
+    pub media_tokens: Mutex<HashMap<String, (String, Instant, MediaToken)>>,
     pub uploads: tokio::sync::Semaphore,
     /// Live upload streams per IP. Guarded by `UploadSlotGuard`: a slow
     /// client pins at most `limits.upload_slots_per_ip` global slots.
@@ -217,7 +218,7 @@ impl AppState {
             statics,
             invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
             limits,
-            owner_tokens: Mutex::new(HashMap::new()),
+            media_tokens: Mutex::new(HashMap::new()),
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
             upload_ips: Mutex::new(HashMap::new()),
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
@@ -335,8 +336,16 @@ pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
 /// Admin tokens live 24h from issue; expired ones are dropped on sight.
 pub const ADMIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Owner media cookies outlive a browsing session but not a day.
+/// Owner and viewer media cookies outlive a browsing session but not a day.
 pub const OWNER_TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
+
+/// What a media cookie authorises. Both kinds share one token map, so the
+/// kind is stored with the token: a viewer cookie can never act as an owner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaToken {
+    Owner,
+    Viewer,
+}
 
 /// Value of `name` in the request's `Cookie` header.
 pub fn cookie_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {

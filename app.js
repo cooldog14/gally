@@ -98,10 +98,11 @@ async function loadPhotos(retry = false) {
     if (galleryKey) {
       headers["X-Gallery-Key"] = galleryKey;
     }
-    // Query too: <img>/<video> cannot send headers, and latin-1 headers
-    // mangle non-ASCII passwords (?pass= is percent-encoded UTF-8).
+    // Password as a percent-encoded header, never a URL: fetch() refuses
+    // non-ASCII header values, so encodeURIComponent + server-side decode.
+    // The listing's Set-Cookie then authorises every media tag.
     const p = storedPass(slug);
-    if (p) url += "?pass=" + encodeURIComponent(p);
+    if (p) headers["X-Gallery-Pass"] = encodeURIComponent(p);
     const res = await fetch(url, { headers });
     if (res.status === 404) {
       // Private (or deleted): a key is the only door. Ask once, then leave.
@@ -329,16 +330,14 @@ function mediaKind(name) {
   return "file";
 }
 
-// Media URLs carry the viewer password (query) when the gallery is locked;
-// <img>/<video>/<audio> cannot send the header, so it goes in the URL.
+// Media URLs carry no secret: an owner key or the viewer cookie set by the
+// listing authorises <img>/<video>/<audio>, which cannot send a header.
 function mediaUrl(name) {
-  const slug = slugFromPath();
-  const base = "/photos/" + encodeURIComponent(name);
-  const p = slug ? storedPass(slug) : "";
-  return p ? base + "?pass=" + encodeURIComponent(p) : base;
+  return "/photos/" + encodeURIComponent(name);
 }
 
-// Owner key as a header (ASCII-safe); viewer password travels in mediaUrl.
+// Owner key as a header; viewer password goes on the listing fetch only
+// (percent-encoded: fetch() refuses non-ASCII header values).
 async function authedFetch(name) {
   const headers = {};
   if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
