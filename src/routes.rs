@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::db::{GalleryDb, GalleryMeta};
 use crate::state::{
     is_admin, pass_fail_exceeded, pass_fail_record, rate_limited, read_limited, AppState,
-    OWNER_TOKEN_TTL, PASS_CACHE_TTL,
+    MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL,
 };
 use crate::validate::{
     is_slug, normalize_key, percent_decode_bytes, photo_slug, sanitize_filename,
@@ -48,17 +48,26 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Owner media cookie for `slug`, live and belonging to this gallery.
-fn owner_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str) -> bool {
-    let Some(tok) = crate::state::cookie_value(headers, &format!("galowner_{slug}")) else {
+/// Cookie name for one kind of media token: owner and viewer never share one.
+fn media_cookie(slug: &str, kind: MediaToken) -> String {
+    let prefix = match kind {
+        MediaToken::Owner => "galowner",
+        MediaToken::Viewer => "galpass",
+    };
+    format!("{prefix}_{slug}")
+}
+
+/// True when the request carries a live media cookie of `kind` for `slug`.
+fn media_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str, kind: MediaToken) -> bool {
+    let Some(tok) = crate::state::cookie_value(headers, &media_cookie(slug, kind)) else {
         return false;
     };
-    let mut tokens = state.owner_tokens.lock().unwrap();
+    let mut tokens = state.media_tokens.lock().unwrap();
     match tokens.get(tok) {
-        // Live and bound to this gallery.
-        Some((s, at)) if s == slug && at.elapsed() < OWNER_TOKEN_TTL => true,
+        // Live, this gallery, this kind: never another slug's or a viewer's.
+        Some((s, at, k)) if s == slug && *k == kind && at.elapsed() < OWNER_TOKEN_TTL => true,
         // Expired: drop it so the map never grows.
-        Some((_, at)) if at.elapsed() >= OWNER_TOKEN_TTL => {
+        Some((_, at, _)) if at.elapsed() >= OWNER_TOKEN_TTL => {
             tokens.remove(tok);
             false
         }
@@ -66,21 +75,23 @@ fn owner_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str) -> bool {
     }
 }
 
-/// Mint an owner media cookie for `slug` (for `<img>`/`<video>`, which cannot
-/// send the key header). Returns the full `Set-Cookie` value.
-fn issue_owner_token(state: &AppState, slug: &str) -> String {
+/// Mint a media cookie for `slug` (for `<img>`/`<video>`, which cannot send
+/// the key or password header). Returns the full `Set-Cookie` value.
+fn issue_media_token(state: &AppState, slug: &str, kind: MediaToken) -> String {
     let tok = uuid::Uuid::new_v4().as_simple().to_string()
         + &uuid::Uuid::new_v4().as_simple().to_string();
     {
-        let mut tokens = state.owner_tokens.lock().unwrap();
+        let mut tokens = state.media_tokens.lock().unwrap();
         if tokens.len() >= 10_000 {
-            tokens.retain(|_, (_, at)| at.elapsed() < OWNER_TOKEN_TTL);
+            tokens.retain(|_, (_, at, _)| at.elapsed() < OWNER_TOKEN_TTL);
         }
-        tokens.insert(tok.clone(), (slug.to_string(), Instant::now()));
+        tokens.insert(tok.clone(), (slug.to_string(), Instant::now(), kind));
     }
     // No `Secure`: plain HTTP server, browsers would drop the cookie.
     format!(
-        "galowner_{slug}={tok}; HttpOnly; SameSite=Lax; Path=/photos/; Max-Age=43200"
+        "{}={tok}; HttpOnly; SameSite=Lax; Path=/photos/; Max-Age={}",
+        media_cookie(slug, kind),
+        OWNER_TOKEN_TTL.as_secs()
     )
 }
 
@@ -141,6 +152,17 @@ fn parse_range(headers: &HeaderMap, len: u64) -> Option<Result<(u64, u64), ()>> 
         return Some(Err(()));
     }
     Some(Ok((start, end)))
+}
+
+/// True when `If-None-Match` names `etag` (or `*`).
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| {
+            let t = t.trim();
+            t == "*" || t == etag
+        }))
 }
 
 /// OGG is a container: sniff the first content packet for the codec.
@@ -267,12 +289,17 @@ fn request_slug(headers: &HeaderMap) -> Result<Option<String>, Response> {
 
 /// Viewer password from header or query. Empty when absent (or not UTF-8).
 fn request_pass(headers: &HeaderMap, query: &str) -> String {
-    if let Some(p) = headers
-        .get("x-gallery-pass")
-        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-        .filter(|p| !p.is_empty())
-    {
-        return p.to_string();
+    if let Some(v) = headers.get("x-gallery-pass") {
+        // Header values are ASCII-only on the way out of fetch(), so app.js
+        // percent-encodes: decode here (raw old-style values decode to
+        // themselves when they hold no `%XX`).
+        if let Some(p) = std::str::from_utf8(v.as_bytes())
+            .ok()
+            .map(|p| String::from_utf8(percent_decode_bytes(p)).unwrap_or_default())
+            .filter(|p| !p.is_empty())
+        {
+            return p;
+        }
     }
     for part in query.split('&') {
         let (k, v) = match part.split_once('=') {
@@ -297,33 +324,41 @@ fn pass_cache_key(hash: &[u8], pass: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+/// Result of the viewer lock check: the caller needs to know not just
+/// "refused" but whether a password was proven, so it can set the cookie.
+enum Locked {
+    /// No viewer password set on the gallery.
+    Open,
+    /// Password proven just now (or by the pass cache): set the cookie.
+    Unlocked,
+    /// Locked and unproven: return this response as-is.
+    Denied(Response),
+}
+
 /// Slow Argon2 work runs on the blocking pool: never stall the runtime.
-/// `None` = open (public gallery or correct password / owner bypass).
-/// `Some(response)` = locked, return it directly.
 async fn check_locked(
     state: &AppState,
     ip: IpAddr,
     slug: &str,
     pass: &str,
-) -> Option<Response> {
+) -> Locked {
     let stored = {
         let db = state.db.lock().unwrap();
         db.gallery_pass_hash(slug)
     };
-    let hash = match stored {
-        None => return None,
-        Some(h) => h,
+    let Some(hash) = stored else {
+        return Locked::Open;
     };
     // The gallery key always opens its own gallery (owner bypass).
     if !pass.is_empty() {
         let key = pass_cache_key(&hash, pass);
         if let Some(at) = state.pass_ok.lock().unwrap().get(&key) {
             if at.elapsed() < PASS_CACHE_TTL {
-                return None;
+                return Locked::Unlocked;
             }
         }
         if pass_fail_exceeded(state, &ip) {
-            return Some(
+            return Locked::Denied(
                 (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(json!({ "error": "too many attempts" })),
@@ -345,15 +380,17 @@ async fn check_locked(
                 cache.retain(|_, at| at.elapsed() < PASS_CACHE_TTL);
             }
             cache.insert(key, std::time::Instant::now());
-            return None;
+            return Locked::Unlocked;
         }
         pass_fail_record(state, &ip);
     }
-    Some((
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "gallery locked", "locked": true })),
+    Locked::Denied(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "gallery locked", "locked": true })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 /// True when gallery creation is allowed: no invite configured, or the
@@ -407,7 +444,7 @@ pub async fn gallery_photos(
             db.key_owns_slug(k, &slug)
         })
         .unwrap_or(false);
-    let owner = key_ok || owner_cookie_ok(&headers, &state, &slug);
+    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner);
     // Private gallery: nothing exists for anyone but the owner. A
     // supplied-but-wrong key is a guess: throttle it before the 404, so
     // private slugs cannot be probed at read-limit speed.
@@ -417,17 +454,26 @@ pub async fn gallery_photos(
         }
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    // Viewer lock: owner bypasses, otherwise require the password. A wrong
-    // key with no pass was not counted yet, so count it once on denial
+    // Viewer lock: owner bypasses; a live viewer cookie for THIS gallery is
+    // the password, already proven (no Argon2, no URL secret). A wrong key
+    // with no pass was not counted yet, so count it once on denial
     // (check_locked already counted a non-empty wrong pass).
+    let mut unlocked = false;
     if !owner {
-        let query = raw.unwrap_or_default();
-        let pass = request_pass(&headers, &query);
-        if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
-            if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
-                return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+        let viewer = media_cookie_ok(&headers, &state, &slug, MediaToken::Viewer);
+        if !viewer {
+            let query = raw.unwrap_or_default();
+            let pass = request_pass(&headers, &query);
+            match check_locked(&state, ip, &slug, &pass).await {
+                Locked::Open => {}
+                Locked::Unlocked => unlocked = true,
+                Locked::Denied(deny) => {
+                    if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
+                        return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+                    }
+                    return deny;
+                }
             }
-            return deny;
         }
     }
     let t_scan = Instant::now();
@@ -445,20 +491,27 @@ pub async fn gallery_photos(
             };
             let body = Json(json!({ "slug": slug, "public": meta.public, "locked": locked, "photos": photos }));
             // Listings are dynamic + reveal lock state: never cache.
-            // The owner's page needs the media cookie for <img> tags.
-            if key_ok {
-                let cookie = issue_owner_token(&state, &slug);
-                return (
-                    StatusCode::OK,
-                    [
-                        (header::CACHE_CONTROL, "private, no-store"),
-                        (header::SET_COOKIE, cookie.as_str()),
-                    ],
-                    body,
-                )
-                    .into_response();
+            // <img> tags cannot send a header: the owner's page needs the
+            // owner media cookie, a fresh unlock needs the viewer one.
+            let mut resp = (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "private, no-store")],
+                body,
+            )
+                .into_response();
+            let cookie = if key_ok {
+                Some(issue_media_token(&state, &slug, MediaToken::Owner))
+            } else if unlocked {
+                Some(issue_media_token(&state, &slug, MediaToken::Viewer))
+            } else {
+                None
+            };
+            if let Some(cookie) = cookie {
+                if let Ok(v) = HeaderValue::from_str(&cookie) {
+                    resp.headers_mut().append(header::SET_COOKIE, v);
+                }
             }
-            (StatusCode::OK, [(header::CACHE_CONTROL, "private, no-store")], body).into_response()
+            resp
         }
         Err(_) => ApiError::Internal.into_response(),
     }
@@ -1287,8 +1340,8 @@ pub async fn get_photo(
     let Some(meta) = meta else {
         return err(StatusCode::NOT_FOUND, "not found");
     };
-    // ?pass= in <img> URLs stays: media tags cannot set headers, so the
-    // query secret is the only way to authorize direct photo embeds.
+    // `?pass=` and `X-Gallery-Pass` stay accepted (old shared links); a
+    // successful unlock sets a viewer cookie so later media needs neither.
     let query = raw.unwrap_or_default();
     let pass = request_pass(&headers, &query);
     let key = request_key(&headers);
@@ -1299,7 +1352,7 @@ pub async fn get_photo(
             db.key_owns_slug(k, &slug)
         })
         .unwrap_or(false);
-    let owner = key_ok || owner_cookie_ok(&headers, &state, &slug);
+    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner);
     // A supplied-but-wrong key on a private gallery is a guess: throttle it
     // before the 404, like the private listing, so private photos cannot be
     // probed at read-limit speed. No key (public probing) burns nothing.
@@ -1312,27 +1365,33 @@ pub async fn get_photo(
     if !meta.public && !owner {
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    // Viewer lock applies per-file too (direct /photos/ links). A wrong key
-    // with no pass was not counted yet, so count it once on denial
-    // (check_locked already counted a non-empty wrong pass).
-    if !owner {
-        if let Some(deny) = check_locked(&state, ip, &slug, &pass).await {
-            if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
-                return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+    // Viewer lock applies per-file too (direct /photos/ links). A live viewer
+    // cookie for THIS gallery already proves the password: no Argon2, no URL
+    // secret. A wrong key with no pass was not counted yet, so count it once
+    // on denial (check_locked already counted a non-empty wrong pass).
+    let viewer_cookie = !owner && media_cookie_ok(&headers, &state, &slug, MediaToken::Viewer);
+    let mut unlocked = false;
+    if !owner && !viewer_cookie {
+        match check_locked(&state, ip, &slug, &pass).await {
+            Locked::Open => {}
+            Locked::Unlocked => unlocked = true,
+            Locked::Denied(deny) => {
+                if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
+                    return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+                }
+                return deny;
             }
-            return deny;
         }
     }
     // Anything a non-owner can reach here is either private (never cache) or
-    // a public gallery's public bytes. Owner-key requests always stay private.
-    // A locked gallery (pass_hash set) or a supplied viewer password means
-    // the bytes are access-controlled: never mark them public for caches.
+    // a public gallery's unlocked bytes. Owner requests, a locked gallery
+    // (pass_hash set), and any ?pass=/viewer-cookie request stay private.
     let locked = {
         let db = state.db.lock().unwrap();
         db.gallery_pass_hash(&slug).is_some()
     };
-    let cache_control = if meta.public && !owner && pass.is_empty() && !locked {
-        "public, max-age=31536000, immutable"
+    let cache_control = if meta.public && !owner && !locked && pass.is_empty() && !viewer_cookie {
+        "public, max-age=86400"
     } else {
         "private, no-store"
     };
@@ -1350,7 +1409,19 @@ pub async fn get_photo(
         Ok(f) => f,
         Err(_) => return err(StatusCode::NOT_FOUND, "not found"),
     };
-    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let md = file.metadata().await.ok();
+    let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+    // Length + mtime: enough for a file that never changes in place (a
+    // re-upload gets a new name), and costs no read of the bytes.
+    let etag = {
+        let mtime = md
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("\"{len:x}-{mtime:x}\"")
+    };
     tracing::debug!(stage = "serve_open", latency_ms = format!("{:.2}", t_canon.elapsed().as_secs_f64() * 1000.0));
     let ext = match name.rfind('.') {
         Some(i) if i > 0 => name[i..].to_lowercase(),
@@ -1382,6 +1453,14 @@ pub async fn get_photo(
     } else if !inline {
         builder = builder.header(header::CONTENT_DISPOSITION, "attachment");
     }
+    // A password proven on this request earns the cookie for every later
+    // media tag of this gallery.
+    if unlocked {
+        builder = builder.header(
+            header::SET_COOKIE,
+            issue_media_token(&state, &slug, MediaToken::Viewer),
+        );
+    }
     match parse_range(&headers, len) {
         // Unsatisfiable: 416 with the real length, no body (RFC 9110 §15.5.17).
         Some(Err(())) => builder
@@ -1401,10 +1480,20 @@ pub async fn get_photo(
                 .body(Body::from_stream(tokio_util::io::ReaderStream::new(take)))
                 .unwrap()
         }
-        None => builder
-            .header(header::CONTENT_LENGTH, len.to_string())
-            .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
-            .unwrap(),
+        None => {
+            let builder = builder.header(header::ETAG, etag.as_str());
+            // Full-file GET only: range requests keep their own semantics.
+            if if_none_match(&headers, &etag) {
+                return builder
+                    .status(StatusCode::NOT_MODIFIED)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            builder
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+                .unwrap()
+        }
     }
 }
 

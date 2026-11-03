@@ -90,6 +90,17 @@ fn key_header(key: &str) -> (&str, &str) {
     ("x-gallery-key", key)
 }
 
+/// `name=value` pair of the first `Set-Cookie` whose name starts with
+/// `prefix`, ready to send back as a `Cookie` header.
+fn set_cookie_pair(resp: &Response, prefix: &str) -> Option<String> {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with(prefix))
+        .map(|c| c.split(';').next().unwrap().to_string())
+}
+
 /// Upload `bytes` as `name`; returns (status, parsed json body).
 /// `slug`: gallery-page upload (scoped). None = home upload (fresh gallery).
 async fn put_photo(
@@ -496,6 +507,145 @@ async fn lock_requires_owner_key() {
     let resp = router(state).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn unlock_sets_viewer_cookie_that_serves_media() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"s3cret-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Unlock through the listing: the 200 carries the viewer cookie.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug}/photos?pass=s3cret-pass"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("viewer cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("galpass_{slug}=")), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("SameSite=Lax"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/photos/"), "{set_cookie}");
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // Cookie alone serves the photo: no ?pass=, no key. Still never cached.
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/photos/{name}"), &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "private, no-store");
+    assert_eq!(body_bytes(resp).await.len(), jpeg().len());
+}
+
+#[tokio::test]
+async fn viewer_cookie_is_bound_to_its_gallery() {
+    let (state, _tmp) = test_state().await;
+    let (_, a) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let (_, b) = put_photo(&state, "b.jpg", Some(KEY_B), None, "image/jpeg", jpeg()).await;
+    let slug_a = a["slug"].as_str().unwrap().to_string();
+    let slug_b = b["slug"].as_str().unwrap().to_string();
+    let name_a = a["name"].as_str().unwrap().to_string();
+    for (slug, key) in [(&slug_a, KEY_A), (&slug_b, KEY_B)] {
+        let r = post_json(
+            &format!("/api/galleries/{slug}/visibility"),
+            &[key_header(key)],
+            r#"{"public":true}"#,
+        );
+        assert_eq!(
+            router(state.clone()).oneshot(r).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let r = post_json(
+            &format!("/api/galleries/{slug}/lock"),
+            &[key_header(key)],
+            r#"{"password":"only-a"}"#,
+        );
+        assert_eq!(
+            router(state.clone()).oneshot(r).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug_a}/photos?pass=only-a"), &[]))
+        .await
+        .unwrap();
+    let pair = set_cookie_pair(&resp, &format!("galpass_{slug_a}=")).expect("viewer cookie");
+    let tok = pair.split_once('=').unwrap().1;
+
+    // Gallery A's token relabelled for gallery B opens nothing.
+    let wrong = format!("galpass_{slug_b}={tok}");
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/api/galleries/{slug_b}/photos"), &[("cookie", wrong.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Nor may a viewer token pose as an owner cookie: separate token kinds.
+    let forged = format!("galowner_{slug_a}={tok}");
+    let resp = router(state.clone())
+        .oneshot(get(&format!("/photos/{name_a}"), &[("cookie", forged.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn photo_etag_revalidates_with_304() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let name = v["name"].as_str().unwrap().to_string();
+    let photo = format!("/photos/{name}");
+
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get("etag")
+        .expect("photo etag")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Same ETag: 304, empty body, header unchanged.
+    let resp = router(state.clone())
+        .oneshot(get(&photo, &[key_header(KEY_A), ("if-none-match", etag.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp.headers().get("etag").unwrap(), etag.as_str());
+    assert!(body_bytes(resp).await.is_empty());
+
+    // Range requests are never 304: they still slice.
+    let resp = router(state.clone())
+        .oneshot(get(
+            &photo,
+            &[key_header(KEY_A), ("range", "bytes=0-3"), ("if-none-match", etag.as_str())],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+}
+
 #[tokio::test]
 async fn delete_keeps_gallery_when_photos_remain() {
     let (state, _tmp) = test_state().await;
@@ -1042,7 +1192,7 @@ async fn photo_cache_control_never_public_for_owners() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("cache-control").unwrap(),
-        "public, max-age=31536000, immutable"
+        "public, max-age=86400"
     );
     // Owner key on a public gallery still stays out of shared caches.
     let resp = router(state.clone())
@@ -1147,9 +1297,11 @@ async fn non_ascii_viewer_password_works() {
         router(state.clone()).oneshot(r).await.unwrap().status(),
         StatusCode::OK
     );
-    // UTF-8 percent-encoded query, raw UTF-8 header: both accepted.
+    // Percent-encoded UTF-8 in query or header, and a raw UTF-8 header: all
+    // accepted (app.js sends the header percent-encoded).
     for req in [
         get(&format!("/api/galleries/{slug}/photos?pass=p%C3%A4ss"), &[]),
+        get(&format!("/api/galleries/{slug}/photos"), &[("x-gallery-pass", "p%C3%A4ss")]),
         get(&format!("/api/galleries/{slug}/photos"), &[("x-gallery-pass", "päss")]),
         get(&format!("/photos/{name}?pass=p%C3%A4ss"), &[]),
     ] {
