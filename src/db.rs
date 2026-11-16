@@ -88,8 +88,10 @@ pub struct GalleryMeta {
 }
 
 /// Recount `galleries.bytes`/`.photos` from the files on disk. Runs at
-/// startup: repairs counters after a crash.
-pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()> {
+/// startup: repairs counters after a crash. A directory we cannot read aborts
+/// the rebuild before the transaction, leaving the previous listing intact.
+pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
     use std::collections::HashMap;
     let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
     // Rows carry the capture time (EXIF backfill or upload time); the disk
@@ -106,30 +108,36 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()>
     // The listing table is a projection of the directory: rebuild it, not
     // just the counters, so a crashed install gets its rows back.
     let mut files: Vec<(String, String, i64, i64)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(photos_dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            let Some(slug) = crate::validate::photo_slug(&name) else {
-                continue;
-            };
-            let slug = slug.to_string();
-            let md = match ent.metadata() {
-                // Directories (`.thumbs`) and dotfiles never become rows.
-                Ok(m) if m.is_file() => m,
-                _ => continue,
-            };
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let created = existing.get(&name).copied().unwrap_or(mtime);
-            files.push((slug.clone(), name, md.len() as i64, created));
-            let e = counts.entry(slug).or_default();
-            e.0 += md.len() as i64;
-            e.1 += 1;
-        }
+    let rd = std::fs::read_dir(photos_dir)
+        .with_context(|| format!("read photos dir {}", photos_dir.display()))?;
+    for ent in rd {
+        let ent = ent.with_context(|| format!("read photos dir {}", photos_dir.display()))?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let Some(slug) = crate::validate::photo_slug(&name) else {
+            continue;
+        };
+        let slug = slug.to_string();
+        let md = match ent.metadata() {
+            // Directories (`.thumbs`) and dotfiles never become rows.
+            Ok(m) if m.is_file() => m,
+            Ok(_) => continue,
+            // Vanished between read_dir and stat: not a listing error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat {}", ent.path().display()));
+            }
+        };
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let created = existing.get(&name).copied().unwrap_or(mtime);
+        files.push((slug.clone(), name, md.len() as i64, created));
+        let e = counts.entry(slug).or_default();
+        e.0 += md.len() as i64;
+        e.1 += 1;
     }
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM photos", [])?;
@@ -147,7 +155,8 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()>
             rusqlite::params![bytes, photos, slug],
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    Ok(())
 }
 
 /// One-time EXIF capture-date backfill for libraries created before the
@@ -502,6 +511,34 @@ mod tests {
         assert!(!db.gallery_exists(&slug));
         assert!(!db.remove_gallery(&slug));
         assert!(db.get_or_create_gallery("public-key-0001").is_some());
+    }
+
+    #[test]
+    fn recount_aborts_before_wiping_on_photos_dir_error() {
+        let dir = std::env::temp_dir().join(format!("gally-db-recount-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = open(&dir.join("g.db")).expect("open");
+        let slug = db
+            .get_or_create_gallery("recount-error-key")
+            .expect("create");
+        assert_eq!(db.add_upload(&slug, "kept.jpg", 5, 500), Some((5, 1)));
+        // read_dir on a regular file fails like a permission or mount error.
+        let not_a_dir = dir.join("photos");
+        std::fs::write(&not_a_dir, b"not a directory").unwrap();
+        let err = recount(&mut db, &not_a_dir).unwrap_err();
+        assert!(format!("{err:#}").contains("read photos dir"), "{err:#}");
+        // Nothing was deleted: the listing and counters are unchanged.
+        assert!(db.photo_exists(&slug, "kept.jpg"));
+        assert_eq!(
+            db.gallery_meta(&slug).expect("meta"),
+            GalleryMeta {
+                public: false,
+                bytes: 5,
+                photos: 1,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
