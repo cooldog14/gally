@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 use crate::db;
 
@@ -41,6 +45,8 @@ pub struct Limits {
     pub upload_slots_per_ip: usize,
     /// Concurrent Argon2 hashes (`GALLY_ARGON2_SLOTS`), clamped to >= 1.
     pub argon2_slots: usize,
+    /// Append `Secure` to login and media cookies (`GALLY_SECURE_COOKIES`).
+    pub secure_cookies: bool,
 }
 
 impl Limits {
@@ -55,6 +61,7 @@ impl Limits {
             upload_slots: 32,
             upload_slots_per_ip: 4,
             argon2_slots: 4,
+            secure_cookies: false,
         }
     }
 
@@ -65,16 +72,32 @@ impl Limits {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
         };
+        let flag = |name: &str| {
+            matches!(
+                std::env::var(name)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes"
+            )
+        };
         Limits {
             max_file: num("GALLY_MAX_BYTES").unwrap_or(d.max_file as u64) as usize,
             gallery_bytes: num("GALLY_GALLERY_MAX_BYTES").unwrap_or(d.gallery_bytes),
-            gallery_photos: num("GALLY_GALLERY_MAX_PHOTOS").unwrap_or(d.gallery_photos as u64) as i64,
+            gallery_photos: num("GALLY_GALLERY_MAX_PHOTOS").unwrap_or(d.gallery_photos as u64)
+                as i64,
             min_free: num("GALLY_MIN_FREE_BYTES").unwrap_or(d.min_free),
             rate_max: num("GALLY_RATE_MAX").unwrap_or(d.rate_max as u64) as usize,
             read_max: num("GALLY_READ_RATE_MAX").unwrap_or(d.read_max as u64) as usize,
-            upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize).max(1),
-            upload_slots_per_ip: (num("GALLY_UPLOAD_SLOTS_PER_IP").unwrap_or(d.upload_slots_per_ip as u64) as usize).max(1),
-            argon2_slots: (num("GALLY_ARGON2_SLOTS").unwrap_or(d.argon2_slots as u64) as usize).max(1),
+            upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize)
+                .max(1),
+            upload_slots_per_ip: (num("GALLY_UPLOAD_SLOTS_PER_IP")
+                .unwrap_or(d.upload_slots_per_ip as u64)
+                as usize)
+                .max(1),
+            argon2_slots: (num("GALLY_ARGON2_SLOTS").unwrap_or(d.argon2_slots as u64) as usize)
+                .max(1),
+            secure_cookies: flag("GALLY_SECURE_COOKIES"),
         }
     }
 }
@@ -96,17 +119,123 @@ pub struct AppState {
     /// gallery never needs it.
     pub invite: Mutex<Option<String>>,
     pub limits: Limits,
-    /// Media cookies: token → (gallery slug, issued at, what it authorises).
-    /// `<img>` tags cannot send a header, so private and locked galleries
-    /// both need a cookie.
-    pub media_tokens: Mutex<HashMap<String, (String, Instant, MediaToken)>>,
+    /// HMAC key for stateless media cookies (`GALLY_MEDIA_SECRET`, else the
+    /// generated `<root>/.gally-media-secret`).
+    pub media_secret: Vec<u8>,
     pub uploads: tokio::sync::Semaphore,
     /// Live upload streams per IP. Guarded by `UploadSlotGuard`: a slow
     /// client pins at most `limits.upload_slots_per_ip` global slots.
     pub upload_ips: Mutex<HashMap<IpAddr, usize>>,
     pub argon2: tokio::sync::Semaphore,
+    /// Thumbnail decodes in flight. Hardcoded to 2: a small thumbnail can
+    /// need the full source bitmap in RAM, so this bounds peak decode memory.
+    pub thumbs: tokio::sync::Semaphore,
     /// Read requests per IP (listing + photo), separate from uploads.
     pub read: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    /// Exclusive data-dir lock: a second server must never sweep the first
+    /// instance's `.part-` uploads. Held until the state is dropped.
+    pub _instance_lock: Option<std::fs::File>,
+    pub started: Instant,
+    pub requests_total: AtomicU64,
+    pub responses_5xx_total: AtomicU64,
+    pub uploads_total: AtomicU64,
+    pub upload_bytes_total: AtomicU64,
+}
+
+/// Non-blocking exclusive flock on `<root>/.gally.lock`; `None` off unix.
+fn instance_lock(root: &Path) -> anyhow::Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let path = root.join(".gally.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+        // SAFETY: `file` owns the fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            anyhow::bail!(
+                "{} is already in use by another gally instance",
+                root.display()
+            );
+        }
+        Ok(Some(file))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(None)
+    }
+}
+
+/// Lowercase hex, no external crate.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// HMAC key for media cookies: `GALLY_MEDIA_SECRET`, else a 32-byte secret
+/// generated once into `<root>/.gally-media-secret` (0600) and reused.
+fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
+    if let Ok(s) = std::env::var("GALLY_MEDIA_SECRET")
+        && !s.is_empty()
+    {
+        return Ok(s.into_bytes());
+    }
+    let path = root.join(".gally-media-secret");
+    if let Ok(raw) = std::fs::read(&path) {
+        let text = String::from_utf8_lossy(&raw);
+        if let Some(bytes) = from_hex(text.trim())
+            && bytes.len() == 32
+        {
+            return Ok(bytes);
+        }
+        anyhow::bail!("{} is not a 32-byte hex secret", path.display());
+    }
+    let mut bytes = [0u8; 32];
+    {
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(&mut bytes);
+    }
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    file.write_all(to_hex(&bytes).as_bytes())?;
+    file.sync_all()?;
+    Ok(bytes.to_vec())
+}
+
+fn hmac_sha256(secret: &[u8], msg: &[u8]) -> [u8; 32] {
+    // HMAC accepts keys of any length.
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl AppState {
@@ -115,9 +244,17 @@ impl AppState {
     }
 
     pub async fn new_with(root: &Path, limits: Limits) -> anyhow::Result<Arc<AppState>> {
+        // Lock before touching the dir: the stale-.part sweep below would
+        // otherwise delete a live server's in-flight uploads.
+        tokio::fs::create_dir_all(root).await?;
+        let _instance_lock = instance_lock(root)?;
+        // After the flock: two instances must never race the secret file.
+        let media_secret = media_secret(root)?;
         let dir = root.join("photos");
         tokio::fs::create_dir_all(&dir).await?;
         // Data dir holds every uploaded file and the SQLite file: owner-only.
+        // A host bind mount must already be owned by the container uid (10001);
+        // the shipped compose file uses a named volume to inherit that.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -134,6 +271,14 @@ impl AppState {
                 }
             }
         }
+        // Thumbnail writes are temp+rename; a crash can leave `.tmp-*` behind.
+        if let Ok(mut rd) = tokio::fs::read_dir(dir.join(".thumbs")).await {
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                if ent.file_name().to_string_lossy().starts_with(".tmp-") {
+                    let _ = tokio::fs::remove_file(ent.path()).await;
+                }
+            }
+        }
         // db::open + recount are synchronous but fast (local SQLite); run
         // them blocking so we never stall the runtime.
         let db_path = root.join("galleries.db");
@@ -144,53 +289,49 @@ impl AppState {
             Ok::<_, anyhow::Error>(conn)
         })
         .await??;
-        let statics: HashMap<&'static str, (&'static [u8], &'static str)> =
-            HashMap::from([
-                ("/", (&include_bytes!("../index.html")[..], "text/html")),
+        let statics: HashMap<&'static str, (&'static [u8], &'static str)> = HashMap::from([
+            ("/", (&include_bytes!("../index.html")[..], "text/html")),
+            (
+                "/index.html",
+                (&include_bytes!("../index.html")[..], "text/html"),
+            ),
+            (
+                "/app.js",
+                (&include_bytes!("../app.js")[..], "application/javascript"),
+            ),
+            (
+                "/vendor-heic2any.min.js",
                 (
-                    "/index.html",
-                    (&include_bytes!("../index.html")[..], "text/html"),
+                    &include_bytes!("../vendor-heic2any.min.js")[..],
+                    "application/javascript",
                 ),
+            ),
+            (
+                "/styles.css",
+                (&include_bytes!("../styles.css")[..], "text/css"),
+            ),
+            (
+                "/fonts/Figtree-400.woff2",
                 (
-                    "/app.js",
-                    (
-                        &include_bytes!("../app.js")[..],
-                        "application/javascript",
-                    ),
+                    &include_bytes!("../fonts/Figtree-400.woff2")[..],
+                    "font/woff2",
                 ),
+            ),
+            (
+                "/fonts/Figtree-500.woff2",
                 (
-                    "/vendor-heic2any.min.js",
-                    (
-                        &include_bytes!("../vendor-heic2any.min.js")[..],
-                        "application/javascript",
-                    ),
+                    &include_bytes!("../fonts/Figtree-500.woff2")[..],
+                    "font/woff2",
                 ),
+            ),
+            (
+                "/fonts/Figtree-600.woff2",
                 (
-                    "/styles.css",
-                    (&include_bytes!("../styles.css")[..], "text/css"),
+                    &include_bytes!("../fonts/Figtree-600.woff2")[..],
+                    "font/woff2",
                 ),
-                (
-                    "/fonts/Figtree-400.woff2",
-                    (
-                        &include_bytes!("../fonts/Figtree-400.woff2")[..],
-                        "font/woff2",
-                    ),
-                ),
-                (
-                    "/fonts/Figtree-500.woff2",
-                    (
-                        &include_bytes!("../fonts/Figtree-500.woff2")[..],
-                        "font/woff2",
-                    ),
-                ),
-                (
-                    "/fonts/Figtree-600.woff2",
-                    (
-                        &include_bytes!("../fonts/Figtree-600.woff2")[..],
-                        "font/woff2",
-                    ),
-                ),
-            ]);
+            ),
+        ]);
         let statics = statics
             .into_iter()
             .map(|(path, (bytes, ctype))| {
@@ -211,13 +352,24 @@ impl AppState {
             pass_ok: Mutex::new(HashMap::new()),
             pass_fail: Mutex::new(HashMap::new()),
             statics,
-            invite: Mutex::new(std::env::var("GALLY_INVITE_CODE").ok().filter(|s| !s.trim().is_empty())),
+            invite: Mutex::new(
+                std::env::var("GALLY_INVITE_CODE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            ),
             limits,
-            media_tokens: Mutex::new(HashMap::new()),
+            media_secret,
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
             upload_ips: Mutex::new(HashMap::new()),
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
+            thumbs: tokio::sync::Semaphore::new(2),
             read: Mutex::new(HashMap::new()),
+            _instance_lock,
+            started: Instant::now(),
+            requests_total: AtomicU64::new(0),
+            responses_5xx_total: AtomicU64::new(0),
+            uploads_total: AtomicU64::new(0),
+            upload_bytes_total: AtomicU64::new(0),
         }))
     }
 }
@@ -233,7 +385,11 @@ pub struct UploadSlotGuard<'a> {
 
 impl<'a> UploadSlotGuard<'a> {
     /// `cap` of 0 means unlimited (direct callers only; from_env clamps to >= 1).
-    pub fn try_acquire(ips: &'a Mutex<HashMap<IpAddr, usize>>, ip: &IpAddr, cap: usize) -> Option<Self> {
+    pub fn try_acquire(
+        ips: &'a Mutex<HashMap<IpAddr, usize>>,
+        ip: &IpAddr,
+        cap: usize,
+    ) -> Option<Self> {
         if cap > 0 {
             let mut guard = ips.lock().unwrap();
             let n = guard.get(ip).copied().unwrap_or(0);
@@ -275,10 +431,14 @@ pub fn window_hit(
     let now = Instant::now();
     let mut hits_map = map.lock().unwrap();
     // Bound memory: drop the oldest entry when full (dead IPs never return).
-    if !hits_map.contains_key(ip) && hits_map.len() >= 10_000 {
-        if let Some(oldest) = hits_map.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
-            hits_map.remove(&oldest);
-        }
+    if !hits_map.contains_key(ip)
+        && hits_map.len() >= 10_000
+        && let Some(oldest) = hits_map
+            .iter()
+            .min_by_key(|(_, v)| v.first().copied())
+            .map(|(k, _)| *k)
+    {
+        hits_map.remove(&oldest);
     }
     let hits = hits_map.entry(*ip).or_default();
     hits.retain(|t| now.duration_since(*t).as_secs() < window_secs);
@@ -317,10 +477,14 @@ pub fn pass_fail_exceeded(state: &AppState, ip: &IpAddr) -> bool {
 pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
     let now = Instant::now();
     let mut fail = state.pass_fail.lock().unwrap();
-    if !fail.contains_key(ip) && fail.len() >= 10_000 {
-        if let Some(oldest) = fail.iter().min_by_key(|(_, v)| v.first().copied()).map(|(k, _)| *k) {
-            fail.remove(&oldest);
-        }
+    if !fail.contains_key(ip)
+        && fail.len() >= 10_000
+        && let Some(oldest) = fail
+            .iter()
+            .min_by_key(|(_, v)| v.first().copied())
+            .map(|(k, _)| *k)
+    {
+        fail.remove(&oldest);
     }
     let hits = fail.entry(*ip).or_default();
     hits.retain(|t| now.duration_since(*t).as_secs() < PASS_FAIL_WINDOW_SECS);
@@ -334,12 +498,57 @@ pub const ADMIN_TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Owner and viewer media cookies outlive a browsing session but not a day.
 pub const OWNER_TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// What a media cookie authorises. Both kinds share one token map, so the
-/// kind is stored with the token: a viewer cookie can never act as an owner.
+/// What a media cookie authorises. The kind is part of the signed message,
+/// so a viewer cookie can never act as an owner.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MediaToken {
     Owner,
     Viewer,
+}
+
+fn media_message(slug: &str, kind: MediaToken, version: i64, exp: u64) -> String {
+    match kind {
+        MediaToken::Owner => format!("v1|{slug}|owner|{exp}"),
+        // Revocation is per gallery: a password change bumps token_version.
+        // Upgrade to per-session ids only if single-cookie logout is needed.
+        MediaToken::Viewer => format!("v1|{slug}|viewer|{exp}|{version}"),
+    }
+}
+
+/// `v1.<exp_unix>.<mac_hex>` for one media cookie.
+pub fn media_token(secret: &[u8], slug: &str, kind: MediaToken, version: i64, exp: u64) -> String {
+    let mac = hmac_sha256(secret, media_message(slug, kind, version, exp).as_bytes());
+    format!("v1.{exp}.{}", to_hex(&mac))
+}
+
+/// True when `token` is live, signed for `slug`/`kind`, and (for viewers)
+/// carries the gallery's current `version`.
+pub fn media_token_ok(
+    secret: &[u8],
+    token: &str,
+    slug: &str,
+    kind: MediaToken,
+    version: i64,
+) -> bool {
+    let mut parts = token.split('.');
+    let (Some("v1"), Some(exp), Some(mac)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let Ok(exp) = exp.parse::<u64>() else {
+        return false;
+    };
+    if exp <= now_secs() {
+        return false;
+    }
+    let expected = to_hex(&hmac_sha256(
+        secret,
+        media_message(slug, kind, version, exp).as_bytes(),
+    ));
+    use subtle::ConstantTimeEq;
+    expected.as_bytes().ct_eq(mac.as_bytes()).unwrap_u8() == 1
 }
 
 /// Value of `name` in the request's `Cookie` header.

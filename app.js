@@ -19,6 +19,7 @@ const publicCheck = document.getElementById("public-check");
 const editStatus = document.getElementById("edit-status");
 const keyBanner = document.getElementById("key-banner");
 const keyBannerKey = document.getElementById("key-banner-key");
+const loadMoreBtn = document.getElementById("load-more");
 
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
 
@@ -26,6 +27,9 @@ const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-
 
 let photos = [];
 let index = 0;
+// Server-side pagination: `next` cursor from the last listing page.
+let nextCursor = null;
+let loadingMore = false;
 // Whole-gallery visibility; new galleries start private server-side.
 let galleryPublic = true;
 // Viewer password set? Comes from the listing: an unauthenticated probe gets
@@ -76,6 +80,24 @@ function slugFromPath() {
   return SLUG_RE.test(seg) ? seg : "";
 }
 
+const PAGE_SIZE = 200;
+
+/** Password as a percent-encoded header, never a URL: fetch() refuses
+    non-ASCII header values, so encodeURIComponent + server-side decode. */
+function listingHeaders(slug) {
+  const headers = {};
+  if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
+  const p = storedPass(slug);
+  if (p) headers["X-Gallery-Pass"] = encodeURIComponent(p);
+  return headers;
+}
+
+function listingUrl(slug, before) {
+  let url = "/api/galleries/" + slug + "/photos?limit=" + PAGE_SIZE;
+  if (before) url += "&before=" + encodeURIComponent(before);
+  return url;
+}
+
 async function loadPhotos(retry = false) {
   const slug = slugFromPath();
   if (!slug) {
@@ -84,6 +106,7 @@ async function loadPhotos(retry = false) {
     editBtn.hidden = true;
     setEditing(false);
     photos = [];
+    nextCursor = null;
     publicCheck.checked = true;
     galleryLocked = false;
     renderGrid();
@@ -93,17 +116,8 @@ async function loadPhotos(retry = false) {
   editBtn.hidden = false;
   showKeyBannerOnce(slug);
   try {
-    const headers = {};
-    let url = "/api/galleries/" + slug + "/photos";
-    if (galleryKey) {
-      headers["X-Gallery-Key"] = galleryKey;
-    }
-    // Password as a percent-encoded header, never a URL: fetch() refuses
-    // non-ASCII header values, so encodeURIComponent + server-side decode.
-    // The listing's Set-Cookie then authorises every media tag.
-    const p = storedPass(slug);
-    if (p) headers["X-Gallery-Pass"] = encodeURIComponent(p);
-    const res = await fetch(url, { headers });
+    // The listing's Set-Cookie authorises every media tag.
+    const res = await fetch(listingUrl(slug), { headers: listingHeaders(slug) });
     if (res.status === 404) {
       // Private (or deleted): a key is the only door. Ask once, then leave.
       if (!retry) {
@@ -118,6 +132,7 @@ async function loadPhotos(retry = false) {
       const ok = await needPass(slug);
       if (ok) return loadPhotos();
       photos = [];
+      nextCursor = null;
       renderGrid();
       empty.hidden = false;
       empty.textContent = "This gallery is locked.";
@@ -129,6 +144,7 @@ async function loadPhotos(retry = false) {
     galleryLocked = data.locked === true;
     publicCheck.checked = galleryPublic;
     photos = data.photos || [];
+    nextCursor = data.next || null;
     // Drop selection for photos that no longer exist.
     for (const name of Array.from(selected)) {
       if (!photos.some((p) => p.name === name)) selected.delete(name);
@@ -136,6 +152,8 @@ async function loadPhotos(retry = false) {
     renderGrid();
     updateEditUI();
   } catch (_) {
+    nextCursor = null;
+    updateLoadMore();
     empty.hidden = false;
     empty.textContent = "Could not load photos";
   }
@@ -336,6 +354,15 @@ function mediaUrl(name) {
   return "/photos/" + encodeURIComponent(name);
 }
 
+// Only formats the server generates previews for. Everything else (SVG, AVIF,
+// HEIC, …) must load its original/special path directly, not 404 then fall back.
+const THUMB_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico"]);
+function thumbUrl(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : "";
+  return THUMB_EXTS.has(ext) ? "/photos/thumb/" + encodeURIComponent(name) + ".jpg" : "";
+}
+
 // Owner key as a header; viewer password goes on the listing fetch only
 // (percent-encoded: fetch() refuses non-ASCII header values).
 async function authedFetch(name) {
@@ -497,7 +524,18 @@ function tileMedia(photo) {
     const img = document.createElement("img");
     img.loading = "lazy";
     img.alt = displayName(photo.name);
-    img.src = url;
+    // Supported formats get the server preview (old photos have none, so fall
+    // back to the original exactly once); others load the original directly.
+    const preview = thumbUrl(photo.name);
+    if (preview) {
+      img.src = preview;
+      img.onerror = () => {
+        img.onerror = null;
+        img.src = url;
+      };
+    } else {
+      img.src = url;
+    }
     return img;
   }
   if (kind === "video") {
@@ -524,34 +562,66 @@ function tileMedia(photo) {
   return div;
 }
 
+function addTile(photo, i) {
+  const tile = document.createElement("button");
+  tile.className = "tile" + (selected.has(photo.name) ? " selected" : "");
+  tile.setAttribute("aria-pressed", selected.has(photo.name) ? "true" : "false");
+  tile.appendChild(tileMedia(photo));
+  const tick = document.createElement("span");
+  tick.className = "tick";
+  tick.textContent = "\u2713";
+  tile.appendChild(tick);
+  tile.addEventListener("click", () => {
+    if (editing) {
+      const now = !selected.has(photo.name);
+      if (now) selected.add(photo.name);
+      else selected.delete(photo.name);
+      tile.classList.toggle("selected", now);
+      tile.setAttribute("aria-pressed", String(now));
+      updateEditUI();
+    } else {
+      openLightbox(i);
+    }
+  });
+  grid.appendChild(tile);
+}
+
 function renderGrid() {
   grid.textContent = "";
   empty.hidden = photos.length > 0;
   empty.textContent = "Empty gallery.";
-  photos.forEach((photo, i) => {
-    const tile = document.createElement("button");
-    tile.className = "tile" + (selected.has(photo.name) ? " selected" : "");
-    tile.setAttribute("aria-pressed", selected.has(photo.name) ? "true" : "false");
-    tile.appendChild(tileMedia(photo));
-    const tick = document.createElement("span");
-    tick.className = "tick";
-    tick.textContent = "\u2713";
-    tile.appendChild(tick);
-    tile.addEventListener("click", () => {
-      if (editing) {
-        const now = !selected.has(photo.name);
-        if (now) selected.add(photo.name);
-        else selected.delete(photo.name);
-        tile.classList.toggle("selected", now);
-        tile.setAttribute("aria-pressed", String(now));
-        updateEditUI();
-      } else {
-        openLightbox(i);
-      }
-    });
-    grid.appendChild(tile);
-  });
+  photos.forEach(addTile);
+  updateLoadMore();
 }
+
+function updateLoadMore() {
+  loadMoreBtn.hidden = !slugFromPath() || !nextCursor || loadingMore;
+}
+
+/** Append the next page without rebuilding existing tiles or selection. */
+async function loadMore() {
+  const slug = slugFromPath();
+  if (!slug || !nextCursor || loadingMore) return;
+  loadingMore = true;
+  updateLoadMore();
+  try {
+    const res = await fetch(listingUrl(slug, nextCursor), { headers: listingHeaders(slug) });
+    if (!res.ok) throw new Error("bad status " + res.status);
+    const data = await res.json();
+    const fresh = data.photos || [];
+    const start = photos.length;
+    photos.push(...fresh);
+    fresh.forEach((photo, i) => addTile(photo, start + i));
+    nextCursor = data.next || null;
+  } catch (_) {
+    uploadStatus.textContent = "Could not load more photos";
+  } finally {
+    loadingMore = false;
+    updateLoadMore();
+  }
+}
+
+loadMoreBtn.addEventListener("click", loadMore);
 
 function render() {
   counter.textContent = (index + 1) + " / " + photos.length;
@@ -586,6 +656,14 @@ function showInViewport(i) {
       div.textContent = displayName(name);
       viewport.appendChild(div);
     }, true));
+    return;
+  }
+  if (kind === "image") {
+    // Grid tiles now show a small thumb: the lightbox must load the original.
+    const img = document.createElement("img");
+    img.alt = displayName(name);
+    img.src = url;
+    viewport.appendChild(img);
     return;
   }
   if (kind === "audio") {
@@ -867,27 +945,34 @@ fileInput.addEventListener("change", async () => {
       return null;
     }
   }
-  for (const file of files) {
-    if (file.size > MAX_BYTES) {
-      failures.push(file.name + ": file is too large (10GB max)");
-      continue;
+  async function uploadWorker() {
+    for (;;) {
+      const file = files.shift();
+      if (!file) return;
+      if (file.size > MAX_BYTES) {
+        failures.push(file.name + ": file is too large (10GB max)");
+        continue;
+      }
+      const res = await putFile(file);
+      if (!res) {
+        failures.push(file.name + ": upload failed");
+        continue;
+      }
+      if (!res.ok) {
+        let msg = res.statusText;
+        try {
+          const err = await res.json();
+          if (err.error) msg = err.error;
+        } catch (_) { /* keep status text */ }
+        failures.push(file.name + ": " + msg);
+        continue;
+      }
+      stored += 1;
     }
-    const res = await putFile(file);
-    if (!res) {
-      failures.push(file.name + ": upload failed");
-      continue;
-    }
-    if (!res.ok) {
-      let msg = res.statusText;
-      try {
-        const err = await res.json();
-        if (err.error) msg = err.error;
-      } catch (_) { /* keep status text */ }
-      failures.push(file.name + ": " + msg);
-      continue;
-    }
-    stored += 1;
   }
+  // The server allows 4 concurrent uploads per IP; 3 leaves room for the
+  // listing request that follows the batch.
+  await Promise.all(Array.from({ length: Math.min(3, files.length) }, uploadWorker));
   if (pageSlug) {
     // Gallery page: show the new tiles without a manual reload.
     await loadPhotos(true);

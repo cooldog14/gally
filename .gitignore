@@ -1,5 +1,7 @@
 photos/*
 !photos/.gitkeep
+.gally.lock
+.gally-media-secret
 *.db
 *.db-shm
 *.db-wal

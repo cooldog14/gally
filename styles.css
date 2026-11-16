@@ -208,6 +208,12 @@ body.editing #main { padding-bottom: 150px; }
 #key-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 
 #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+#load-more {
+  display: block; margin: 16px auto; padding: 9px 18px;
+  background: transparent; color: var(--fg); border: 1px solid var(--border); cursor: pointer;
+}
+#load-more[hidden] { display: none; }
+#load-more:hover { background: var(--surface); }
 .tile { padding: 0; border: 0; cursor: pointer; background: var(--surface); overflow: hidden; }
 .tile img, .tile video { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; background: var(--surface); color: transparent; }
 .tile video { pointer-events: none; }

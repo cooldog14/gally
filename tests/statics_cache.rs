@@ -4,10 +4,10 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::ConnectInfo,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     response::Response,
 };
-use gally_uring::{router, AppState};
+use gally_uring::{AppState, router};
 use tower::ServiceExt;
 
 async fn state() -> (Arc<AppState>, tempfile::TempDir) {
@@ -22,13 +22,12 @@ fn get(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
         b = b.header(*k, *v);
     }
     let mut r = b.body(Body::empty()).unwrap();
-    r.extensions_mut().insert(ConnectInfo(
-        "127.0.0.1:4242".parse::<SocketAddr>().unwrap(),
-    ));
+    r.extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:4242".parse::<SocketAddr>().unwrap()));
     r
 }
 
-fn header<'a>(resp: &'a Response, name: header::HeaderName) -> &'a str {
+fn header(resp: &Response, name: header::HeaderName) -> &str {
     resp.headers()
         .get(&name)
         .unwrap_or_else(|| panic!("missing {name}"))

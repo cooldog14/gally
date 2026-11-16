@@ -1,0 +1,56 @@
+name: gally
+
+x-gally: &gally
+  image: gally-uring:local
+  build: .
+  restart: unless-stopped
+  # Match main.rs graceful shutdown: stop accepting, drain in-flight uploads.
+  stop_grace_period: 120s
+
+services:
+  gally:
+    <<: *gally
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+      GALLY_ROOT: /data
+      # Reverse proxies allowed to set X-Forwarded-For (IPs/CIDRs). The
+      # default covers loopback and Docker bridge peers (published host port,
+      # proxy container). Narrow it to the proxy address for a remote proxy.
+      GALLY_TRUST_PROXY: ${GALLY_TRUST_PROXY:-127.0.0.0/8,172.16.0.0/12}
+      RUST_LOG: ${RUST_LOG:-gally_uring=info}
+    # Optional: every other GALLY_*/ADMIN_PASS knob from a .env beside this file.
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # Loopback only; set GALLY_BIND=0.0.0.0 only for a proxy on another host.
+      - "${GALLY_BIND:-127.0.0.1}:8000:8000"
+    volumes:
+      - data:/data
+
+  backup:
+    <<: *gally
+    # Same image, no server: daily snapshot into the backup volume.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "while :; do /usr/local/bin/gally-uring --backup /backups/current || exit 1; sleep 86400; done"
+    stop_grace_period: 5s
+    network_mode: none
+    environment:
+      GALLY_ROOT: /data
+    volumes:
+      - data:/data
+      - backups:/backups
+
+networks:
+  default:
+    # Stable name so another compose project can attach its proxy container.
+    name: gally
+
+volumes:
+  data:
+    name: gally-data
+  backups:
+    name: gally-backups

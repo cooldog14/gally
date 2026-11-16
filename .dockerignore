@@ -1,0 +1,10 @@
+target
+.git
+.github
+photos
+*.db
+*.db-shm
+*.db-wal
+.gally.lock
+.gally-media-secret
+.env
