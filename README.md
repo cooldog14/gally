@@ -186,3 +186,7 @@ CI (`.github/workflows/ci.yml`) runs on push and pull requests on
 `ubuntu-latest`: `cargo fmt --check`, then
 `cargo clippy --all-targets -- -D warnings`, then `cargo test` and
 `cargo build --release`. The stress suite is not run in CI.
+
+Photos are ordered by EXIF `DateTimeOriginal` when present, falling back to
+upload time; existing libraries are backfilled once on the first startup after
+the upgrade.

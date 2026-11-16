@@ -138,6 +138,56 @@ fn jpeg() -> Vec<u8> {
     vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46]
 }
 
+/// Minimal JPEG whose EXIF APP1 segment carries one `DateTimeOriginal`.
+fn jpeg_with_exif(dt: &str) -> Vec<u8> {
+    use exif::{In, Tag, Value};
+    let field = exif::Field {
+        tag: Tag::DateTimeOriginal,
+        ifd_num: In::PRIMARY,
+        value: Value::Ascii(vec![dt.as_bytes().to_vec()]),
+    };
+    let mut writer = exif::experimental::Writer::new();
+    writer.push_field(&field);
+    let mut tiff = std::io::Cursor::new(Vec::new());
+    writer.write(&mut tiff, true).expect("write EXIF");
+    let tiff = tiff.into_inner();
+
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    // APP1 length covers itself, "Exif\0\0", and the TIFF block.
+    jpeg.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+    jpeg.extend_from_slice(b"Exif\0\0");
+    jpeg.extend_from_slice(&tiff);
+    jpeg.extend_from_slice(&[0xFF, 0xD9]);
+    jpeg
+}
+
+/// One resumable-upload request: `range` is `bytes START-END/TOTAL`.
+async fn put_chunk(
+    state: &Arc<AppState>,
+    name: &str,
+    key: &str,
+    slug: &str,
+    id: &str,
+    range: &str,
+    bytes: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let r = request(
+        "PUT",
+        &format!("/api/photos/{name}"),
+        &[
+            ("content-type", "image/jpeg"),
+            ("x-gallery-key", key),
+            ("x-gallery-slug", slug),
+            ("x-upload-id", id),
+            ("content-range", range),
+        ],
+        Body::from(bytes.to_vec()),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
 /// A real (decodable) PNG, needed for thumbnail generation.
 fn png() -> Vec<u8> {
     use image::ImageEncoder;
@@ -3108,4 +3158,98 @@ async fn delete_gallery_removes_thumbs() {
         )
         .unwrap();
     assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn exif_capture_date_orders_listing() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+
+    // Uploaded newer first: upload order would put "older" last.
+    let (status, _) = put_photo(
+        &state,
+        "newer.jpg",
+        Some(KEY_A),
+        Some(&slug),
+        "image/jpeg",
+        jpeg_with_exif("2021:02:03 04:05:06"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = put_photo(
+        &state,
+        "older.jpg",
+        Some(KEY_A),
+        Some(&slug),
+        "image/jpeg",
+        jpeg_with_exif("2020:01:02 03:04:05"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos"),
+            &[key_header(KEY_A)],
+        ))
+        .await
+        .unwrap();
+    let listed = body_json(resp).await;
+    let photos = listed["photos"].as_array().unwrap();
+    assert_eq!(photos.len(), 2);
+    let newer = photos[0]["name"].as_str().unwrap();
+    let older = photos[1]["name"].as_str().unwrap();
+    assert!(newer.ends_with("_newer.jpg"), "{newer}");
+    assert!(older.ends_with("_older.jpg"), "{older}");
+
+    let db = state.db.lock().unwrap();
+    let created = |name: &str| -> i64 {
+        db.query_row(
+            "SELECT created FROM photos WHERE slug = ?1 AND name = ?2",
+            rusqlite::params![slug, name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(created(newer), 1_612_325_106_000);
+    assert_eq!(created(older), 1_577_934_245_000);
+}
+
+#[tokio::test]
+async fn startup_backfills_exif_capture_date() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("photos")).unwrap();
+    let mut db = gally_uring::db::open(&root.join("galleries.db")).expect("open db");
+    let slug = db.get_or_create_gallery(KEY_A).expect("gallery");
+    let name = format!("{slug}_{}_old.jpg", "e".repeat(32));
+    std::fs::write(
+        root.join("photos").join(&name),
+        jpeg_with_exif("2020:01:02 03:04:05"),
+    )
+    .unwrap();
+    assert_eq!(db.add_upload(&slug, &name, 1, 1), Some((1, 1)));
+    drop(db);
+
+    let state = AppState::new_with(root, Limits::defaults())
+        .await
+        .expect("restart");
+    let db = state.db.lock().unwrap();
+    let created: i64 = db
+        .query_row(
+            "SELECT created FROM photos WHERE slug = ?1 AND name = ?2",
+            rusqlite::params![slug, name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(created, 1_577_934_245_000);
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
 }

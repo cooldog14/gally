@@ -9,6 +9,7 @@ use axum::response::Response;
 
 pub mod backup;
 pub mod db;
+mod exif_time;
 pub mod routes;
 pub mod state;
 pub mod validate;

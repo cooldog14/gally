@@ -1638,6 +1638,15 @@ pub async fn put_photo(
         let _ = tokio::fs::remove_file(&temp_path).await;
         return err(StatusCode::BAD_REQUEST, "empty body");
     }
+    // Capture time decides listing order; fall back to upload time.
+    let created = tokio::task::spawn_blocking({
+        let path = temp_path.clone();
+        move || crate::exif_time::taken_millis(&path)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(crate::db::now_millis);
     if tokio::fs::rename(&temp_path, state.dir.join(&final_name))
         .await
         .is_err()
@@ -1649,7 +1658,7 @@ pub async fn put_photo(
     // concurrent overshoot is corrected by deleting this file again.
     let usage = {
         let mut db = state.db.lock().unwrap();
-        db.add_upload(&slug, &final_name, total as u64)
+        db.add_upload(&slug, &final_name, total as u64, created)
     };
     if let Some((bytes, photos)) = usage {
         let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
