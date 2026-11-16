@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 use reqwest::{Client, StatusCode};
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct Server {
@@ -26,8 +30,7 @@ impl Server {
     fn boot_with_env(admin_pass: Option<&str>, env: &[(&str, &str)]) -> Self {
         let tmp = tempfile::TempDir::new().unwrap();
         let port = free_port();
-        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/release/gally-uring");
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/gally-uring");
         assert!(bin.exists(), "build release first: {}", bin.display());
         let mut cmd = Command::new(bin);
         cmd.env("PORT", port.to_string())
@@ -53,17 +56,21 @@ impl Server {
                 if t0.elapsed() > Duration::from_secs(10) {
                     panic!("server on {port} never came up");
                 }
-                if let Ok(r) = reqwest::blocking::get(&url) {
-                    if r.status() == StatusCode::OK {
-                        return;
-                    }
+                if let Ok(r) = reqwest::blocking::get(&url)
+                    && r.status() == StatusCode::OK
+                {
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         })
         .join()
         .expect("readiness thread");
-        Self { child, port, _tmp: tmp }
+        Self {
+            child,
+            port,
+            _tmp: tmp,
+        }
     }
 
     fn url(&self, p: &str) -> String {
@@ -86,7 +93,13 @@ fn client() -> Client {
         .unwrap()
 }
 
-async fn put(client: &Client, srv: &Server, key: &str, name: &str, bytes: &[u8]) -> reqwest::Response {
+async fn put(
+    client: &Client,
+    srv: &Server,
+    key: &str,
+    name: &str,
+    bytes: &[u8],
+) -> reqwest::Response {
     client
         .put(srv.url(&format!("/api/photos/{name}")))
         .header("X-Gallery-Key", key)
@@ -99,7 +112,10 @@ async fn put(client: &Client, srv: &Server, key: &str, name: &str, bytes: &[u8])
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_uploads_same_key() {
-    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
+    let srv = Server::boot_with_env(
+        None,
+        &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")],
+    );
     let client = client();
     let body = vec![0xABu8; 200_000];
     // Mint one gallery first; writers target it via slug header (scoped auth).
@@ -132,7 +148,12 @@ async fn concurrent_uploads_same_key() {
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(r.status(), StatusCode::CREATED, "t{t} i{i}: {}", r.text().await.unwrap());
+                assert_eq!(
+                    r.status(),
+                    StatusCode::CREATED,
+                    "t{t} i{i}: {}",
+                    r.text().await.unwrap()
+                );
                 ok += 1;
             }
             ok
@@ -143,11 +164,14 @@ async fn concurrent_uploads_same_key() {
         total += h.await.unwrap();
     }
     let el = t0.elapsed();
-    println!("800 PUTs (200KB) in {el:.1?} = {:.0}/s", 800.0 / el.as_secs_f64());
+    println!(
+        "800 PUTs (200KB) in {el:.1?} = {:.0}/s",
+        800.0 / el.as_secs_f64()
+    );
     assert_eq!(total, 800);
-    // listing must contain all 800 (slug minted up front)
+    // listing must contain all 800 (slug minted up front); 1000 is the cap
     let list: serde_json::Value = client
-        .get(srv.url(&format!("/api/galleries/{slug}/photos")))
+        .get(srv.url(&format!("/api/galleries/{slug}/photos?limit=1000")))
         .header("X-Gallery-Key", "stresskey-001")
         .send()
         .await
@@ -165,7 +189,10 @@ async fn concurrent_uploads_with_listings_stay_correct() {
     const WRITERS: usize = 8;
     const PER_WRITER: usize = 25;
     const N: usize = WRITERS * PER_WRITER;
-    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
+    let srv = Server::boot_with_env(
+        None,
+        &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")],
+    );
     let client = client();
     let body = vec![0x5Au8; 20_000];
     let url = srv.url("/api/photos/");
@@ -203,10 +230,19 @@ async fn concurrent_uploads_with_listings_stay_correct() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut readers = vec![];
     for _ in 0..4 {
-        let (c, u, s) = (client.clone(), srv.url(&format!("/api/galleries/{slug}/photos")), stop.clone());
+        let (c, u, s) = (
+            client.clone(),
+            srv.url(&format!("/api/galleries/{slug}/photos")),
+            stop.clone(),
+        );
         readers.push(tokio::spawn(async move {
             while !s.load(std::sync::atomic::Ordering::Relaxed) {
-                let r = c.get(&u).header("X-Gallery-Key", "racekey-0001").send().await.unwrap();
+                let r = c
+                    .get(&u)
+                    .header("X-Gallery-Key", "racekey-0001")
+                    .send()
+                    .await
+                    .unwrap();
                 assert_eq!(r.status(), StatusCode::OK);
                 assert!(r.json::<serde_json::Value>().await.unwrap()["photos"].is_array());
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -231,7 +267,11 @@ async fn concurrent_uploads_with_listings_stay_correct() {
         .await
         .unwrap();
     let photos = list["photos"].as_array().unwrap();
-    assert_eq!(photos.len(), N, "final listing must contain exactly all uploads");
+    assert_eq!(
+        photos.len(),
+        N,
+        "final listing must contain exactly all uploads"
+    );
     let mut names: Vec<&str> = photos.iter().map(|p| p["name"].as_str().unwrap()).collect();
     names.sort_unstable();
     names.dedup();
@@ -245,7 +285,10 @@ async fn concurrent_downloads_one_file() {
     let body = vec![0xCDu8; 1_000_000];
     let r = put(&client, &srv, "dlkey-000001", "big.jpg", &body).await;
     assert_eq!(r.status(), StatusCode::CREATED);
-    let name: String = r.json::<serde_json::Value>().await.unwrap()["name"].as_str().unwrap().into();
+    let name: String = r.json::<serde_json::Value>().await.unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .into();
     let t0 = Instant::now();
     let mut handles = vec![];
     for _ in 0..64usize {
@@ -274,13 +317,19 @@ async fn concurrent_downloads_one_file() {
         total += h.await.unwrap();
     }
     let el = t0.elapsed();
-    println!("640 GETs (1MB) in {el:.1?} = {:.0} MB/s", 640.0 / el.as_secs_f64());
+    println!(
+        "640 GETs (1MB) in {el:.1?} = {:.0} MB/s",
+        640.0 / el.as_secs_f64()
+    );
     assert_eq!(total, 640);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_read_write_churn() {
-    let srv = Server::boot_with_env(Some("s3cret"), &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")]);
+    let srv = Server::boot_with_env(
+        Some("s3cret"),
+        &[("GALLY_RATE_MAX", "0"), ("GALLY_UPLOAD_SLOTS_PER_IP", "32")],
+    );
     let client = client();
     // unlock admin
     let r = client
@@ -290,7 +339,13 @@ async fn mixed_read_write_churn() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let cookie = r.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
     // writers target one pre-minted gallery (scoped auth); deleter shares it.
     let churn_slug: String = client
         .post(srv.url("/api/galleries/resolve"))
@@ -390,10 +445,19 @@ async fn edge_cases() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE, "got {}", r.status());
+    assert_eq!(
+        r.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "got {}",
+        r.status()
+    );
     // dotfile + traversal: rejected, never serves files (404, redirect home,
     // or the landing page after a redirect is followed — all without content)
-    for p in ["/photos/.hidden", "/photos/a%2Fb", "/photos/%2e%2e/server.py"] {
+    for p in [
+        "/photos/.hidden",
+        "/photos/a%2Fb",
+        "/photos/%2e%2e/server.py",
+    ] {
         let r = client.get(srv.url(p)).send().await.unwrap();
         let body = r.bytes().await.unwrap();
         let needle = b"fn put_photo";
@@ -401,9 +465,17 @@ async fn edge_cases() {
         assert!(body.len() < 1024 * 1024, "{p}");
     }
     // unknown gallery slug shape vs missing
-    let r = client.get(srv.url("/api/galleries/nope-slug-calm-1a2b/photos")).send().await.unwrap();
+    let r = client
+        .get(srv.url("/api/galleries/nope-slug-calm-1a2b/photos"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
-    let r = client.get(srv.url("/no-such-gallery-calm-1a2b")).send().await.unwrap();
+    let r = client
+        .get(srv.url("/no-such-gallery-calm-1a2b"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.url().path(), "/");
     // delete nonexistent
     let r = client
@@ -426,7 +498,11 @@ async fn edge_cases() {
             .unwrap();
         last = r.status();
     }
-    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS, "rate limiter never tripped");
+    assert_eq!(
+        last,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate limiter never tripped"
+    );
     println!("edge cases all correct");
 }
 
@@ -437,12 +513,17 @@ async fn large_directory_degradation() {
     // seed 2000 files directly (bypass HTTP for speed)
     let dir = srv._tmp.path().join("photos");
     for i in 0..2000 {
-        tokio::fs::write(dir.join(format!("seed_{i:05}.jpg")), [1u8; 100]).await.unwrap();
+        tokio::fs::write(dir.join(format!("seed_{i:05}.jpg")), [1u8; 100])
+            .await
+            .unwrap();
     }
     let t0 = std::time::Instant::now();
     let r = put(&client, &srv, "bigdir-000001", "one.jpg", &[2u8; 1000]).await;
     assert_eq!(r.status(), StatusCode::CREATED);
-    let slug: String = r.json::<serde_json::Value>().await.unwrap()["slug"].as_str().unwrap().into();
+    let slug: String = r.json::<serde_json::Value>().await.unwrap()["slug"]
+        .as_str()
+        .unwrap()
+        .into();
     // listing with 2001 files must still respond quickly (<2s) and contain ours
     let t1 = std::time::Instant::now();
     let list: serde_json::Value = client
@@ -455,7 +536,13 @@ async fn large_directory_degradation() {
         .await
         .unwrap();
     let dt = t1.elapsed();
-    assert!(list["photos"].as_array().unwrap().iter().any(|p| p["name"].as_str().unwrap().ends_with("one.jpg")));
+    assert!(
+        list["photos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"].as_str().unwrap().ends_with("one.jpg"))
+    );
     println!("2000-file listing in {dt:.1?} (total setup+up {t0:?})");
     assert!(dt < Duration::from_secs(2), "listing too slow: {dt:?}");
 }

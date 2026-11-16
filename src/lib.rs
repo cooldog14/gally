@@ -1,8 +1,9 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 
@@ -18,23 +19,34 @@ pub use state::AppState;
 fn is_noisy(path: &str) -> bool {
     matches!(
         path,
-        "/" | "/index.html" | "/app.js" | "/vendor-heic2any.min.js" | "/styles.css"
+        "/" | "/index.html"
+            | "/app.js"
+            | "/vendor-heic2any.min.js"
+            | "/styles.css"
+            | "/healthz"
+            | "/metrics"
     ) || path.starts_with("/fonts/")
         || path.starts_with("/photos/")
 }
 
 /// Log every request with its client IP and latency, and stamp the security
 /// headers that do not depend on the body.
-async fn log_requests(req: Request, next: Next) -> Response {
+async fn log_requests(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    let ip = req
+    // Same resolution as the handlers: GALLY_TRUST_PROXY lets a trusted
+    // reverse proxy's X-Forwarded-For stand in for the peer address here too.
+    let info = req
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "-".to_string());
+        .map(|c| ConnectInfo(c.0));
+    let ip = routes::client_ip(req.headers(), info).to_string();
     let t0 = Instant::now();
     let mut resp = next.run(req).await;
+    if resp.status().is_server_error() {
+        state.responses_5xx_total.fetch_add(1, Ordering::Relaxed);
+    }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     // Media and statics dominate the log; uploads/navigation stay at info.
     if method == axum::http::Method::GET && is_noisy(&path) {
@@ -57,6 +69,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, post, put};
     use routes::*;
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/api/galleries/{slug}/photos", get(gallery_photos))
         .route("/api/galleries/{slug}", delete(delete_own_gallery))
         .route("/api/galleries/{slug}/visibility", post(set_visibility))
@@ -65,6 +79,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/admin/logout", post(admin_logout))
         .route("/api/photos/{*name}", put(put_photo))
         .route("/api/photos/{*name}", delete(delete_photo))
+        .route("/photos/thumb/{*name}", get(get_thumb))
         .route("/photos/{*name}", get(get_photo))
         .route("/api/galleries/resolve", post(resolve_gallery))
         .route("/api/admin/unlock", post(admin_unlock))
@@ -82,6 +97,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(static_path))
         .route("/{slug}", get(spa_or_404))
         .fallback(fallback_404)
-        .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn_with_state(state.clone(), log_requests))
         .with_state(state)
 }

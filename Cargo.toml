@@ -9,6 +9,9 @@ argon2 = "0.5"
 libc = "0.2"
 axum = "0.8.9"
 futures = "0.3.34"
+hmac = "0.13"
+image = "0.25"
+ipnet = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

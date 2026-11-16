@@ -18,13 +18,76 @@ pub static ADJ: &[&str] = &[
     "velvet", "verdant", "wheat", "willow", "wispy",
 ];
 pub static NOUN: &[&str] = &[
-    "acorn", "anchor", "arrow", "aspen", "badger", "basin", "beacon", "beaver", "brook", "burrow",
-    "cabin", "canyon", "cavern", "cliff", "cove", "crane", "creek", "dune", "eagle", "elm",
-    "falcon", "fern", "finch", "fjord", "fox", "garnet", "glade", "grove", "gull", "heron",
-    "hill", "hollow", "inlet", "island", "jay", "kelp", "lagoon", "lark", "lichen", "lotus",
-    "meadowlark", "mesa", "moth", "newt", "oasis", "otter", "owl", "oxbow", "peak", "pond",
-    "poplar", "prairie", "quail", "raven", "reef", "ridge", "river", "robin", "sedge", "sparrow",
-    "stone", "stork", "summit", "tern", "thrush", "trail", "trout", "tundra", "valley", "vole",
+    "acorn",
+    "anchor",
+    "arrow",
+    "aspen",
+    "badger",
+    "basin",
+    "beacon",
+    "beaver",
+    "brook",
+    "burrow",
+    "cabin",
+    "canyon",
+    "cavern",
+    "cliff",
+    "cove",
+    "crane",
+    "creek",
+    "dune",
+    "eagle",
+    "elm",
+    "falcon",
+    "fern",
+    "finch",
+    "fjord",
+    "fox",
+    "garnet",
+    "glade",
+    "grove",
+    "gull",
+    "heron",
+    "hill",
+    "hollow",
+    "inlet",
+    "island",
+    "jay",
+    "kelp",
+    "lagoon",
+    "lark",
+    "lichen",
+    "lotus",
+    "meadowlark",
+    "mesa",
+    "moth",
+    "newt",
+    "oasis",
+    "otter",
+    "owl",
+    "oxbow",
+    "peak",
+    "pond",
+    "poplar",
+    "prairie",
+    "quail",
+    "raven",
+    "reef",
+    "ridge",
+    "river",
+    "robin",
+    "sedge",
+    "sparrow",
+    "stone",
+    "stork",
+    "summit",
+    "tern",
+    "thrush",
+    "trail",
+    "trout",
+    "tundra",
+    "valley",
+    "vole",
     "wren",
 ];
 
@@ -74,7 +137,13 @@ pub fn photo_slug(name: &str) -> Option<&str> {
 }
 
 pub fn sanitize_filename(raw: &str) -> (String, String) {
-    let base0 = raw.rsplit('/').next().unwrap_or(raw).rsplit('\\').next().unwrap_or(raw);
+    let base0 = raw
+        .rsplit('/')
+        .next()
+        .unwrap_or(raw)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(raw);
     let mut base: String = base0
         .chars()
         .map(|c| {
@@ -128,12 +197,13 @@ pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let mut o = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                o.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            o.push(h * 16 + l);
+            i += 3;
+            continue;
         }
         o.push(b[i]);
         i += 1;
@@ -174,7 +244,10 @@ pub fn gen_slug(db: &rusqlite::Connection) -> String {
             return s;
         }
     }
-    format!("oddball-slug-extra-{:08x}", uuid::Uuid::new_v4().as_u128() as u32)
+    format!(
+        "oddball-slug-extra-{:08x}",
+        uuid::Uuid::new_v4().as_u128() as u32
+    )
 }
 
 #[cfg(test)]
@@ -229,7 +302,10 @@ mod tests {
         assert!(normalize_key(&"k".repeat(12)).is_some());
         assert!(normalize_key(&"k".repeat(128)).is_some());
         assert!(normalize_key(&"k".repeat(129)).is_none());
-        assert_eq!(normalize_key("  a-long-secret-key  "), Some("a-long-secret-key".to_string()));
+        assert_eq!(
+            normalize_key("  a-long-secret-key  "),
+            Some("a-long-secret-key".to_string())
+        );
     }
 
     #[test]
@@ -255,10 +331,16 @@ mod tests {
         assert!(photo_slug("nope.jpg").is_none());
         let h = "z".repeat(32); // not hex
         assert!(photo_slug(&format!("velvet-lagoon-quiet-river-1a2b_{}_x.jpg", h)).is_none());
-        assert!(photo_slug("Happy-otter-calm-pond-1a2b_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        assert!(
+            photo_slug("Happy-otter-calm-pond-1a2b_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg")
+                .is_none()
+        );
         // Old short galleries no longer resolve.
         assert!(photo_slug("happy-otter-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
-        assert!(photo_slug("happy-otter-calm-pond-123_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        assert!(
+            photo_slug("happy-otter-calm-pond-123_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg")
+                .is_none()
+        );
     }
 
     #[test]
@@ -271,5 +353,5 @@ mod tests {
         .unwrap();
         let s = gen_slug(&db);
         assert!(is_slug(&s), "generated slug should validate: {s}");
-}
+    }
 }

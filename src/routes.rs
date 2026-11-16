@@ -2,11 +2,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -14,8 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::db::{GalleryDb, GalleryMeta};
 use crate::state::{
-    is_admin, pass_fail_exceeded, pass_fail_record, rate_limited, read_limited, AppState,
-    MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL,
+    AppState, MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL, is_admin, pass_fail_exceeded,
+    pass_fail_record, rate_limited, read_limited,
 };
 use crate::validate::{
     is_slug, normalize_key, percent_decode_bytes, photo_slug, sanitize_filename,
@@ -62,40 +62,42 @@ fn media_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str, kind: Medi
     let Some(tok) = crate::state::cookie_value(headers, &media_cookie(slug, kind)) else {
         return false;
     };
-    let mut tokens = state.media_tokens.lock().unwrap();
-    match tokens.get(tok) {
-        // Live, this gallery, this kind: never another slug's or a viewer's.
-        Some((s, at, k)) if s == slug && *k == kind && at.elapsed() < OWNER_TOKEN_TTL => true,
-        // Expired: drop it so the map never grows.
-        Some((_, at, _)) if at.elapsed() >= OWNER_TOKEN_TTL => {
-            tokens.remove(tok);
-            false
-        }
-        _ => false,
-    }
+    let version = match kind {
+        // Owner cookies are not revocable per gallery: only the key mints them.
+        MediaToken::Owner => 0,
+        MediaToken::Viewer => match state.db.lock().unwrap().gallery_token_version(slug) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    crate::state::media_token_ok(&state.media_secret, tok, slug, kind, version)
 }
 
 /// Mint a media cookie for `slug` (for `<img>`/`<video>`, which cannot send
 /// the key or password header). Returns the full `Set-Cookie` value.
-fn issue_media_token(state: &AppState, slug: &str, kind: MediaToken) -> String {
-    let tok = uuid::Uuid::new_v4().as_simple().to_string()
-        + &uuid::Uuid::new_v4().as_simple().to_string();
-    {
-        let mut tokens = state.media_tokens.lock().unwrap();
-        if tokens.len() >= 10_000 {
-            tokens.retain(|_, (_, at, _)| at.elapsed() < OWNER_TOKEN_TTL);
-        }
-        tokens.insert(tok.clone(), (slug.to_string(), Instant::now(), kind));
-    }
-    // No `Secure`: plain HTTP server, browsers would drop the cookie.
+fn issue_media_token(state: &AppState, slug: &str, kind: MediaToken, version: i64) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + OWNER_TOKEN_TTL.as_secs();
+    let tok = crate::state::media_token(&state.media_secret, slug, kind, version, exp);
+    // `Secure` only when the operator says the front end is HTTPS.
+    let secure = if state.limits.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
     format!(
-        "{}={tok}; HttpOnly; SameSite=Lax; Path=/photos/; Max-Age={}",
+        "{}={tok}; HttpOnly; SameSite=Lax; Path=/photos/; Max-Age={}{secure}",
         media_cookie(slug, kind),
         OWNER_TOKEN_TTL.as_secs()
     )
 }
 
 /// Bounded, timeout-guarded JSON body read.
+// Response is the cold error path; boxing it would only add an allocation.
+#[allow(clippy::result_large_err)]
 async fn read_body(body: Body, limit: usize) -> Result<axum::body::Bytes, Response> {
     match tokio::time::timeout(Duration::from_secs(10), axum::body::to_bytes(body, limit)).await {
         Ok(Ok(b)) => Ok(b),
@@ -159,10 +161,12 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| {
-            let t = t.trim();
-            t == "*" || t == etag
-        }))
+        .is_some_and(|v| {
+            v.split(',').any(|t| {
+                let t = t.trim();
+                t == "*" || t == etag
+            })
+        })
 }
 
 /// OGG is a container: sniff the first content packet for the codec.
@@ -214,6 +218,73 @@ fn content_type_for(ext: &str) -> &'static str {
     }
 }
 
+/// Preview edge and JPEG quality (one small file per photo).
+const THUMB_EDGE: u32 = 400;
+const THUMB_QUALITY: u8 = 80;
+/// Decompression-bomb guard: refuse absurd dimensions before decoding.
+const THUMB_MAX_PIXELS: u64 = 50_000_000;
+const THUMB_MAX_SIDE: u32 = 16_384;
+
+fn thumb_supported(ext: &str) -> bool {
+    matches!(
+        ext,
+        ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".tiff" | ".ico"
+    )
+}
+
+/// Write `<photos>/.thumbs/<name>.jpg`, best effort. Old photos may have no
+/// thumb: the client falls back to the original. Add a backfill CLI only if
+/// existing libraries need previews.
+async fn write_thumb(state: &AppState, src: &std::path::Path, name: &str) {
+    let dir = state.dir.join(".thumbs");
+    let dest = dir.join(format!("{name}.jpg"));
+    // Write-then-rename: a concurrent GET must never see a half-written JPEG
+    // (a public gallery would cache that for a day).
+    let temp = dir.join(format!(".tmp-{}.jpg", uuid::Uuid::new_v4().as_simple()));
+    let src = src.to_path_buf();
+    // Two decodes at a time: even a small result needs the source bitmap
+    // (width*height*4 bytes) in memory while it is resized.
+    let _permit = state.thumbs.acquire().await.ok();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let out = (|| {
+            let (w, h) = image::ImageReader::open(&src)?
+                .with_guessed_format()?
+                .into_dimensions()?;
+            if w > THUMB_MAX_SIDE
+                || h > THUMB_MAX_SIDE
+                || u64::from(w) * u64::from(h) > THUMB_MAX_PIXELS
+            {
+                anyhow::bail!("image too large");
+            }
+            let img = image::ImageReader::open(&src)?
+                .with_guessed_format()?
+                .decode()?;
+            let thumb = img.thumbnail(THUMB_EDGE, THUMB_EDGE);
+            if let Some(dir) = dest.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::File::create(&temp)?;
+            thumb.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                file,
+                THUMB_QUALITY,
+            ))?;
+            std::fs::rename(&temp, &dest)?;
+            Ok(())
+        })();
+        // Derived file: no fsync, but never leave a partial temp behind.
+        if out.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        out
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(thumb = name, error = %e, "thumbnail skipped"),
+        Err(e) => tracing::debug!(thumb = name, error = %e, "thumbnail task failed"),
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     Unauthorized,
@@ -244,27 +315,150 @@ fn err(status: StatusCode, msg: &'static str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
-fn trust_proxy() -> bool {
-    matches!(
-        std::env::var("GALLY_TRUST_PROXY").unwrap_or_default().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes"
+/// Liveness/readiness probe: DB reachable, photos dir readable, and free
+/// space above `GALLY_MIN_FREE_BYTES` (0 = ignore).
+pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    let db_ok = {
+        let db = state.db.lock().unwrap();
+        db.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok()
+    };
+    let dir_ok = tokio::fs::read_dir(&state.dir).await.is_ok();
+    let free = free_bytes(&state.dir);
+    let free_ok = state.limits.min_free == 0 || free.is_some_and(|f| f >= state.limits.min_free);
+    let ok = db_ok && dir_ok && free_ok;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({ "ok": ok, "free_bytes": free.unwrap_or(0) })),
     )
+        .into_response()
 }
 
-fn client_ip(headers: &HeaderMap, info: Option<ConnectInfo<std::net::SocketAddr>>) -> IpAddr {
+/// Prometheus scrape. Loopback only (honours `GALLY_TRUST_PROXY`, so a
+/// trusted reverse proxy can resolve the real client IP): never public.
+pub async fn metrics(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    let local = ip.is_loopback() || metrics_direct_peer(addr.ip(), &headers, &TRUSTED_PROXIES);
+    if !local {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    let (galleries, photos, bytes) = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(photos),0), COALESCE(SUM(bytes),0) FROM galleries",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap_or((0, 0, 0))
+    };
+    let load = std::sync::atomic::Ordering::Relaxed;
+    let body = format!(
+        "# TYPE gally_uptime_seconds gauge\n\
+         gally_uptime_seconds {}\n\
+         # TYPE gally_free_bytes gauge\n\
+         gally_free_bytes {}\n\
+         # TYPE gally_galleries gauge\n\
+         gally_galleries {galleries}\n\
+         # TYPE gally_photos gauge\n\
+         gally_photos {photos}\n\
+         # TYPE gally_bytes gauge\n\
+         gally_bytes {bytes}\n\
+         # TYPE gally_requests_total counter\n\
+         gally_requests_total {}\n\
+         # TYPE gally_responses_5xx_total counter\n\
+         gally_responses_5xx_total {}\n\
+         # TYPE gally_uploads_total counter\n\
+         gally_uploads_total {}\n\
+         # TYPE gally_upload_bytes_total counter\n\
+         gally_upload_bytes_total {}\n",
+        state.started.elapsed().as_secs(),
+        free_bytes(&state.dir).unwrap_or(0),
+        state.requests_total.load(load),
+        state.responses_5xx_total.load(load),
+        state.uploads_total.load(load),
+        state.upload_bytes_total.load(load),
+    );
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// `GALLY_TRUST_PROXY`: comma-separated IPs/CIDRs allowed to set
+/// `X-Forwarded-For`. `1/true/yes` keeps the old meaning: loopback only.
+/// Parsed once; changing it needs a restart.
+static TRUSTED_PROXIES: std::sync::LazyLock<Vec<ipnet::IpNet>> = std::sync::LazyLock::new(|| {
+    let raw = std::env::var("GALLY_TRUST_PROXY").unwrap_or_default();
+    parse_trust_proxy(&raw)
+});
+
+fn parse_trust_proxy(raw: &str) -> Vec<ipnet::IpNet> {
+    let mut nets = Vec::new();
+    for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if matches!(token.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+            nets.push("127.0.0.0/8".parse().expect("valid loopback net"));
+            nets.push("::1/128".parse().expect("valid loopback net"));
+        } else if let Ok(net) = token.parse::<ipnet::IpNet>() {
+            nets.push(net);
+        } else if let Ok(addr) = token.parse::<IpAddr>() {
+            nets.push(ipnet::IpNet::from(addr));
+        } else {
+            tracing::warn!(value = token, "GALLY_TRUST_PROXY: ignoring invalid IP/CIDR");
+        }
+    }
+    nets
+}
+
+/// A direct (not proxied) connection from a trusted peer is local for
+/// `/metrics`: in a container the host reaches the app through the Docker
+/// bridge gateway, not loopback. A forwarded request is only local if the
+/// resolved client is loopback, so public `/metrics` stays 404.
+fn metrics_direct_peer(peer: IpAddr, headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> bool {
+    !headers.contains_key("x-forwarded-for") && trusted.iter().any(|net| net.contains(&peer))
+}
+
+pub(crate) fn client_ip(
+    headers: &HeaderMap,
+    info: Option<ConnectInfo<std::net::SocketAddr>>,
+) -> IpAddr {
+    client_ip_from(headers, info, &TRUSTED_PROXIES)
+}
+
+fn client_ip_from(
+    headers: &HeaderMap,
+    info: Option<ConnectInfo<std::net::SocketAddr>>,
+    trusted: &[ipnet::IpNet],
+) -> IpAddr {
     // Never trust X-Forwarded-For by default: any client can spoof it and
     // dodge the rate limit. Only the real connection address counts, unless
-    // GALLY_TRUST_PROXY is set and the peer is loopback (local reverse
-    // proxy): then the rightmost XFF entry (closest proxy hop) is used.
+    // the peer is in GALLY_TRUST_PROXY (a reverse proxy, local or remote):
+    // then the rightmost XFF entry (closest proxy hop) is used.
     let peer = info.map(|c| c.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    if trust_proxy() && peer.is_loopback() {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(last) = xff.rsplit(',').next().map(str::trim) {
-                if let Ok(ip) = last.parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
+    if trusted.iter().any(|net| net.contains(&peer))
+        && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(last) = xff.rsplit(',').next().map(str::trim)
+        && let Ok(ip) = last.parse::<IpAddr>()
+    {
+        return ip;
     }
     peer
 }
@@ -278,6 +472,8 @@ fn request_key(headers: &HeaderMap) -> Option<String> {
 
 /// Target gallery for uploads. Absent on home (= mint a fresh gallery).
 /// Present-but-invalid is a client bug: reject, never silently mint.
+// Same as read_body: the error response is a cold path.
+#[allow(clippy::result_large_err)]
 fn request_slug(headers: &HeaderMap) -> Result<Option<String>, Response> {
     let raw = headers.get("x-gallery-slug").and_then(|v| v.to_str().ok());
     match raw {
@@ -313,6 +509,23 @@ fn request_pass(headers: &HeaderMap, query: &str) -> String {
     String::new()
 }
 
+/// First `name=` value in a raw query string, percent-decoded.
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (k, v) = part.split_once('=')?;
+        (k == name)
+            .then(|| String::from_utf8(percent_decode_bytes(v)).ok())
+            .flatten()
+    })
+}
+
+/// Listing cursor: `<created_ms>:<name>` (split at the first colon).
+fn parse_cursor(s: &str) -> Option<(i64, String)> {
+    let (created, name) = s.split_once(':')?;
+    let created = created.parse::<i64>().ok()?;
+    (!name.is_empty()).then(|| (created, name.to_string()))
+}
+
 /// Cache key for a verified (stored hash, supplied password) pair: changing
 /// the gallery password changes the hash, so old entries miss.
 fn pass_cache_key(hash: &[u8], pass: &str) -> Vec<u8> {
@@ -336,12 +549,7 @@ enum Locked {
 }
 
 /// Slow Argon2 work runs on the blocking pool: never stall the runtime.
-async fn check_locked(
-    state: &AppState,
-    ip: IpAddr,
-    slug: &str,
-    pass: &str,
-) -> Locked {
+async fn check_locked(state: &AppState, ip: IpAddr, slug: &str, pass: &str) -> Locked {
     let stored = {
         let db = state.db.lock().unwrap();
         db.gallery_pass_hash(slug)
@@ -352,10 +560,10 @@ async fn check_locked(
     // The gallery key always opens its own gallery (owner bypass).
     if !pass.is_empty() {
         let key = pass_cache_key(&hash, pass);
-        if let Some(at) = state.pass_ok.lock().unwrap().get(&key) {
-            if at.elapsed() < PASS_CACHE_TTL {
-                return Locked::Unlocked;
-            }
+        if let Some(at) = state.pass_ok.lock().unwrap().get(&key)
+            && at.elapsed() < PASS_CACHE_TTL
+        {
+            return Locked::Unlocked;
         }
         if pass_fail_exceeded(state, &ip) {
             return Locked::Denied(
@@ -431,7 +639,10 @@ pub async fn gallery_photos(
         let db = state.db.lock().unwrap();
         db.gallery_meta(&slug)
     };
-    tracing::debug!(stage = "list_db_check", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
+    tracing::debug!(
+        stage = "list_db_check",
+        latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0)
+    );
     let Some(meta) = meta else {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     };
@@ -454,6 +665,18 @@ pub async fn gallery_photos(
         }
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
+    let query = raw.unwrap_or_default();
+    let limit = query_param(&query, "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500)
+        .clamp(1, 1000);
+    let before = match query_param(&query, "before") {
+        None => None,
+        Some(c) => match parse_cursor(&c) {
+            Some(b) => Some(b),
+            None => return err(StatusCode::BAD_REQUEST, "bad cursor"),
+        },
+    };
     // Viewer lock: owner bypasses; a live viewer cookie for THIS gallery is
     // the password, already proven (no Argon2, no URL secret). A wrong key
     // with no pass was not counted yet, so count it once on denial
@@ -462,7 +685,6 @@ pub async fn gallery_photos(
     if !owner {
         let viewer = media_cookie_ok(&headers, &state, &slug, MediaToken::Viewer);
         if !viewer {
-            let query = raw.unwrap_or_default();
             let pass = request_pass(&headers, &query);
             match check_locked(&state, ip, &slug, &pass).await {
                 Locked::Open => {}
@@ -477,44 +699,77 @@ pub async fn gallery_photos(
         }
     }
     let t_scan = Instant::now();
-    let result = photo_entries(&state, &slug).await;
-    tracing::debug!(stage = "list_dir_scan", latency_ms = format!("{:.2}", t_scan.elapsed().as_secs_f64() * 1000.0));
-    match result {
-        Ok(photos) => {
-            let count = photos.len();
-            tracing::debug!(stage = "list_total", count = count, latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+    // One query for the page plus the lock/cookie state.
+    let (page, locked, version) = {
+        let db = state.db.lock().unwrap();
+        (
+            db.photos_page(&slug, before, limit),
             // The owner's Protect dialog needs this: an unauthenticated probe
             // cannot see the lock on a private gallery (it gets 404 first).
-            let locked = {
-                let db = state.db.lock().unwrap();
-                db.gallery_pass_hash(&slug).is_some()
-            };
-            let body = Json(json!({ "slug": slug, "public": meta.public, "locked": locked, "photos": photos }));
-            // Listings are dynamic + reveal lock state: never cache.
-            // <img> tags cannot send a header: the owner's page needs the
-            // owner media cookie, a fresh unlock needs the viewer one.
-            let mut resp = (
-                StatusCode::OK,
-                [(header::CACHE_CONTROL, "private, no-store")],
-                body,
-            )
-                .into_response();
-            let cookie = if key_ok {
-                Some(issue_media_token(&state, &slug, MediaToken::Owner))
-            } else if unlocked {
-                Some(issue_media_token(&state, &slug, MediaToken::Viewer))
-            } else {
-                None
-            };
-            if let Some(cookie) = cookie {
-                if let Ok(v) = HeaderValue::from_str(&cookie) {
-                    resp.headers_mut().append(header::SET_COOKIE, v);
-                }
-            }
-            resp
-        }
-        Err(_) => ApiError::Internal.into_response(),
+            db.gallery_pass_hash(&slug).is_some(),
+            db.gallery_token_version(&slug).unwrap_or(0),
+        )
+    };
+    // A DB failure must not masquerade as an empty gallery.
+    let rows = match page {
+        Ok(rows) => rows,
+        Err(_) => return ApiError::Internal.into_response(),
+    };
+    tracing::debug!(
+        stage = "list_db_page",
+        count = rows.len(),
+        latency_ms = format!("{:.2}", t_scan.elapsed().as_secs_f64() * 1000.0)
+    );
+    // A full page means more may follow: the last row is the next cursor.
+    let next = if rows.len() == limit {
+        rows.last()
+            .map(|(created, name)| format!("{created}:{name}"))
+    } else {
+        None
+    };
+    let photos: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(_, name)| json!({ "name": name }))
+        .collect();
+    tracing::debug!(
+        stage = "list_total",
+        count = photos.len(),
+        latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0)
+    );
+    let body = Json(json!({
+        "slug": slug,
+        "public": meta.public,
+        "locked": locked,
+        "photos": photos,
+        "next": next,
+    }));
+    // Listings are dynamic + reveal lock state: never cache.
+    // <img> tags cannot send a header: the owner's page needs the
+    // owner media cookie, a fresh unlock needs the viewer one.
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "private, no-store")],
+        body,
+    )
+        .into_response();
+    let cookie = if key_ok {
+        Some(issue_media_token(&state, &slug, MediaToken::Owner, 0))
+    } else if unlocked {
+        Some(issue_media_token(
+            &state,
+            &slug,
+            MediaToken::Viewer,
+            version,
+        ))
+    } else {
+        None
+    };
+    if let Some(cookie) = cookie
+        && let Ok(v) = HeaderValue::from_str(&cookie)
+    {
+        resp.headers_mut().append(header::SET_COOKIE, v);
     }
+    resp
 }
 
 #[derive(Deserialize)]
@@ -566,29 +821,11 @@ pub async fn set_visibility(
     if !ok {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    (StatusCode::OK, Json(json!({ "slug": slug, "public": public }))).into_response()
-}
-
-async fn photo_entries(
-    state: &AppState,
-    slug: &str,
-) -> std::io::Result<Vec<serde_json::Value>> {
-    let prefix = format!("{slug}_");
-    let mut out: Vec<(std::time::SystemTime, String)> = Vec::new();
-    let mut rd = tokio::fs::read_dir(&state.dir).await?;
-    while let Some(ent) = rd.next_entry().await? {
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !name.starts_with(&prefix) {
-            continue;
-        }
-        let Ok(md) = ent.metadata().await else { continue; };
-        if !md.is_file() {
-            continue;
-        }
-        out.push((md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), name));
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(out.into_iter().map(|(_, n)| json!({ "name": n })).collect())
+    (
+        StatusCode::OK,
+        Json(json!({ "slug": slug, "public": public })),
+    )
+        .into_response()
 }
 
 // --- admin ---
@@ -600,7 +837,9 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
     // Counters come from the DB: a directory scan costs O(files).
     let rows: Vec<(String, i64, i64, i64, i64)> = {
         let db = state.db.lock().unwrap();
-        match db.prepare("SELECT slug, created, photos, bytes, public FROM galleries ORDER BY created DESC") {
+        match db.prepare(
+            "SELECT slug, created, photos, bytes, public FROM galleries ORDER BY created DESC",
+        ) {
             Ok(mut stmt) => stmt
                 .query_map([], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -691,9 +930,14 @@ pub async fn admin_unlock(
         tokens.retain(|_, issued| issued.elapsed() < crate::state::ADMIN_TOKEN_TTL);
         tokens.insert(tok.clone(), std::time::Instant::now());
     }
-    // No `Secure`: the server is plain HTTP, so browsers would refuse to
-    // store (and never return) a Secure cookie, silently breaking login.
-    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400");
+    // `Secure` only when the operator serves the site over HTTPS; on plain
+    // HTTP browsers would drop the cookie and break login.
+    let secure = if state.limits.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!("admin={tok}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400{secure}");
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
@@ -816,7 +1060,9 @@ pub async fn static_path(
     let resp = Response::builder()
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::ETAG, etag);
-    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
         == Some(etag.as_str())
     {
         return resp
@@ -844,17 +1090,15 @@ pub async fn spa_or_404(
     if !known {
         // Unknown, deleted, or legacy slug: send the user home.
         tracing::debug!(stage = "spa_gone", slug = slug.as_str());
-        return (
-            StatusCode::FOUND,
-            [(header::LOCATION, "/")],
-            "",
-        )
-            .into_response();
+        return (StatusCode::FOUND, [(header::LOCATION, "/")], "").into_response();
     }
     match state.statics.get("/index.html") {
         Some((bytes, ctype, _)) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, *ctype), (header::CACHE_CONTROL, "no-cache")],
+            [
+                (header::CONTENT_TYPE, *ctype),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             Body::from(*bytes),
         )
             .into_response(),
@@ -862,36 +1106,67 @@ pub async fn spa_or_404(
     }
 }
 
-/// Delete every file belonging to `slug`. Returns
+/// Remove `prefix*` files directly under `dir`; a missing dir is empty.
+async fn sweep_dir(dir: &std::path::Path, prefix: &str) -> (usize, usize) {
+    let mut removed = 0;
+    let mut failed = 0;
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut rd) => loop {
+            match rd.next_entry().await {
+                Ok(Some(ent)) => {
+                    if !ent.file_name().to_string_lossy().starts_with(prefix) {
+                        continue;
+                    }
+                    if tokio::fs::remove_file(ent.path()).await.is_ok() {
+                        removed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failed += 1;
+                    break;
+                }
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => failed += 1,
+    }
+    (removed, failed)
+}
+
+/// Any `prefix*` file left under `dir`? A missing dir has none.
+async fn has_prefixed(dir: &std::path::Path, prefix: &str) -> bool {
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut rd) => loop {
+            match rd.next_entry().await {
+                Ok(Some(ent)) => {
+                    if ent.file_name().to_string_lossy().starts_with(prefix) {
+                        return true;
+                    }
+                }
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Delete every file belonging to `slug`, originals and thumbs. Returns
 /// (removed, failed, still_remaining).
 async fn sweep_files(state: &AppState, slug: &str) -> (usize, usize, bool) {
     let prefix = format!("{slug}_");
-    let mut removed: usize = 0;
-    let mut failed: usize = 0;
-    if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            if tokio::fs::remove_file(ent.path()).await.is_ok() {
-                removed += 1;
-            } else {
-                failed += 1;
-            }
-        }
-    }
+    let thumbs = state.dir.join(".thumbs");
+    let (mut removed, mut failed) = sweep_dir(&state.dir, &prefix).await;
+    let (thumb_removed, thumb_failed) = sweep_dir(&thumbs, &prefix).await;
+    removed += thumb_removed;
+    failed += thumb_failed;
     // A concurrent upload may land mid-sweep: re-scan, never claim success
-    // while files remain.
-    let mut remaining = false;
-    if let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await {
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            if ent.file_name().to_string_lossy().starts_with(&prefix) {
-                remaining = true;
-                break;
-            }
-        }
-    }
+    // while files remain. A scan error means we cannot prove the dirs are clean.
+    let remaining = has_prefixed(&state.dir, &prefix).await || has_prefixed(&thumbs, &prefix).await;
     (removed, failed, remaining)
 }
 
@@ -906,6 +1181,11 @@ pub async fn remove_gallery(
     }
     if !is_slug(&slug) {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
+    }
+    // Preflight before touching the row: if the dir cannot be read the files
+    // cannot be swept, so keep both the row and its files untouched.
+    if tokio::fs::read_dir(&state.dir).await.is_err() {
+        return ApiError::Internal.into_response();
     }
     let ok = {
         let mut db = state.db.lock().unwrap();
@@ -922,7 +1202,11 @@ pub async fn remove_gallery(
         )
             .into_response();
     }
-    (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "deleted": slug, "files": removed })),
+    )
+        .into_response()
 }
 
 /// Owner: delete ONE gallery row (and its files). Requires the gallery key.
@@ -955,6 +1239,11 @@ pub async fn delete_own_gallery(
             return err(StatusCode::NOT_FOUND, "not found");
         }
     }
+    // Preflight before touching the row: if the dir cannot be read the files
+    // cannot be swept, so keep both the row and its files untouched.
+    if tokio::fs::read_dir(&state.dir).await.is_err() {
+        return ApiError::Internal.into_response();
+    }
     let ok = {
         let mut db = state.db.lock().unwrap();
         db.remove_gallery(&slug)
@@ -970,7 +1259,54 @@ pub async fn delete_own_gallery(
         )
             .into_response();
     }
-    (StatusCode::OK, Json(json!({ "deleted": slug, "files": removed }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "deleted": slug, "files": removed })),
+    )
+        .into_response()
+}
+
+/// Delete files under `dir` whose gallery is gone. `known` is the snapshot;
+/// each hit is re-checked live so a gallery created after the snapshot keeps
+/// its files. `required` = the directory must exist (photos), while a missing
+/// `.thumbs` on an old install is fine.
+async fn sweep_orphans(
+    state: &AppState,
+    dir: &std::path::Path,
+    known: &std::collections::HashSet<String>,
+    required: bool,
+    deleted: &mut usize,
+    failed: &mut usize,
+) -> Result<(), ()> {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(r) => r,
+        Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(()),
+    };
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(slug) = photo_slug(&name) else {
+            continue;
+        };
+        if known.contains(slug) {
+            continue;
+        }
+        {
+            let db = state.db.lock().unwrap();
+            if db.gallery_exists(slug) {
+                continue;
+            }
+        }
+        if tokio::fs::remove_file(ent.path()).await.is_ok() {
+            *deleted += 1;
+        } else {
+            *failed += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Admin: drop files whose gallery row is gone (e.g. crashes).
@@ -990,36 +1326,29 @@ pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap)
     };
     let mut deleted: usize = 0;
     let mut failed: usize = 0;
-    let mut rd = match tokio::fs::read_dir(&state.dir).await {
-        Ok(r) => r,
-        Err(_) => return ApiError::Internal.into_response(),
-    };
     // The directory listing is a snapshot: an upload mid-stream (.part-) or a
     // gallery created after the query keeps its files, so never delete those.
-    while let Ok(Some(ent)) = rd.next_entry().await {
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(slug) = photo_slug(&name) else { continue };
-        if known.contains(slug) {
-            continue;
-        }
-        // Gallery may have been created after the snapshot above; re-check
-        // before deleting so a fresh gallery's files are never swept.
-        {
-            let db = state.db.lock().unwrap();
-            if db.gallery_exists(slug) {
-                continue;
-            }
-        }
-        if tokio::fs::remove_file(ent.path()).await.is_ok() {
-            deleted += 1;
-        } else {
-            failed += 1;
-        }
+    if sweep_orphans(&state, &state.dir, &known, true, &mut deleted, &mut failed)
+        .await
+        .is_err()
+    {
+        return ApiError::Internal.into_response();
     }
-    (StatusCode::OK, Json(json!({ "deleted": deleted, "failed": failed }))).into_response()
+    // Thumbs mirror their originals; a missing dir on old installs is fine.
+    let _ = sweep_orphans(
+        &state,
+        &state.dir.join(".thumbs"),
+        &known,
+        false,
+        &mut deleted,
+        &mut failed,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(json!({ "deleted": deleted, "failed": failed })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1091,7 +1420,13 @@ pub async fn lock_gallery(
     if !ok {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    (StatusCode::OK, Json(json!({ "slug": slug, "locked": hash.is_some() }))).into_response()
+    // Old unlocks die with the old password: set_gallery_pass bumped
+    // token_version, so every viewer cookie minted before this is invalid.
+    (
+        StatusCode::OK,
+        Json(json!({ "slug": slug, "locked": hash.is_some() })),
+    )
+        .into_response()
 }
 
 // --- PUT upload ---
@@ -1168,7 +1503,10 @@ pub async fn put_photo(
             }
         }
     };
-    tracing::debug!(stage = "db_get_or_create", latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0));
+    tracing::debug!(
+        stage = "db_get_or_create",
+        latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0)
+    );
     // Minted here? Then the row exists only because of this request: drop it
     // again unless a file actually lands.
     let mut mint = target.is_none().then(|| MintGuard {
@@ -1180,7 +1518,11 @@ pub async fn put_photo(
     let limits = state.limits;
     let (used_bytes, used_photos) = {
         let db = state.db.lock().unwrap();
-        let m = db.gallery_meta(&slug).unwrap_or(GalleryMeta { public: false, bytes: 0, photos: 0 });
+        let m = db.gallery_meta(&slug).unwrap_or(GalleryMeta {
+            public: false,
+            bytes: 0,
+            photos: 0,
+        });
         (m.bytes.max(0) as u64, m.photos)
     };
     if limits.gallery_bytes > 0 && used_bytes >= limits.gallery_bytes {
@@ -1196,20 +1538,25 @@ pub async fn put_photo(
         Ok(p) => p,
         Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
     };
-    let _ip_permit = match crate::state::UploadSlotGuard::try_acquire(&state.upload_ips, &ip, limits.upload_slots_per_ip) {
+    let _ip_permit = match crate::state::UploadSlotGuard::try_acquire(
+        &state.upload_ips,
+        &ip,
+        limits.upload_slots_per_ip,
+    ) {
         Some(g) => g,
         None => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
     };
-    if let Some(free) = free_bytes(&state.dir) {
-        if limits.min_free > 0 && free < limits.min_free {
-            return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
-        }
+    if let Some(free) = free_bytes(&state.dir)
+        && limits.min_free > 0
+        && free < limits.min_free
+    {
+        return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
     }
-    let (sanitized, _ext) = sanitize_filename(&raw_name);
+    let (sanitized, ext) = sanitize_filename(&raw_name);
     let t_body = Instant::now();
-    // Stream into a dot-prefixed temp file: `photo_entries` skips dot names,
-    // so a stalled or aborted upload is never listed or served as a photo.
-    // The real name only appears after a successful `rename`.
+    // Stream into a dot-prefixed temp file: dot names are never listed or
+    // served, so a stalled or aborted upload stays invisible. The real name
+    // (and its DB row) only appears after a successful `rename`.
     let uuid = uuid::Uuid::new_v4().as_simple().to_string();
     let temp_path = state.dir.join(format!(".part-{uuid}"));
     let final_name = format!("{slug}_{uuid}_{sanitized}");
@@ -1251,8 +1598,7 @@ pub async fn put_photo(
         total += chunk.len();
         let ok = started.elapsed() <= UPLOAD_DEADLINE
             && total <= limits.max_file
-            && (limits.gallery_bytes == 0
-                || used_bytes + total as u64 <= limits.gallery_bytes);
+            && (limits.gallery_bytes == 0 || used_bytes + total as u64 <= limits.gallery_bytes);
         if !ok {
             drop(out);
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1260,12 +1606,13 @@ pub async fn put_photo(
         }
         if total as u64 >= next_free_check {
             next_free_check = total as u64 + FREE_CHECK_EVERY;
-            if let Some(free) = free_bytes(&state.dir) {
-                if limits.min_free > 0 && free < limits.min_free {
-                    drop(out);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
-                }
+            if let Some(free) = free_bytes(&state.dir)
+                && limits.min_free > 0
+                && free < limits.min_free
+            {
+                drop(out);
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
             }
         }
         if out.write_all(&chunk).await.is_err() {
@@ -1274,8 +1621,19 @@ pub async fn put_photo(
             return ApiError::Internal.into_response();
         }
     }
+    // Durability: the rename below is atomic, but only a synced temp file
+    // survives a crash after the fact.
+    if out.sync_all().await.is_err() {
+        drop(out);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return ApiError::Internal.into_response();
+    }
     drop(out);
-    tracing::debug!(stage = "body_stream", bytes = total, latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0));
+    tracing::debug!(
+        stage = "body_stream",
+        bytes = total,
+        latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0)
+    );
     if total == 0 {
         let _ = tokio::fs::remove_file(&temp_path).await;
         return err(StatusCode::BAD_REQUEST, "empty body");
@@ -1291,7 +1649,7 @@ pub async fn put_photo(
     // concurrent overshoot is corrected by deleting this file again.
     let usage = {
         let mut db = state.db.lock().unwrap();
-        db.add_upload(&slug, total as u64)
+        db.add_upload(&slug, &final_name, total as u64)
     };
     if let Some((bytes, photos)) = usage {
         let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
@@ -1299,7 +1657,7 @@ pub async fn put_photo(
         if over {
             let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
             let mut db = state.db.lock().unwrap();
-            let _ = db.remove_upload(&slug, total as u64);
+            let _ = db.remove_upload(&slug, &final_name, total as u64);
             return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
         }
     } else {
@@ -1307,12 +1665,34 @@ pub async fn put_photo(
         let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
-    tracing::debug!(stage = "put_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+    // Bytes are stored and quota-checked: this gallery now exists for real.
+    // Disarm the rollback before thumbnail work, so a client disconnect during
+    // decoding cannot delete the row (and orphan the file) behind our back.
     if let Some(m) = &mut mint {
         m.keep = true;
     }
-    (StatusCode::CREATED, Json(json!({ "name": final_name, "slug": slug }))).into_response()
+    // Best effort, never fails the upload: the client falls back to the
+    // original when the preview is missing.
+    if thumb_supported(&ext) {
+        write_thumb(&state, &state.dir.join(&final_name), &final_name).await;
+    }
+    tracing::debug!(
+        stage = "put_total",
+        latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0)
+    );
+    state
+        .uploads_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .upload_bytes_total
+        .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+    (
+        StatusCode::CREATED,
+        Json(json!({ "name": final_name, "slug": slug })),
+    )
+        .into_response()
 }
+
 // --- photo serve / delete ---
 
 pub async fn get_photo(
@@ -1322,12 +1702,48 @@ pub async fn get_photo(
     AxumPath(name): AxumPath<String>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
+    serve_photo(state, addr, headers, name, raw, false).await
+}
+
+/// JPEG preview from `<photos>/.thumbs`. The URL is `<stored_name>.jpg`, so
+/// the normal `/photos/` media cookie authorises it. Missing = 404 (the
+/// client then falls back to the original).
+pub async fn get_thumb(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    serve_photo(state, addr, headers, name, raw, true).await
+}
+
+/// Shared photo/thumbnail serving: auth, visibility, lock, rate limit,
+/// caching, ETag and ranges are identical for both.
+async fn serve_photo(
+    state: Arc<AppState>,
+    addr: std::net::SocketAddr,
+    headers: HeaderMap,
+    name: String,
+    raw: Option<String>,
+    thumb: bool,
+) -> Response {
     let t_total = Instant::now();
     // Orphaned files stay on disk but are unreachable: reject names
     // outside a known gallery before touching the filesystem.
-    let slug = match photo_slug(&name) {
-        Some(s) => s.to_string(),
-        None => return err(StatusCode::NOT_FOUND, "not found"),
+    let slug = if thumb {
+        let Some(stored) = name.strip_suffix(".jpg") else {
+            return err(StatusCode::NOT_FOUND, "not found");
+        };
+        match photo_slug(stored) {
+            Some(s) => s.to_string(),
+            None => return err(StatusCode::NOT_FOUND, "not found"),
+        }
+    } else {
+        match photo_slug(&name) {
+            Some(s) => s.to_string(),
+            None => return err(StatusCode::NOT_FOUND, "not found"),
+        }
     };
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
     if read_limited(&state, &ip) {
@@ -1356,10 +1772,8 @@ pub async fn get_photo(
     // A supplied-but-wrong key on a private gallery is a guess: throttle it
     // before the 404, like the private listing, so private photos cannot be
     // probed at read-limit speed. No key (public probing) burns nothing.
-    if !meta.public && !owner && key.is_some() {
-        if pass_fail_record(&state, &ip) {
-            return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
-        }
+    if !meta.public && !owner && key.is_some() && pass_fail_record(&state, &ip) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
     }
     // Private gallery: photos are invisible without the key or its cookie.
     if !meta.public && !owner {
@@ -1386,17 +1800,36 @@ pub async fn get_photo(
     // Anything a non-owner can reach here is either private (never cache) or
     // a public gallery's unlocked bytes. Owner requests, a locked gallery
     // (pass_hash set), and any ?pass=/viewer-cookie request stay private.
-    let locked = {
+    let (locked, version) = {
         let db = state.db.lock().unwrap();
-        db.gallery_pass_hash(&slug).is_some()
+        (
+            db.gallery_pass_hash(&slug).is_some(),
+            db.gallery_token_version(&slug).unwrap_or(0),
+        )
     };
     let cache_control = if meta.public && !owner && !locked && pass.is_empty() && !viewer_cookie {
         "public, max-age=86400"
     } else {
         "private, no-store"
     };
+    // A thumb with no listing row is stale (deleted original, restored backup,
+    // delete race): never serve it, even though the derived file still exists.
+    if thumb {
+        let stored = name.strip_suffix(".jpg").unwrap_or_default();
+        let exists = {
+            let db = state.db.lock().unwrap();
+            db.photo_exists(&slug, stored)
+        };
+        if !exists {
+            return err(StatusCode::NOT_FOUND, "not found");
+        }
+    }
     let t_canon = Instant::now();
-    let path = state.dir.join(&name);
+    let path = if thumb {
+        state.dir.join(".thumbs").join(&name)
+    } else {
+        state.dir.join(&name)
+    };
     // Contain within photos dir (no symlink escape); base canonicalized once.
     let canon_file = match path.canonicalize() {
         Ok(p) => p,
@@ -1422,19 +1855,32 @@ pub async fn get_photo(
             .unwrap_or(0);
         format!("\"{len:x}-{mtime:x}\"")
     };
-    tracing::debug!(stage = "serve_open", latency_ms = format!("{:.2}", t_canon.elapsed().as_secs_f64() * 1000.0));
-    let ext = match name.rfind('.') {
-        Some(i) if i > 0 => name[i..].to_lowercase(),
-        _ => String::new(),
-    };
-    // .ogg is ambiguous (Theora video vs Vorbis/Opus audio): sniff content.
-    let ctype = if ext == ".ogg" || ext == ".ogv" || ext == ".ogm" || ext == ".opus" {
-        sniff_ogg(&canon_file).await.unwrap_or_else(|| content_type_for(ext.as_str()))
+    tracing::debug!(
+        stage = "serve_open",
+        latency_ms = format!("{:.2}", t_canon.elapsed().as_secs_f64() * 1000.0)
+    );
+    let (ext, ctype) = if thumb {
+        // Thumbs are always JPEG, whatever the original was.
+        (".jpg".to_string(), "image/jpeg".to_string())
     } else {
-        content_type_for(ext.as_str())
-    }
-    .to_string();
-    tracing::debug!(stage = "serve_total", latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0));
+        let ext = match name.rfind('.') {
+            Some(i) if i > 0 => name[i..].to_lowercase(),
+            _ => String::new(),
+        };
+        // .ogg is ambiguous (Theora video vs Vorbis/Opus audio): sniff content.
+        let ctype = if ext == ".ogg" || ext == ".ogv" || ext == ".ogm" || ext == ".opus" {
+            sniff_ogg(&canon_file)
+                .await
+                .unwrap_or_else(|| content_type_for(ext.as_str()))
+        } else {
+            content_type_for(ext.as_str())
+        };
+        (ext, ctype.to_string())
+    };
+    tracing::debug!(
+        stage = "serve_total",
+        latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0)
+    );
     // SVG runs in site origin: sandbox it and force download. Anything else
     // that browsers cannot render inline is a download, never a sniffed page.
     let inline = ctype.starts_with("image/")
@@ -1458,7 +1904,7 @@ pub async fn get_photo(
     if unlocked {
         builder = builder.header(
             header::SET_COOKIE,
-            issue_media_token(&state, &slug, MediaToken::Viewer),
+            issue_media_token(&state, &slug, MediaToken::Viewer, version),
         );
     }
     match parse_range(&headers, len) {
@@ -1536,15 +1982,26 @@ pub async fn delete_photo(
         _ => return err(StatusCode::NOT_FOUND, "not found"),
     }
     // Size before the file vanishes: counters keep the gallery quota honest.
-    let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     match tokio::fs::remove_file(&path).await {
         // Keep the gallery row: a concurrent upload landing between a file
         // count and a row delete orphaned files under a dead slug.
         Ok(()) => {
+            // Best effort: an old photo may have no thumb, and a stale one is
+            // removed by admin_sweep if this races.
+            let _ =
+                tokio::fs::remove_file(state.dir.join(".thumbs").join(format!("{name}.jpg"))).await;
             let mut db = state.db.lock().unwrap();
-            let _ = db.remove_upload(&slug, size);
+            let _ = db.remove_upload(&slug, &name, size);
             drop(db);
-            (StatusCode::OK, Json(json!({ "deleted": name, "gallery_gone": false }))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({ "deleted": name, "gallery_gone": false })),
+            )
+                .into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             err(StatusCode::NOT_FOUND, "not found")
@@ -1555,4 +2012,65 @@ pub async fn delete_photo(
 
 pub async fn fallback_404() -> Response {
     err(StatusCode::NOT_FOUND, "not found")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trusts(raw: &str, ip: &str) -> bool {
+        let peer: IpAddr = ip.parse().unwrap();
+        parse_trust_proxy(raw).iter().any(|net| net.contains(&peer))
+    }
+
+    #[test]
+    fn trust_proxy_accepts_ips_and_cidrs() {
+        assert!(trusts("1", "127.0.0.1"));
+        assert!(trusts("true", "::1"));
+        assert!(!trusts("1", "192.0.2.1"));
+        assert!(trusts("10.0.0.0/8, 203.0.113.7", "10.1.2.3"));
+        assert!(trusts("10.0.0.0/8, 203.0.113.7", "203.0.113.7"));
+        assert!(!trusts("10.0.0.0/8", "192.0.2.1"));
+        assert!(!trusts("", "127.0.0.1"));
+    }
+
+    #[test]
+    fn trust_proxy_ignores_invalid_entries() {
+        assert!(!trusts("not-an-ip", "127.0.0.1"));
+        assert!(!trusts("10.0.0.0/99", "10.0.0.1"));
+    }
+
+    #[test]
+    fn client_ip_uses_forwarded_for_only_from_trusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.1, 203.0.113.9".parse().unwrap(),
+        );
+        let trusted = parse_trust_proxy("10.0.0.0/8");
+        let peer = |ip: &str| Some(ConnectInfo(format!("{ip}:1234").parse().unwrap()));
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+
+        assert_eq!(client_ip_from(&headers, peer("10.1.2.3"), &trusted), client);
+        let direct: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            client_ip_from(&headers, peer("192.0.2.1"), &trusted),
+            direct
+        );
+    }
+
+    #[test]
+    fn metrics_allow_only_local_or_direct_trusted_peers() {
+        let trusted = parse_trust_proxy("172.16.0.0/12");
+        let peer: IpAddr = "172.17.0.1".parse().unwrap();
+        let direct = HeaderMap::new();
+        assert!(metrics_direct_peer(peer, &direct, &trusted));
+
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert!(!metrics_direct_peer(peer, &forwarded, &trusted));
+
+        let public: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!metrics_direct_peer(public, &direct, &trusted));
+    }
 }
