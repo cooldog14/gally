@@ -3160,6 +3160,163 @@ async fn delete_gallery_removes_thumbs() {
     assert_eq!(rows, 0);
 }
 
+// --- EXIF capture-date sort + resumable uploads ---
+
+#[tokio::test]
+async fn chunked_upload_resumes_and_is_idempotent() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "a".repeat(32);
+
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 0-2/6",
+        b"abc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["received"], 3);
+
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 3-5/6",
+        b"def",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = body["name"].as_str().expect("name").to_string();
+    assert_eq!(body["slug"], slug.as_str());
+    assert_eq!(std::fs::read(state.dir.join(&name)).unwrap(), b"abcdef");
+
+    // A lost reply to the final chunk must not duplicate the photo.
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 3-5/6",
+        b"def",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["name"], name.as_str());
+
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos"),
+            &[key_header(KEY_A)],
+        ))
+        .await
+        .unwrap();
+    let listed = body_json(resp).await;
+    assert_eq!(listed["photos"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn chunked_upload_reports_offset_mismatch() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "b".repeat(32);
+
+    let (status, _) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 0-2/6",
+        b"abc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // A chunk that overlaps committed bytes is rejected with the offset.
+    let (status, body) =
+        put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 0-1/6", b"ab").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["received"], 3);
+
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 3-5/6",
+        b"def",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = body["name"].as_str().unwrap();
+    assert_eq!(std::fs::read(state.dir.join(name)).unwrap(), b"abcdef");
+}
+
+#[tokio::test]
+async fn chunked_upload_skips_rate_limit_after_first_chunk() {
+    let (state, _tmp) = test_state_with(Limits {
+        rate_max: 1,
+        ..Limits::defaults()
+    })
+    .await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "c".repeat(32);
+
+    // Three chunks of one file, but the rate limit only allows one hit.
+    for (range, bytes) in [
+        ("bytes 0-1/6", b"ab".as_slice()),
+        ("bytes 2-3/6", b"cd".as_slice()),
+    ] {
+        let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, range, bytes).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 4-5/6", b"ef").await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn chunked_upload_requires_slug() {
+    let (state, _tmp) = test_state().await;
+    let id = "d".repeat(32);
+    let r = request(
+        "PUT",
+        "/api/photos/photo.jpg",
+        &[
+            ("x-gallery-key", KEY_A),
+            ("x-upload-id", id.as_str()),
+            ("content-range", "bytes 0-0/1"),
+        ],
+        Body::from("x"),
+    );
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "gallery slug required for resumable upload");
+}
+
 #[tokio::test]
 async fn exif_capture_date_orders_listing() {
     let (state, _tmp) = test_state().await;
@@ -3252,4 +3409,34 @@ async fn startup_backfills_exif_capture_date() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, 1);
+}
+
+#[tokio::test]
+async fn chunked_upload_short_body_reports_interrupted() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "f".repeat(32);
+
+    // Declared 3 bytes, sent 2: interrupted, but the committed bytes stay.
+    let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 0-2/6", b"ab").await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 2-5/6",
+        b"cdef",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = body["name"].as_str().unwrap();
+    assert_eq!(std::fs::read(state.dir.join(name)).unwrap(), b"abcdef");
 }

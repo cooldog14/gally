@@ -182,6 +182,7 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
   const calls = [];
   const docListeners = new Map();
   const session = store || new Map();
+  let randomCalls = 0;
   const local = new Map();
   const page = { calls, els, session, local, location: null, document: null };
 
@@ -252,6 +253,16 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
     location,
     matchMedia: () => ({ matches: false }),
     fetch: fetchImpl,
+    // Deterministic but distinct per call: two concurrent files must not
+    // share an upload id, or they would collide on the server's `.part-` temp.
+    crypto: {
+      getRandomValues(arr) {
+        randomCalls += 1;
+        for (let i = 0; i < arr.length; i += 1) arr[i] = (randomCalls + i) & 0xff;
+        return arr;
+      },
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
     Image: class {},
     URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
     IntersectionObserver: class {
@@ -673,7 +684,14 @@ function homePage(uploadHandler) {
   });
 }
 
-const filed = (name) => ({ name, type: "image/jpeg", size: 10 });
+const filed = (name, size = 10) => ({
+  name,
+  type: "image/jpeg",
+  size,
+  slice(start, end) {
+    return { size: end - start };
+  },
+});
 
 async function startBatch(page, files) {
   page.els.get("file-input").files = files;
@@ -710,7 +728,7 @@ async function testLostReplyDoesNotMintAgain() {
       return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
     }
     if (opts.method === "PUT") {
-      puts.push(opts);
+      puts.push({ url, headers: opts.headers });
       putCount += 1;
       if (putCount === 1) throw new TypeError("network lost");
       return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
@@ -719,8 +737,71 @@ async function testLostReplyDoesNotMintAgain() {
   });
   await startBatch(page, [filed("a.jpg"), filed("b.jpg")]);
   assert.strictEqual(resolves.length, 1, "mints exactly one gallery per batch");
-  assert.strictEqual(puts.length, 2);
-  for (const p of puts) assert.strictEqual(p.headers["X-Gallery-Slug"], SLUG, "second file keeps the batch slug");
+  assert(puts.length >= 2, "the retried chunk and the next file were uploaded");
+  // The failed chunk was retried with the same id and range, so the server
+  // can resume instead of restarting the file.
+  const failedFile = puts.filter((p) => p.url.endsWith("/a.jpg"));
+  assert.strictEqual(failedFile.length, 2, "a.jpg retried once");
+  assert.strictEqual(failedFile[0].headers["Content-Range"], failedFile[1].headers["Content-Range"]);
+  assert.strictEqual(failedFile[0].headers["X-Upload-Id"], failedFile[1].headers["X-Upload-Id"]);
+  for (const p of puts) {
+    assert.strictEqual(p.headers["X-Gallery-Slug"], SLUG, "every file keeps the batch slug");
+  }
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+}
+
+async function testUploadRetriesLostChunk() {
+  let putCount = 0;
+  const puts = [];
+  const page = homePage((url, opts) => {
+    if (url === "/api/galleries/resolve") return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
+    if (opts.method === "PUT") {
+      puts.push(opts);
+      putCount += 1;
+      if (putCount === 1) throw new TypeError("network lost");
+      return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
+    }
+    throw new Error("unexpected " + url);
+  });
+  await startBatch(page, [filed("a.jpg")]);
+  assert.strictEqual(puts.length, 2, "the lost chunk is retried");
+  assert.strictEqual(puts[0].headers["Content-Range"], "bytes 0-9/10");
+  assert.strictEqual(puts[1].headers["Content-Range"], puts[0].headers["Content-Range"]);
+  assert.strictEqual(puts[1].headers["X-Upload-Id"], puts[0].headers["X-Upload-Id"]);
+  assert.strictEqual(page.location.assigned, "/" + SLUG, "the retried upload still lands");
+}
+
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
+
+async function testUploadResumesFromServerOffset() {
+  const size = UPLOAD_CHUNK + 10;
+  let putCount = 0;
+  const puts = [];
+  const page = homePage((url, opts) => {
+    if (url === "/api/galleries/resolve") return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
+    if (opts.method === "PUT") {
+      puts.push(opts);
+      putCount += 1;
+      if (putCount === 1) {
+        return {
+          status: 409,
+          ok: false,
+          json: async () => ({ error: "offset mismatch", received: UPLOAD_CHUNK }),
+        };
+      }
+      return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
+    }
+    throw new Error("unexpected " + url);
+  });
+  await startBatch(page, [filed("big.jpg", size)]);
+  assert.strictEqual(puts.length, 2, "the second chunk was sent");
+  assert.strictEqual(puts[0].headers["Content-Range"], `bytes 0-${UPLOAD_CHUNK - 1}/${size}`);
+  assert.strictEqual(
+    puts[1].headers["Content-Range"],
+    `bytes ${UPLOAD_CHUNK}-${size - 1}/${size}`,
+    "resumes at the server's committed offset"
+  );
+  assert.strictEqual(puts[1].headers["X-Upload-Id"], puts[0].headers["X-Upload-Id"]);
   assert.strictEqual(page.location.assigned, "/" + SLUG);
 }
 
@@ -731,6 +812,8 @@ async function testLostReplyDoesNotMintAgain() {
   await testHeicFetchesOnlyWhenVisible();
   await testHomeUploadUsesOneSlug();
   await testLostReplyDoesNotMintAgain();
+  await testUploadRetriesLostChunk();
+  await testUploadResumesFromServerOffset();
   if (BASE) {
     await workflowUpload();
     await workflowEdit();

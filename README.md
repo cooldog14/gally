@@ -189,4 +189,6 @@ CI (`.github/workflows/ci.yml`) runs on push and pull requests on
 
 Photos are ordered by EXIF `DateTimeOriginal` when present, falling back to
 upload time; existing libraries are backfilled once on the first startup after
-the upgrade.
+the upgrade. The browser uploads in 8 MiB chunks and resumes from the server's
+committed offset after a failure; other clients can keep sending the whole
+body in one `PUT`.
