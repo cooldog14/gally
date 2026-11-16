@@ -9,19 +9,31 @@ fn copy_tree(from: &Path, to: &Path, files: &mut usize) -> anyhow::Result<()> {
     std::fs::create_dir_all(to)?;
     let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
     while let Some((src, dst)) = stack.pop() {
-        for ent in std::fs::read_dir(&src)?.flatten() {
+        let rd = std::fs::read_dir(&src).with_context(|| format!("read {}", src.display()))?;
+        for ent in rd {
+            let ent = ent.with_context(|| format!("read entry in {}", src.display()))?;
             let name = ent.file_name().to_string_lossy().into_owned();
             // In-flight uploads and thumbnail temps are not photos yet.
             if name.starts_with(".part-") || name.starts_with(".tmp-") {
                 continue;
             }
             let (s, d): (PathBuf, PathBuf) = (ent.path(), dst.join(&name));
-            let md = ent.metadata()?;
+            let md = ent
+                .metadata()
+                .with_context(|| format!("stat {}", s.display()))?;
             if md.is_dir() {
                 std::fs::create_dir_all(&d)?;
                 stack.push((s, d));
             } else if md.is_file() {
-                std::fs::copy(&s, &d).with_context(|| format!("copy {}", s.display()))?;
+                // Temp name + rename: a killed backup leaves the previous
+                // complete photo in place, never a truncated one under the
+                // final name.
+                let tmp = dst.join(format!(".tmp-{name}"));
+                std::fs::copy(&s, &tmp).with_context(|| format!("copy {}", s.display()))?;
+                if let Err(e) = std::fs::rename(&tmp, &d) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e).with_context(|| format!("install {}", d.display()));
+                }
                 *files += 1;
             }
         }
@@ -108,6 +120,8 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
     }
     // Deleted source photos must not linger in an overwritten backup. A dir
     // read error is fatal: we cannot prove the backup matches the source.
+    // Prune after installing the DB: a crash can then leave stray extra
+    // photos, never an installed DB that lists files prune already removed.
     let mut src = std::collections::HashSet::new();
     for ent in std::fs::read_dir(root.join("photos")).context("read source photos")? {
         src.insert(ent.context("read source photo entry")?.file_name());
@@ -323,7 +337,7 @@ mod tests {
         let blocker = dest.join("photos").join(&name_b);
         std::fs::create_dir_all(&blocker).unwrap();
         let err = run(&root, &dest).unwrap_err();
-        assert!(format!("{err:#}").contains("copy"), "{err:#}");
+        assert!(format!("{err:#}").contains("install"), "{err:#}");
 
         // The DB from the earlier good backup must still be the installed one.
         let prev = rusqlite::Connection::open(dest.join("galleries.db")).unwrap();

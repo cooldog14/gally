@@ -1,3 +1,4 @@
+.env
 photos/*
 !photos/.gitkeep
 .gally.lock
