@@ -225,7 +225,7 @@ mod tests {
         let bytes = b"photo-bytes";
         std::fs::write(photos.join(&name), bytes).unwrap();
         assert_eq!(
-            db.add_upload(&slug, &name, bytes.len() as u64),
+            db.add_upload(&slug, &name, bytes.len() as u64, 1_000),
             Some((bytes.len() as i64, 1))
         );
         std::fs::create_dir_all(photos.join(".thumbs")).unwrap();
@@ -307,7 +307,7 @@ mod tests {
         let hex = "d".repeat(32);
         let name_a = format!("{slug_a}_{hex}_a.jpg");
         std::fs::write(photos.join(&name_a), b"a").unwrap();
-        db.add_upload(&slug_a, &name_a, 1).unwrap();
+        db.add_upload(&slug_a, &name_a, 1, 1_000).unwrap();
         drop(db);
         let dest = tmp.path().join("dest");
         run(&root, &dest).unwrap();
@@ -317,7 +317,7 @@ mod tests {
         let slug_b = db.get_or_create_gallery("fail-key-b-0002").unwrap();
         let name_b = format!("{slug_b}_{hex}_b.jpg");
         std::fs::write(photos.join(&name_b), b"b").unwrap();
-        db.add_upload(&slug_b, &name_b, 1).unwrap();
+        db.add_upload(&slug_b, &name_b, 1, 1_000).unwrap();
         drop(db);
         // copy(file -> existing dir) fails, exercising the photo-copy stage.
         let blocker = dest.join("photos").join(&name_b);

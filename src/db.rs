@@ -51,7 +51,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -92,6 +92,17 @@ pub struct GalleryMeta {
 pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
+    // Rows carry the capture time (EXIF backfill or upload time); the disk
+    // only knows mtime, so keep what the DB already has for known files.
+    let mut existing: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT name, created FROM photos")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (name, created) = row?;
+            existing.insert(name, created);
+        }
+    }
     // The listing table is a projection of the directory: rebuild it, not
     // just the counters, so a crashed install gets its rows back.
     let mut files: Vec<(String, String, i64, i64)> = Vec::new();
@@ -107,12 +118,13 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()>
                 Ok(m) if m.is_file() => m,
                 _ => continue,
             };
-            let created = md
+            let mtime = md
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let created = existing.get(&name).copied().unwrap_or(mtime);
             files.push((slug.clone(), name, md.len() as i64, created));
             let e = counts.entry(slug).or_default();
             e.0 += md.len() as i64;
@@ -138,6 +150,41 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<()>
     tx.commit()
 }
 
+/// One-time EXIF capture-date backfill for libraries created before the
+/// `created` column carried capture time. `user_version = 1` records that
+/// it ran; unreadable/no-EXIF files keep their prior timestamps and are not
+/// retried. Idempotent if interrupted before the version bump.
+pub fn backfill_exif(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Result<usize> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 1 {
+        return Ok(0);
+    }
+    let mut names = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT name FROM photos")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            names.push(row?);
+        }
+    }
+    let tx = conn.transaction()?;
+    let mut updated = 0;
+    for name in names {
+        if let Some(ms) = crate::exif_time::taken_millis(&photos_dir.join(&name)) {
+            tx.execute(
+                "UPDATE photos SET created = ?1 WHERE name = ?2",
+                rusqlite::params![ms, name],
+            )?;
+            updated += 1;
+        }
+    }
+    tx.commit()?;
+    // Outside the transaction: a crash before this reruns the (idempotent)
+    // backfill next boot.
+    conn.execute_batch("PRAGMA user_version = 1")?;
+    Ok(updated)
+}
+
 pub trait GalleryDb {
     /// Scoped auth: does this key own this slug? Same key may own many slugs.
     fn key_owns_slug(&self, key: &str, slug: &str) -> bool;
@@ -150,7 +197,14 @@ pub trait GalleryDb {
     fn set_public(&mut self, slug: &str, public: bool) -> bool;
     /// Record one stored file in the listing table and the counters, one
     /// transaction: `(bytes, photos)` after. None when the gallery vanished.
-    fn add_upload(&mut self, slug: &str, name: &str, bytes: u64) -> Option<(i64, i64)>;
+    /// `created` is the sort timestamp (capture time, or upload time).
+    fn add_upload(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+        created: i64,
+    ) -> Option<(i64, i64)>;
     /// Forget one removed file and its listing row (saturating counters):
     /// `(bytes, photos)` after. None when the gallery is unknown.
     fn remove_upload(&mut self, slug: &str, name: &str, bytes: u64) -> Option<(i64, i64)>;
@@ -240,7 +294,13 @@ impl GalleryDb for Connection {
         .unwrap_or(false)
     }
 
-    fn add_upload(&mut self, slug: &str, name: &str, bytes: u64) -> Option<(i64, i64)> {
+    fn add_upload(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+        created: i64,
+    ) -> Option<(i64, i64)> {
         let tx = self.transaction().ok()?;
         let n = tx
             .execute(
@@ -254,7 +314,7 @@ impl GalleryDb for Connection {
         }
         tx.execute(
             "INSERT OR REPLACE INTO photos(slug, name, size, created) VALUES(?1, ?2, ?3, ?4)",
-            rusqlite::params![slug, name, bytes as i64, now_millis()],
+            rusqlite::params![slug, name, bytes as i64, created],
         )
         .ok()?;
         let out = tx
@@ -408,12 +468,15 @@ mod tests {
     fn counters_track_uploads_and_removals() {
         let mut db = mem();
         let slug = db.get_or_create_gallery("counters-key-01").expect("create");
-        assert_eq!(db.add_upload(&slug, "a.jpg", 40), Some((40, 1)));
-        assert_eq!(db.add_upload(&slug, "b.jpg", 60), Some((100, 2)));
+        assert_eq!(db.add_upload(&slug, "a.jpg", 40, 1_000), Some((40, 1)));
+        assert_eq!(db.add_upload(&slug, "b.jpg", 60, 2_000), Some((100, 2)));
         assert_eq!(db.remove_upload(&slug, "a.jpg", 40), Some((60, 1)));
         // Saturating: counters never go negative.
         assert_eq!(db.remove_upload(&slug, "b.jpg", 1_000), Some((0, 0)));
-        assert_eq!(db.add_upload("no-such-gallery-aaaa", "x.jpg", 1), None);
+        assert_eq!(
+            db.add_upload("no-such-gallery-aaaa", "x.jpg", 1, 3_000),
+            None
+        );
         // The listing rows tracked the same add/remove cycle.
         let rows: i64 = db
             .query_row(
@@ -462,7 +525,12 @@ mod tests {
             b"zz",
         )
         .unwrap();
-        assert_eq!(db.add_upload(&slug, "stale.jpg", 5), Some((5, 1)));
+        assert_eq!(db.add_upload(&slug, "stale.jpg", 5, 500), Some((5, 1)));
+        // Capture times already in the DB survive the rebuild.
+        assert_eq!(
+            db.add_upload(&slug, &name("a.jpg"), 40, 12_345),
+            Some((45, 2))
+        );
         recount(&mut db, &photos).expect("recount");
         let meta = db.gallery_meta(&slug).expect("meta");
         assert_eq!((meta.bytes, meta.photos), (100, 2));
@@ -482,7 +550,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(created > 0, "created comes from the file mtime");
+        assert_eq!(created, 12_345, "recount keeps the stored capture time");
         // .thumbs and dotfiles never become rows.
         let junk: i64 = db
             .query_row(
@@ -492,6 +560,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(junk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_runs_once() {
+        let dir = std::env::temp_dir().join(format!("gally-db-backfill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        let mut db = open(&dir.join("g.db")).expect("open");
+        let slug = db.get_or_create_gallery("backfill-key-01").expect("create");
+        let name = format!("{slug}_{}_old.jpg", "b".repeat(32));
+        // No such file: no EXIF, so nothing is rewritten.
+        assert_eq!(db.add_upload(&slug, &name, 3, 1), Some((3, 1)));
+        assert_eq!(backfill_exif(&mut db, &photos).expect("backfill"), 0);
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "the run is recorded");
+        // A later call must not touch rows again.
+        db.execute("UPDATE photos SET created = 999 WHERE slug = ?1", [&slug])
+            .unwrap();
+        assert_eq!(backfill_exif(&mut db, &photos).expect("backfill"), 0);
+        let created: i64 = db
+            .query_row(
+                "SELECT created FROM photos WHERE slug = ?1 AND name = ?2",
+                rusqlite::params![slug, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 999, "user_version guards the backfill");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

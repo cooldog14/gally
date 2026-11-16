@@ -286,6 +286,10 @@ impl AppState {
         let conn = tokio::task::spawn_blocking(move || {
             let mut conn = db::open(&db_path)?;
             db::recount(&mut conn, &scan_dir)?;
+            let backfilled = db::backfill_exif(&mut conn, &scan_dir)?;
+            if backfilled > 0 {
+                tracing::info!(photos = backfilled, "EXIF capture times backfilled");
+            }
             Ok::<_, anyhow::Error>(conn)
         })
         .await??;
