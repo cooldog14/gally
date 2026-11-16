@@ -22,6 +22,23 @@ const keyBannerKey = document.getElementById("key-banner-key");
 const loadMoreBtn = document.getElementById("load-more");
 
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
+const UPLOAD_RETRIES = 5;
+
+/** 32 lowercase hex characters: the server keys the resumable upload on it. */
+function randomUploadId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Transient failures worth another attempt with the same upload id. */
+function retryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
 
 const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4})$/;
 
@@ -932,28 +949,75 @@ fileInput.addEventListener("change", async () => {
     return;
   }
   let stored = 0;
-  async function putFile(file) {
-    const headers = { "X-Gallery-Key": key, "X-Gallery-Slug": target };
-    if (file.type) headers["Content-Type"] = file.type;
-    try {
-      return await fetch("/api/photos/" + encodeURIComponent(file.name), {
-        method: "PUT",
-        headers,
-        body: file,
-      });
-    } catch (_) {
-      return null;
+  const headersBase = { "X-Gallery-Key": key, "X-Gallery-Slug": target };
+  /**
+   * One sequential chunk loop per file, keyed by a stable upload id: a lost
+   * or failed request resumes from the server's committed byte offset.
+   * Returns the final 201 response, or the last failed response / null.
+   */
+  async function putFile(file, headersBase) {
+    const headersFor = { ...headersBase };
+    if (file.type) headersFor["Content-Type"] = file.type;
+    const id = randomUploadId();
+    let offset = 0;
+    let failures = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + UPLOAD_CHUNK, file.size);
+      const headers = {
+        ...headersFor,
+        "X-Upload-Id": id,
+        "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`,
+      };
+      let res = null;
+      try {
+        res = await fetch("/api/photos/" + encodeURIComponent(file.name), {
+          method: "PUT",
+          headers,
+          body: file.slice(offset, end),
+        });
+      } catch (_) { /* network failure: retried below */ }
+      if (res && res.status === 201) return res;
+      if (res && res.status === 202) {
+        // Chunk stored, more expected: the server owns the committed offset.
+        const data = await res.json().catch(() => null);
+        const received = data && Number.isInteger(data.received) ? data.received : end;
+        if (received > offset) { offset = received; failures = 0; continue; }
+        failures += 1;
+      } else if (res && res.status === 409) {
+        // Another request committed bytes (or this one did not land): jump
+        // to the server's offset when it moved forward.
+        const data = await res.json().catch(() => null);
+        if (data && Number.isInteger(data.received) && data.received >= 0 && data.received <= file.size) {
+          if (data.received > offset) { offset = data.received; failures = 0; continue; }
+        }
+        failures += 1;
+      } else if (res && res.status === 410) {
+        // Temp gone (restart/expiry): restart the file with the same id.
+        offset = 0;
+        failures += 1;
+      } else if (!res || retryableStatus(res.status)) {
+        failures += 1;
+      } else {
+        return res;
+      }
+      if (failures > UPLOAD_RETRIES) return res;
+      await sleep(500 * 2 ** Math.min(failures - 1, 4));
     }
+    return null;
   }
   async function uploadWorker() {
     for (;;) {
       const file = files.shift();
       if (!file) return;
+      if (file.size === 0) {
+        failures.push(file.name + ": empty file");
+        continue;
+      }
       if (file.size > MAX_BYTES) {
         failures.push(file.name + ": file is too large (10GB max)");
         continue;
       }
-      const res = await putFile(file);
+      const res = await putFile(file, headersBase);
       if (!res) {
         failures.push(file.name + ": upload failed");
         continue;

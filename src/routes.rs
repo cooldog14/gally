@@ -1451,6 +1451,62 @@ impl Drop for MintGuard<'_> {
     }
 }
 
+/// One resumable-upload chunk: `END` is inclusive, `TOTAL` is the file size.
+#[derive(Clone, Copy)]
+struct UploadChunk {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+/// Parse exactly `bytes START-END/TOTAL`; `None` for `*`, inverted or
+/// overflowing ranges, and empty files.
+fn parse_content_range(raw: &str) -> Option<UploadChunk> {
+    let rest = raw.strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.parse().ok()?;
+    let end: u64 = end.parse().ok()?;
+    let total: u64 = total.parse().ok()?;
+    if start > end || end >= total || total == 0 {
+        return None;
+    }
+    Some(UploadChunk { start, end, total })
+}
+
+/// Exactly 32 ASCII hex digits, normalized to lowercase.
+fn parse_upload_id(raw: &str) -> Option<String> {
+    let id = raw.to_ascii_lowercase();
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+}
+
+/// Both resumable-upload headers, valid; or neither (legacy full-body PUT).
+// Response is the cold error path; boxing it would only add an allocation.
+#[allow(clippy::result_large_err)]
+fn parse_upload_headers(headers: &HeaderMap) -> Result<Option<(UploadChunk, String)>, Response> {
+    let (range, id) = (headers.get("content-range"), headers.get("x-upload-id"));
+    match (range, id) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "content-range and x-upload-id go together",
+        )),
+        (Some(range), Some(id)) => {
+            let id = id
+                .to_str()
+                .ok()
+                .and_then(parse_upload_id)
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "bad upload id"))?;
+            let chunk = range
+                .to_str()
+                .ok()
+                .and_then(parse_content_range)
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "bad content-range"))?;
+            Ok(Some((chunk, id)))
+        }
+    }
+}
+
 pub async fn put_photo(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1460,7 +1516,17 @@ pub async fn put_photo(
 ) -> Response {
     let t_total = std::time::Instant::now();
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    if rate_limited(&state, &ip) {
+    let chunk = match parse_upload_headers(&headers) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    // One file arrives as many requests: only its first chunk (or a legacy
+    // full-body PUT) burns a rate-limit hit, or chunking trips the limit.
+    let first_or_legacy = match &chunk {
+        None => true,
+        Some((c, _)) => c.start == 0,
+    };
+    if first_or_legacy && rate_limited(&state, &ip) {
         return ApiError::TooMany.into_response();
     }
     let key = match request_key(&headers) {
@@ -1472,6 +1538,14 @@ pub async fn put_photo(
         Ok(t) => t,
         Err(resp) => return resp,
     };
+    // The browser mints the gallery first; a chunked request without a slug
+    // would mint a new gallery per chunk.
+    if chunk.is_some() && target.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "gallery slug required for resumable upload",
+        );
+    }
     let slug = {
         // Gallery page: key must own this slug. Unknown and not-yours answer
         // identically (404), like private listings, so a valid key cannot
@@ -1514,6 +1588,34 @@ pub async fn put_photo(
         slug: slug.clone(),
         keep: false,
     });
+    let (sanitized, ext) = sanitize_filename(&raw_name);
+    // Resumable uploads name the final file after the client's upload id, so
+    // every retried chunk targets the same file; legacy keeps a random uuid.
+    let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+    let (final_name, temp_path) = match &chunk {
+        Some((_, id)) => (
+            format!("{slug}_{id}_{sanitized}"),
+            state.dir.join(format!(".part-{id}")),
+        ),
+        None => (
+            format!("{slug}_{uuid}_{sanitized}"),
+            state.dir.join(format!(".part-{uuid}")),
+        ),
+    };
+    // Lost reply to the final chunk: the file is already stored, answer
+    // success without reading the body again.
+    if chunk.is_some()
+        && tokio::fs::metadata(state.dir.join(&final_name))
+            .await
+            .is_ok()
+        && state.db.lock().unwrap().photo_exists(&slug, &final_name)
+    {
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "name": final_name, "slug": slug })),
+        )
+            .into_response();
+    }
     // Quota check before any bytes land: a full gallery costs a JSON reply.
     let limits = state.limits;
     let (used_bytes, used_photos) = {
@@ -1530,6 +1632,16 @@ pub async fn put_photo(
     }
     if limits.gallery_photos > 0 && used_photos >= limits.gallery_photos {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached");
+    }
+    // Chunked uploads know the file size up front: refuse one that cannot
+    // fit before accepting any of its bytes.
+    if let Some((c, _)) = &chunk {
+        if c.total > limits.max_file as u64 {
+            return err(StatusCode::PAYLOAD_TOO_LARGE, "file too large");
+        }
+        if limits.gallery_bytes > 0 && used_bytes.saturating_add(c.total) > limits.gallery_bytes {
+            return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
+        }
     }
     // Bounded concurrency: refuse outright instead of queueing disk writers.
     // The global cap is shared; the per-IP cap stops one slow client from
@@ -1552,26 +1664,79 @@ pub async fn put_photo(
     {
         return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
     }
-    let (sanitized, ext) = sanitize_filename(&raw_name);
     let t_body = Instant::now();
     // Stream into a dot-prefixed temp file: dot names are never listed or
     // served, so a stalled or aborted upload stays invisible. The real name
     // (and its DB row) only appears after a successful `rename`.
-    let uuid = uuid::Uuid::new_v4().as_simple().to_string();
-    let temp_path = state.dir.join(format!(".part-{uuid}"));
-    let final_name = format!("{slug}_{uuid}_{sanitized}");
-    let mut out = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-    {
-        Ok(f) => f,
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+    let base_len = chunk.as_ref().map_or(0, |(c, _)| c.start);
+    let chunk_len = chunk.as_ref().map(|(c, _)| c.end - c.start + 1);
+    let mut out = match &chunk {
+        None => match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+        },
+        Some((c, _)) => match tokio::fs::metadata(&temp_path).await {
+            Ok(md) => {
+                let len = md.len();
+                if len > c.total {
+                    return err(StatusCode::BAD_REQUEST, "upload too large");
+                }
+                if len != c.start {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": "offset mismatch", "received": len })),
+                    )
+                        .into_response();
+                }
+                match tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&temp_path)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if c.start > 0 {
+                    // Restart, startup sweep, or expiry: the client restarts
+                    // the file with the same upload id.
+                    return (StatusCode::GONE, Json(json!({ "error": "upload expired" })))
+                        .into_response();
+                }
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)
+                    .await
+                {
+                    Ok(f) => f,
+                    // Lost a create race: report the committed length.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let len = tokio::fs::metadata(&temp_path)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({ "error": "offset mismatch", "received": len })),
+                        )
+                            .into_response();
+                    }
+                    Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+                }
+            }
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
+        },
     };
-    let mut total: usize = 0;
     let started = Instant::now();
     let mut next_free_check = FREE_CHECK_EVERY;
+    let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
     loop {
         // Idle timeout: a dead socket must not pin an upload slot forever.
@@ -1579,47 +1744,85 @@ pub async fn put_photo(
             Ok(n) => n,
             Err(_) => {
                 drop(out);
+                if chunk.is_some() {
+                    // Keep the committed prefix: the client resumes it.
+                    return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
+                }
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 return err(StatusCode::REQUEST_TIMEOUT, "upload timed out");
             }
         };
-        let Some(chunk) = next else { break };
-        let chunk = match chunk {
+        let Some(data) = next else { break };
+        let data = match data {
             Ok(c) => c,
             Err(_) => {
                 drop(out);
+                if chunk.is_some() {
+                    return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
+                }
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 return ApiError::TooLarge.into_response();
             }
         };
-        if chunk.is_empty() {
+        if data.is_empty() {
             continue;
         }
-        total += chunk.len();
+        written += data.len() as u64;
+        if chunk_len.is_some_and(|l| written > l) {
+            // Bytes outside this request's range: drop this request's writes
+            // but keep the chunks committed by earlier requests.
+            let _ = out.set_len(base_len).await;
+            drop(out);
+            return err(StatusCode::BAD_REQUEST, "content-range overrun");
+        }
+        let accumulated = base_len + written;
         let ok = started.elapsed() <= UPLOAD_DEADLINE
-            && total <= limits.max_file
-            && (limits.gallery_bytes == 0 || used_bytes + total as u64 <= limits.gallery_bytes);
+            && chunk.as_ref().is_none_or(|(c, _)| accumulated <= c.total)
+            && accumulated <= limits.max_file as u64
+            && (limits.gallery_bytes == 0 || used_bytes + accumulated <= limits.gallery_bytes);
         if !ok {
             drop(out);
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            if chunk.is_none() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
             return ApiError::TooLarge.into_response();
         }
-        if total as u64 >= next_free_check {
-            next_free_check = total as u64 + FREE_CHECK_EVERY;
+        if accumulated >= next_free_check {
+            next_free_check = accumulated + FREE_CHECK_EVERY;
             if let Some(free) = free_bytes(&state.dir)
                 && limits.min_free > 0
                 && free < limits.min_free
             {
                 drop(out);
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                if chunk.is_none() {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
                 return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
             }
         }
-        if out.write_all(&chunk).await.is_err() {
+        if out.write_all(&data).await.is_err() {
             drop(out);
             let _ = tokio::fs::remove_file(&temp_path).await;
             return ApiError::Internal.into_response();
         }
+    }
+    let accumulated = base_len + written;
+    // A chunk shorter than its declared range is a broken request: keep the
+    // committed prefix and let the client resend from the real offset.
+    if chunk_len.is_some_and(|l| written < l) {
+        drop(out);
+        return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
+    }
+    // Non-final chunk: report the committed offset; no fsync, no rename.
+    if let Some((c, _)) = &chunk
+        && accumulated < c.total
+    {
+        drop(out);
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({ "received": accumulated })),
+        )
+            .into_response();
     }
     // Durability: the rename below is atomic, but only a synced temp file
     // survives a crash after the fact.
@@ -1631,10 +1834,10 @@ pub async fn put_photo(
     drop(out);
     tracing::debug!(
         stage = "body_stream",
-        bytes = total,
+        bytes = accumulated,
         latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0)
     );
-    if total == 0 {
+    if accumulated == 0 {
         let _ = tokio::fs::remove_file(&temp_path).await;
         return err(StatusCode::BAD_REQUEST, "empty body");
     }
@@ -1658,7 +1861,7 @@ pub async fn put_photo(
     // concurrent overshoot is corrected by deleting this file again.
     let usage = {
         let mut db = state.db.lock().unwrap();
-        db.add_upload(&slug, &final_name, total as u64, created)
+        db.add_upload(&slug, &final_name, accumulated, created)
     };
     if let Some((bytes, photos)) = usage {
         let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
@@ -1666,7 +1869,7 @@ pub async fn put_photo(
         if over {
             let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
             let mut db = state.db.lock().unwrap();
-            let _ = db.remove_upload(&slug, &final_name, total as u64);
+            let _ = db.remove_upload(&slug, &final_name, accumulated);
             return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
         }
     } else {
@@ -1694,14 +1897,13 @@ pub async fn put_photo(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state
         .upload_bytes_total
-        .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(accumulated, std::sync::atomic::Ordering::Relaxed);
     (
         StatusCode::CREATED,
         Json(json!({ "name": final_name, "slug": slug })),
     )
         .into_response()
 }
-
 // --- photo serve / delete ---
 
 pub async fn get_photo(
