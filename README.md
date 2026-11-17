@@ -46,6 +46,19 @@ docker compose ps
 docker compose logs -f gally
 ```
 
+CI publishes the image to GHCR on every push to `master` (`latest` and
+`sha-<commit>`) and on `v*` tags (the tag name). To deploy that image instead
+of building on the host:
+
+```sh
+export GALLY_IMAGE=ghcr.io/cooldog14/gally:latest
+docker compose pull
+docker compose up -d --no-build
+```
+
+The package is private by default: authenticate with `docker login ghcr.io`
+using a token that can read packages, or make the package public.
+
 The app listens on `0.0.0.0:8000` inside the container and publishes to
 `127.0.0.1:8000` on the host. Terminate TLS in your reverse proxy:
 
@@ -195,8 +208,8 @@ CI (`.github/workflows/ci.yml`) runs on push and pull requests on
 `ubuntu-latest`: `cargo fmt --check`, then
 `cargo clippy --all-targets -- -D warnings`, then `cargo test` and
 `cargo build --release`. It also builds the Docker image, validates
-`compose.yaml`, and smoke-tests the container's `/healthz`. The stress suite
-is not run in CI.
+`compose.yaml`, and smoke-tests the container's `/healthz`. Pushes to `master`
+and `v*` tags publish the image to GHCR. The stress suite is not run in CI.
 
 Photos are ordered by EXIF `DateTimeOriginal` when present, falling back to
 upload time; existing libraries are backfilled once on the first startup after
