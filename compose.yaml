@@ -1,7 +1,7 @@
 name: gally
 
 x-gally: &gally
-  image: gally-uring:local
+  image: ${GALLY_IMAGE:-gally-uring:local}
   build: .
   restart: unless-stopped
   # SIGTERM stops accepting, then waits up to 120 s for in-flight requests.
