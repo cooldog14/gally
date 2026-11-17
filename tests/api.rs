@@ -666,6 +666,59 @@ async fn lock_unlock_cycle() {
 }
 
 #[tokio::test]
+async fn owner_key_unlocks_via_password_field() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"viewer-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let listing = format!("/api/galleries/{slug}/photos");
+    // The dialog promises the owner key works: it arrives as a password.
+    let resp = router(state.clone())
+        .oneshot(get(&listing, &[("x-gallery-pass", KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A wrong key is still a wrong password.
+    let resp = router(state)
+        .oneshot(get(&listing, &[("x-gallery-pass", KEY_B)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn lock_endpoint_is_rate_limited() {
+    let (state, _tmp) = test_state_with(Limits {
+        rate_max: 2,
+        ..Limits::defaults()
+    })
+    .await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let uri = format!("/api/galleries/{slug}/lock");
+    // The upload above used one of the two hits.
+    let r = post_json(&uri, &[key_header(KEY_A)], r#"{"password":"pw"}"#);
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let r = post_json(&uri, &[key_header(KEY_A)], r#"{"password":"pw"}"#);
+    assert_eq!(
+        router(state).oneshot(r).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
 async fn lock_requires_owner_key() {
     let (state, _tmp) = test_state().await;
     let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;

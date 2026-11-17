@@ -194,14 +194,23 @@ fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
         return Ok(s.into_bytes());
     }
     let path = root.join(".gally-media-secret");
-    if let Ok(raw) = std::fs::read(&path) {
-        let text = String::from_utf8_lossy(&raw);
-        if let Some(bytes) = from_hex(text.trim())
-            && bytes.len() == 32
-        {
-            return Ok(bytes);
+    match std::fs::read(&path) {
+        Ok(raw) => {
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(bytes) = from_hex(text.trim())
+                && bytes.len() == 32
+            {
+                return Ok(bytes);
+            }
+            // A crash or full disk can leave an empty/partial file here.
+            // Rewriting it only invalidates old media cookies.
+            tracing::warn!(
+                path = %path.display(),
+                "invalid media secret; generating a new one"
+            );
         }
-        anyhow::bail!("{} is not a 32-byte hex secret", path.display());
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     }
     let mut bytes = [0u8; 32];
     {
@@ -210,7 +219,8 @@ fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
     }
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+    // The instance lock is held: no other process races this truncate.
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -219,6 +229,12 @@ fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
     let mut file = opts
         .open(&path)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode` above only applies to a new file; a rewritten one may be 0644.
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     file.write_all(to_hex(&bytes).as_bytes())?;
     file.sync_all()?;
     Ok(bytes.to_vec())
@@ -616,5 +632,21 @@ mod tests {
         assert!(UploadSlotGuard::try_acquire(&ips, &b, 4).is_some());
         drop(held.pop());
         assert!(UploadSlotGuard::try_acquire(&ips, &a, 4).is_some());
+    }
+
+    #[test]
+    fn invalid_media_secret_is_regenerated() {
+        let dir = std::env::temp_dir().join(format!("gally-secret-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".gally-media-secret");
+        std::fs::write(&path, b"").unwrap();
+        // A crash/ENOSPC can leave this empty; startup must still work.
+        let secret = media_secret(&dir).expect("regenerate the empty secret");
+        assert_eq!(secret.len(), 32);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim().len(), 64, "rewritten as 32-byte hex");
+        assert_eq!(media_secret(&dir).expect("reuse"), secret);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
