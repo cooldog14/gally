@@ -17,3 +17,14 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      - run: docker build -t gally-uring:ci .
+      - run: docker compose config --quiet
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name gally-ci -p 127.0.0.1:8000:8000 gally-uring:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && exit 0
+            sleep 1
+          done
+          docker logs gally-ci
+          exit 1
