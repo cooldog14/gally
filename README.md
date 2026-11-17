@@ -30,8 +30,8 @@ cargo run --release
 | `GALLY_ARGON2_SLOTS` | `4` | Concurrent Argon2 password hashes; minimum 1. |
 | `GALLY_INVITE_CODE` | unset | When set, new galleries need this code via `X-Invite-Code`; existing galleries never do. |
 | `ADMIN_PASS` | unset | Enables `/api/admin/*`. |
-| `GALLY_TRUST_PROXY` | off | Comma-separated IPs/CIDRs of reverse proxies allowed to set `X-Forwarded-For`; `1/true/yes` means loopback. Read once at startup. Never enable it for a directly reachable app. |
-| `GALLY_SECURE_COOKIES` | off | `1/true/yes`: add `Secure` to cookies; requires HTTPS. |
+| `GALLY_TRUST_PROXY` | off (`127.0.0.0/8,172.16.0.0/12` in Compose) | Comma-separated IPs/CIDRs of every reverse-proxy hop allowed to set `X-Forwarded-For`; `1/true/yes` means loopback. Read once at startup. Never enable it for a directly reachable app. |
+| `GALLY_SECURE_COOKIES` | off (`1` in Compose) | `1/true/yes`: add `Secure` to cookies; requires HTTPS. Set `0` for plain-HTTP LAN use. |
 | `GALLY_MEDIA_SECRET` | generated | Optional media-cookie signing secret; unset = generated and kept in the data dir. |
 | `RUST_LOG` | `gally_uring=info` | Log filter, e.g. `gally_uring=debug` for per-request timings. |
 
@@ -56,9 +56,13 @@ The app listens on `0.0.0.0:8000` inside the container and publishes to
 - Proxy on another host: set `GALLY_BIND=0.0.0.0` and narrow
   `GALLY_TRUST_PROXY` to the proxy IP/CIDR, then firewall port 8000 to that host.
 
-`GALLY_TRUST_PROXY` lists the peers whose rightmost `X-Forwarded-For` value is
-accepted. It defaults to `127.0.0.0/8,172.16.0.0/12`; never extend it to a
-directly reachable client range. `1/true/yes` still means loopback.
+`GALLY_TRUST_PROXY` lists every reverse-proxy hop. The app walks
+`X-Forwarded-For` right-to-left and accepts the first address outside that
+list; a malformed chain falls back to the connection peer. It defaults to
+`127.0.0.0/8,172.16.0.0/12`; never extend it to a directly reachable client
+range. `1/true/yes` still means loopback. For two hops (an edge proxy
+forwarding to a local Caddy) list the edge proxy's address too, or every
+client resolves to the edge and shares its rate limits.
 
 Put secrets and other knobs in `.env` beside `compose.yaml` (compose also
 interpolates it):
@@ -70,8 +74,13 @@ GALLY_MEDIA_SECRET=...
 GALLY_SECURE_COOKIES=1
 ```
 
-`docker compose stop` sends SIGTERM and waits `stop_grace_period: 120s`, so
-in-flight requests drain; `docker compose down` does the same.
+`GALLY_SECURE_COOKIES` defaults to `1` in `compose.yaml`; set it to `0` only
+when the app is served over plain HTTP on a LAN.
+
+`docker compose stop` sends SIGTERM and waits up to `stop_grace_period: 120s`
+for in-flight requests; longer ones (a slow large upload) are cut, and the
+chunked client resumes from its committed offset after restart. `docker
+compose down` does the same.
 
 Both services run as UID/GID `10001`, and the image creates `/data` and
 `/backups` with that ownership. The named volumes (`gally-data`,
@@ -79,7 +88,7 @@ Both services run as UID/GID `10001`, and the image creates `/data` and
 10001:10001 ./data` (and `./backups`) first, or the app cannot create its
 lock, secret and database. Keep `.env` `0600`; it holds secrets.
 
-Server-side previews are generated at upload time for new JPG/PNG/GIF/WebP/BMP/TIFF/ICO
+Server-side previews are generated at upload time for new JPG/PNG/GIF/WebP/BMP/ICO
 photos; photos uploaded before this version have no preview and the grid falls
 back to the original (no backfill command).
 

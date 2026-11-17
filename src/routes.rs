@@ -228,7 +228,7 @@ const THUMB_MAX_SIDE: u32 = 16_384;
 fn thumb_supported(ext: &str) -> bool {
     matches!(
         ext,
-        ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".tiff" | ".ico"
+        ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".ico"
     )
 }
 
@@ -450,17 +450,29 @@ fn client_ip_from(
 ) -> IpAddr {
     // Never trust X-Forwarded-For by default: any client can spoof it and
     // dodge the rate limit. Only the real connection address counts, unless
-    // the peer is in GALLY_TRUST_PROXY (a reverse proxy, local or remote):
-    // then the rightmost XFF entry (closest proxy hop) is used.
+    // the peer is in GALLY_TRUST_PROXY (a reverse proxy, local or remote).
+    // Then walk XFF right-to-left past trusted proxies: the first address
+    // not in the list is the client, so every proxy hop must be listed.
     let peer = info.map(|c| c.ip()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    if trusted.iter().any(|net| net.contains(&peer))
-        && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(last) = xff.rsplit(',').next().map(str::trim)
-        && let Ok(ip) = last.parse::<IpAddr>()
-    {
-        return ip;
+    if !trusted.iter().any(|net| net.contains(&peer)) {
+        return peer;
     }
-    peer
+    let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+        return peer;
+    };
+    let mut leftmost = None;
+    for hop in xff.rsplit(',').map(str::trim) {
+        let Ok(ip) = hop.parse::<IpAddr>() else {
+            // A malformed hop makes the whole chain unverifiable: fall back
+            // to the peer rather than guess a spoofable address.
+            return peer;
+        };
+        if !trusted.iter().any(|net| net.contains(&ip)) {
+            return ip;
+        }
+        leftmost = Some(ip);
+    }
+    leftmost.unwrap_or(peer)
 }
 
 fn request_key(headers: &HeaderMap) -> Option<String> {
@@ -2267,6 +2279,38 @@ mod tests {
         assert_eq!(
             client_ip_from(&headers, peer("192.0.2.1"), &trusted),
             direct
+        );
+    }
+
+    #[test]
+    fn client_ip_walks_forwarded_for_through_trusted_hops() {
+        let trusted = parse_trust_proxy("127.0.0.1/32, 10.0.0.0/8");
+        let peer = |ip: &str| Some(ConnectInfo(format!("{ip}:1234").parse().unwrap()));
+        let client: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut headers = HeaderMap::new();
+
+        // Edge proxy -> local Caddy -> app; both proxy hops are trusted.
+        headers.insert("x-forwarded-for", "198.51.100.7, 10.9.9.9".parse().unwrap());
+        assert_eq!(
+            client_ip_from(&headers, peer("127.0.0.1"), &trusted),
+            client
+        );
+
+        // Every hop trusted: the leftmost address is the best client guess.
+        headers.insert("x-forwarded-for", "10.5.5.5, 10.9.9.9".parse().unwrap());
+        assert_eq!(
+            client_ip_from(&headers, peer("127.0.0.1"), &trusted),
+            "10.5.5.5".parse::<IpAddr>().unwrap()
+        );
+
+        // A malformed hop is not guessed; rate-limit the connection peer.
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.7, not-an-ip".parse().unwrap(),
+        );
+        assert_eq!(
+            client_ip_from(&headers, peer("127.0.0.1"), &trusted),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
         );
     }
 
