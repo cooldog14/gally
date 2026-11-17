@@ -632,6 +632,43 @@ async function testProtectReflectsLock() {
   await tick();
   await openPage.fire("lock-btn");
   assert.strictEqual(openPage.els.get("setpass-remove").hidden, true, "unlocked gallery hides Remove");
+
+  // Enter in #setpass-input must submit Save, never Remove: browsers use the
+  // first submit button in tree order as the default submitter.
+  const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+  const formStart = html.indexOf('id="setpass-form"');
+  const form = html.slice(formStart, html.indexOf("</form>", formStart));
+  const submits = [...form.matchAll(/<button[^>]*type="submit"[^>]*>/g)].map((m) => m[0]);
+  assert.strictEqual(submits.length, 2, "setpass-form has Save and Remove");
+  assert.match(submits[0], /id="setpass-confirm"/, "Enter submits Save");
+  assert.match(submits[0], /value="default"/);
+  assert.match(submits[1], /id="setpass-remove"/);
+
+  // Implicit Enter (browsers may omit `submitter`) must send the typed
+  // password, not the remove action's empty one.
+  let sent = null;
+  const enterPage = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    listing: { slug: SLUG, public: true, locked: true, photos: [] },
+    handler: (url, opts) => {
+      if (url.endsWith("/lock")) {
+        sent = JSON.parse(opts.body);
+        return {
+          status: 200,
+          ok: true,
+          statusText: "status 200",
+          json: async () => ({ slug: SLUG, locked: true }),
+        };
+      }
+      throw new Error("unexpected request " + url);
+    },
+  });
+  await tick();
+  await enterPage.fire("lock-btn");
+  enterPage.els.get("setpass-input").value = "Viewer-Pass-9";
+  await enterPage.fire("setpass-form", { type: "submit" });
+  assert.deepStrictEqual(sent, { password: "Viewer-Pass-9" }, "Enter saves the new password");
 }
 
 async function testNoHeicNeverLoadsDecoder() {

@@ -1,5 +1,6 @@
 //! SQLite gallery metadata: galleries.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,7 +59,7 @@ pub(crate) fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Frozen schema. Every install starts here; legacy files are not migrated.
+/// Fresh-install schema. Older files are upgraded by `migrate`.
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0, token_version INTEGER NOT NULL DEFAULT 0);
     CREATE INDEX IF NOT EXISTS idx_galleries_key ON galleries(key_hash);
@@ -76,7 +77,60 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000; {SCHEMA}"
     ))?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+fn gallery_columns(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(galleries)")?;
+    stmt.query_map([], |r| r.get::<_, String>(1))?.collect()
+}
+
+/// Bring pre-current data dirs up to `SCHEMA`. Every step is guarded by the
+/// live column set, so re-running on a current DB is a no-op.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut cols = gallery_columns(conn)?;
+    if !cols.contains("pass_hash") {
+        conn.execute("ALTER TABLE galleries ADD COLUMN pass_hash BLOB", [])?;
+        cols.insert("pass_hash".to_string());
+    }
+    // Pre-scoped-auth DDL carried a UNIQUE constraint on key_hash, so one key
+    // could own only one gallery. Rebuild without it.
+    let legacy_unique: bool = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='galleries'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|ddl| ddl.contains("UNIQUE"))
+        .unwrap_or(false);
+    if legacy_unique {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE galleries_new(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB);
+             INSERT INTO galleries_new SELECT slug, key_hash, created, pass_hash FROM galleries;
+             DROP TABLE galleries;
+             ALTER TABLE galleries_new RENAME TO galleries;
+             CREATE INDEX idx_galleries_key ON galleries(key_hash);
+             COMMIT;",
+        )?;
+        cols = gallery_columns(conn)?;
+    }
+    // Pre-visibility galleries were all public: default the added column to 1.
+    for (name, decl) in [
+        ("public", "INTEGER NOT NULL DEFAULT 1"),
+        ("bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("photos", "INTEGER NOT NULL DEFAULT 0"),
+        ("token_version", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !cols.contains(name) {
+            conn.execute(
+                &format!("ALTER TABLE galleries ADD COLUMN {name} {decl}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Per-gallery counters + visibility, read in one row.
@@ -470,6 +524,62 @@ mod tests {
             .get_or_create_gallery("test-gallery-key-04")
             .expect("create");
         assert!(db.gallery_exists(&slug));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_migrates_legacy_schemas() {
+        let dir = std::env::temp_dir().join(format!("gally-db-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "legacy-key-0001";
+        let slug = "velvet-lagoon-quiet-river-1a2b";
+
+        // Pre-scoped-auth: UNIQUE key_hash, no pass_hash/public/counters.
+        let path = dir.join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL UNIQUE, created INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO galleries(slug, key_hash, created) VALUES(?1, ?2, 1)",
+                rusqlite::params![slug, key_hash(key)],
+            )
+            .unwrap();
+        }
+        let mut db = open(&path).expect("open migrates pre-scoped-auth db");
+        recount(&mut db, &dir).expect("recount after migration");
+        assert!(db.key_owns_slug(key, slug));
+        assert!(db.gallery_meta(slug).expect("meta").public);
+        assert!(
+            db.get_or_create_gallery(key).is_some(),
+            "same key must mint a second gallery after the UNIQUE rebuild"
+        );
+
+        // Pre-token_version: a locked gallery from the previous release.
+        let path = dir.join("legacy2.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO galleries(slug, key_hash, created, public) VALUES(?1, X'00', 1, 1)",
+                [slug],
+            )
+            .unwrap();
+        }
+        let mut db = open(&path).expect("open migrates pre-token_version db");
+        assert_eq!(db.gallery_token_version(slug), Some(0));
+        assert!(db.set_gallery_pass(slug, Some(&hash_password("Viewer-Pass-9"))));
+        assert_eq!(
+            db.gallery_token_version(slug),
+            Some(1),
+            "changing the password bumps the new column"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

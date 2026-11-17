@@ -27,6 +27,9 @@ const FREE_CHECK_EVERY: u64 = 64 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard ceiling on one upload, however fast the client.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(6 * 3600);
+/// Abandoned resumable-upload temps count against the gallery quota until
+/// this age, then a sweep reclaims them.
+const PART_TTL: Duration = Duration::from_secs(3600);
 
 /// Free bytes on the data volume, or `None` when unknown (never blocks).
 fn free_bytes(path: &std::path::Path) -> Option<u64> {
@@ -344,6 +347,7 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
         db.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok()
     };
     let dir_ok = tokio::fs::read_dir(&state.dir).await.is_ok();
+    let _ = sweep_and_measure_parts(&state, None, None).await;
     let free = free_bytes(&state.dir);
     let free_ok = state.limits.min_free == 0 || free.is_some_and(|f| f >= state.limits.min_free);
     let ok = db_ok && dir_ok && free_ok;
@@ -1147,6 +1151,51 @@ pub async fn spa_or_404(
     }
 }
 
+/// Reap abandoned `.part-*` uploads older than `PART_TTL` and return how many
+/// bytes of `slug` the live ones hold. `exclude` is the current request's own
+/// temp: its committed prefix is already accounted for by the caller.
+async fn sweep_and_measure_parts(
+    state: &AppState,
+    slug: Option<&str>,
+    exclude: Option<&std::path::Path>,
+) -> u64 {
+    let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await else {
+        return 0;
+    };
+    let mut pending = 0u64;
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(".part-") else {
+            continue;
+        };
+        // `.part-{slug}_{upload-id}`: neither part contains a stray underscore.
+        let id = rest.rsplit('_').next().unwrap_or(rest);
+        let active = state.upload_ids.lock().unwrap().contains(id);
+        let Ok(md) = ent.metadata().await else {
+            continue;
+        };
+        let expired = !active
+            && md
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= PART_TTL);
+        // A failed removal keeps the bytes on disk, so they keep counting.
+        if expired && tokio::fs::remove_file(ent.path()).await.is_ok() {
+            continue;
+        }
+        if exclude.is_some_and(|ex| ex == ent.path().as_path()) {
+            continue;
+        }
+        if let Some(s) = slug
+            && name.starts_with(&format!(".part-{s}_"))
+        {
+            pending = pending.saturating_add(md.len());
+        }
+    }
+    pending
+}
+
 /// Remove `prefix*` files directly under `dir`; a missing dir is empty.
 async fn sweep_dir(dir: &std::path::Path, prefix: &str) -> (usize, usize) {
     let mut removed = 0;
@@ -1200,14 +1249,20 @@ async fn has_prefixed(dir: &std::path::Path, prefix: &str) -> bool {
 /// (removed, failed, still_remaining).
 async fn sweep_files(state: &AppState, slug: &str) -> (usize, usize, bool) {
     let prefix = format!("{slug}_");
+    let part_prefix = format!(".part-{slug}_");
     let thumbs = state.dir.join(".thumbs");
     let (mut removed, mut failed) = sweep_dir(&state.dir, &prefix).await;
+    let (part_removed, part_failed) = sweep_dir(&state.dir, &part_prefix).await;
+    removed += part_removed;
+    failed += part_failed;
     let (thumb_removed, thumb_failed) = sweep_dir(&thumbs, &prefix).await;
     removed += thumb_removed;
     failed += thumb_failed;
     // A concurrent upload may land mid-sweep: re-scan, never claim success
     // while files remain. A scan error means we cannot prove the dirs are clean.
-    let remaining = has_prefixed(&state.dir, &prefix).await || has_prefixed(&thumbs, &prefix).await;
+    let remaining = has_prefixed(&state.dir, &prefix).await
+        || has_prefixed(&state.dir, &part_prefix).await
+        || has_prefixed(&thumbs, &prefix).await;
     (removed, failed, remaining)
 }
 
@@ -1326,6 +1381,29 @@ async fn sweep_orphans(
     };
     while let Ok(Some(ent)) = rd.next_entry().await {
         let name = ent.file_name().to_string_lossy().into_owned();
+        // Abandoned resumable-upload temp: `.part-{slug}_{upload-id}`.
+        if let Some(rest) = name.strip_prefix(".part-") {
+            let Some((slug, _)) = rest.split_once('_') else {
+                continue;
+            };
+            let id = rest.rsplit('_').next().unwrap_or(rest);
+            if !is_slug(slug) || state.upload_ids.lock().unwrap().contains(id) {
+                continue;
+            }
+            let exists = {
+                let db = state.db.lock().unwrap();
+                db.gallery_exists(slug)
+            };
+            if exists {
+                continue;
+            }
+            if tokio::fs::remove_file(ent.path()).await.is_ok() {
+                *deleted += 1;
+            } else {
+                *failed += 1;
+            }
+            continue;
+        }
         if name.starts_with('.') {
             continue;
         }
@@ -1367,6 +1445,8 @@ pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap)
     };
     let mut deleted: usize = 0;
     let mut failed: usize = 0;
+    // Reap expired temps first; the orphan pass below handles the rest.
+    let _ = sweep_and_measure_parts(&state, None, None).await;
     // The directory listing is a snapshot: an upload mid-stream (.part-) or a
     // gallery created after the query keeps its files, so never delete those.
     if sweep_orphans(&state, &state.dir, &known, true, &mut deleted, &mut failed)
@@ -1639,11 +1719,11 @@ pub async fn put_photo(
     let (final_name, temp_path) = match &chunk {
         Some((_, id)) => (
             format!("{slug}_{id}_{sanitized}"),
-            state.dir.join(format!(".part-{id}")),
+            state.dir.join(format!(".part-{slug}_{id}")),
         ),
         None => (
             format!("{slug}_{uuid}_{sanitized}"),
-            state.dir.join(format!(".part-{uuid}")),
+            state.dir.join(format!(".part-{slug}_{uuid}")),
         ),
     };
     // Lost reply to the final chunk: the file is already stored, answer
@@ -1671,6 +1751,10 @@ pub async fn put_photo(
         });
         (m.bytes.max(0) as u64, m.photos)
     };
+    // Live `.part-*` temps belong to this gallery too: a stalled chunked
+    // upload must not let a second one bypass the byte quota.
+    let pending = sweep_and_measure_parts(&state, Some(&slug), Some(&temp_path)).await;
+    let used_bytes = used_bytes.saturating_add(pending);
     if limits.gallery_bytes > 0 && used_bytes >= limits.gallery_bytes {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
     }
@@ -1809,7 +1893,11 @@ pub async fn put_photo(
             Err(_) => {
                 drop(out);
                 if chunk.is_some() {
-                    // Keep the committed prefix: the client resumes it.
+                    // Keep the committed prefix: the client resumes it. An
+                    // empty first chunk would otherwise pin an idle temp file.
+                    if base_len == 0 && written == 0 {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                    }
                     return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
                 }
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1822,6 +1910,9 @@ pub async fn put_photo(
             Err(_) => {
                 drop(out);
                 if chunk.is_some() {
+                    if base_len == 0 && written == 0 {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                    }
                     return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
                 }
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1845,9 +1936,13 @@ pub async fn put_photo(
             && accumulated <= limits.max_file as u64
             && (limits.gallery_bytes == 0 || used_bytes + accumulated <= limits.gallery_bytes);
         if !ok {
-            drop(out);
-            if chunk.is_none() {
+            if base_len == 0 {
+                drop(out);
                 let _ = tokio::fs::remove_file(&temp_path).await;
+            } else {
+                // Keep the committed prefix resumable, but do not let this
+                // rejected chunk's bytes eat the quota until the TTL sweep.
+                let _ = out.set_len(base_len).await;
             }
             return ApiError::TooLarge.into_response();
         }
@@ -1857,9 +1952,11 @@ pub async fn put_photo(
                 && limits.min_free > 0
                 && free < limits.min_free
             {
-                drop(out);
-                if chunk.is_none() {
+                if base_len == 0 {
+                    drop(out);
                     let _ = tokio::fs::remove_file(&temp_path).await;
+                } else {
+                    let _ = out.set_len(base_len).await;
                 }
                 return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
             }
