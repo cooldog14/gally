@@ -192,18 +192,14 @@ body.editing #main { padding-bottom: 150px; }
 .tile.selected .tick { display: block; background: var(--fg); color: var(--bg); }
 .tile.selected img { outline: 2px solid var(--fg); outline-offset: -2px; opacity: 0.85; }
 
-#confirm-dialog { border: 1px solid var(--border); background: var(--bg); color: var(--fg); padding: 20px; max-width: 340px; }
-#confirm-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
-#confirm-dialog h2 { font-size: 16px; margin: 0 0 8px; }
-#confirm-dialog p { font-size: 13px; color: var(--muted); }
+dialog { border: 1px solid var(--border); background: var(--bg); color: var(--fg); padding: 20px; max-width: 340px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+dialog h2 { font-size: 16px; margin: 0 0 8px; }
+dialog p { font-size: 13px; color: var(--muted); }
 #upload-status:empty { display: none; }
 #key-error { color: #dc2626; min-height: 1em; }
 :root[data-theme="dark"] #key-error { color: #f87171; }
 
-#key-dialog { border: 1px solid var(--border); background: var(--bg); color: var(--fg); padding: 20px; max-width: 340px; }
-#key-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
-#key-dialog h2 { font-size: 16px; margin: 0 0 8px; }
-#key-dialog p { font-size: 13px; color: var(--muted); }
 #key-input { width: 100%; margin: 8px 0; font-family: ui-monospace, monospace; letter-spacing: 0.02em; }
 #key-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 

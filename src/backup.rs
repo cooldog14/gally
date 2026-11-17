@@ -1,7 +1,7 @@
 //! `gally-uring --backup <dest>`: consistent DB snapshot + photo copy.
 //! VACUUM INTO takes a coherent copy while the server keeps writing.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 
@@ -43,11 +43,25 @@ fn copy_tree(from: &Path, to: &Path, files: &mut usize) -> anyhow::Result<()> {
 
 /// Refuses a destination inside the live data dir.
 fn absolutize(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(p)
-    })
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        return canon;
+    }
+    // A destination that does not exist yet cannot be canonicalized; resolve
+    // `..` lexically so it cannot dodge the live-dir guard.
+    let abs = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(p);
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 /// Copy `root`'s database and photos into `dest` (created if missing).
 /// Overwrites an earlier backup in place; stale photos are pruned.
@@ -211,6 +225,23 @@ mod tests {
         assert_eq!(n, 1, "backup keeps the gallery row");
     }
 
+    #[test]
+    fn backup_refuses_dotdot_path_into_live_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("photos")).unwrap();
+        // The destination does not exist, so canonicalize fails; resolving
+        // `..` lexically still lands inside the live data dir.
+        let dest = tmp
+            .path()
+            .join("backups")
+            .join("..")
+            .join("data")
+            .join("backups");
+        let err = run(&root, &dest).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing"), "{err:#}");
+    }
+
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for ent in std::fs::read_dir(from).unwrap().flatten() {
@@ -240,7 +271,7 @@ mod tests {
         std::fs::write(photos.join(&name), bytes).unwrap();
         assert_eq!(
             db.add_upload(&slug, &name, bytes.len() as u64, 1_000),
-            Some((bytes.len() as i64, 1))
+            Ok(Some((bytes.len() as i64, 1)))
         );
         std::fs::create_dir_all(photos.join(".thumbs")).unwrap();
         std::fs::write(photos.join(".thumbs").join(format!("{name}.jpg")), b"thumb").unwrap();
@@ -274,7 +305,7 @@ mod tests {
         let mut sdb = crate::db::open(&db_path).unwrap();
         assert_eq!(
             sdb.remove_upload(&slug, &name, bytes.len() as u64),
-            Some((0, 0))
+            Ok(Some((0, 0)))
         );
         drop(sdb);
         run(&root, &dest).unwrap();
@@ -321,7 +352,7 @@ mod tests {
         let hex = "d".repeat(32);
         let name_a = format!("{slug_a}_{hex}_a.jpg");
         std::fs::write(photos.join(&name_a), b"a").unwrap();
-        db.add_upload(&slug_a, &name_a, 1, 1_000).unwrap();
+        db.add_upload(&slug_a, &name_a, 1, 1_000).unwrap().unwrap();
         drop(db);
         let dest = tmp.path().join("dest");
         run(&root, &dest).unwrap();
@@ -331,7 +362,7 @@ mod tests {
         let slug_b = db.get_or_create_gallery("fail-key-b-0002").unwrap();
         let name_b = format!("{slug_b}_{hex}_b.jpg");
         std::fs::write(photos.join(&name_b), b"b").unwrap();
-        db.add_upload(&slug_b, &name_b, 1, 1_000).unwrap();
+        db.add_upload(&slug_b, &name_b, 1, 1_000).unwrap().unwrap();
         drop(db);
         // copy(file -> existing dir) fails, exercising the photo-copy stage.
         let blocker = dest.join("photos").join(&name_b);

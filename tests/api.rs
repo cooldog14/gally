@@ -488,6 +488,62 @@ async fn put_roundtrip_bytes_identical() {
 }
 
 #[tokio::test]
+async fn suffix_range_longer_than_file_serves_whole_file() {
+    let (state, _tmp) = test_state().await;
+    let bytes = b"0123456789".to_vec();
+    let (status, v) = put_photo(
+        &state,
+        "short.txt",
+        Some(KEY_A),
+        None,
+        "text/plain",
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = v["name"].as_str().unwrap().to_string();
+    let uri = format!("/photos/{name}");
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=-100")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes 0-9/10",
+        "an over-long suffix means the whole file (RFC 9110)"
+    );
+    assert_eq!(body_bytes(resp).await, bytes);
+
+    // A zero-length suffix remains unsatisfiable.
+    let resp = router(state)
+        .oneshot(get(&uri, &[key_header(KEY_A), ("range", "bytes=-0")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[tokio::test]
+async fn oga_is_served_as_inline_audio() {
+    let (state, _tmp) = test_state().await;
+    let mut bytes = b"OggS\x00\x02".to_vec();
+    bytes.extend_from_slice(b"vorbis");
+    let (status, v) = put_photo(&state, "clip.oga", Some(KEY_A), None, "audio/ogg", bytes).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = v["name"].as_str().unwrap().to_string();
+    let resp = router(state)
+        .oneshot(get(&format!("/photos/{name}"), &[key_header(KEY_A)]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "audio/ogg");
+    assert!(
+        resp.headers().get("content-disposition").is_none(),
+        ".oga plays inline like .ogg"
+    );
+}
+
+#[tokio::test]
 async fn put_missing_key_is_401() {
     let (state, _tmp) = test_state().await;
     let (status, _) = put_photo(&state, "shot.jpg", None, None, "image/jpeg", jpeg()).await;
@@ -1143,10 +1199,28 @@ async fn gallery_slug_serves_spa() {
 }
 
 #[tokio::test]
-async fn unknown_gallery_slug_redirects_home() {
+async fn unknown_gallery_slug_serves_spa() {
+    // The page route must not reveal whether a slug exists: an unknown valid
+    // slug gets the same SPA as an existing private one. The client redirects
+    // home when its listing 404s.
     let (state, _tmp) = test_state().await;
-    let resp = router(state)
+    let resp = router(state.clone())
         .oneshot(get("/quiet-river-calm-pond-1a2b", &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+
+    // A malformed slug still goes home.
+    let resp = router(state)
+        .oneshot(get("/not-a-slug", &[]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FOUND);
@@ -3649,7 +3723,7 @@ async fn startup_backfills_exif_capture_date() {
         jpeg_with_exif("2020:01:02 03:04:05"),
     )
     .unwrap();
-    assert_eq!(db.add_upload(&slug, &name, 1, 1), Some((1, 1)));
+    assert_eq!(db.add_upload(&slug, &name, 1, 1).unwrap(), Some((1, 1)));
     drop(db);
 
     let state = AppState::new_with(root, Limits::defaults())

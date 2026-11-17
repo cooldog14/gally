@@ -259,7 +259,8 @@ pub trait GalleryDb {
     /// Publish (true) or hide (false) the whole gallery. False when unknown.
     fn set_public(&mut self, slug: &str, public: bool) -> bool;
     /// Record one stored file in the listing table and the counters, one
-    /// transaction: `(bytes, photos)` after. None when the gallery vanished.
+    /// transaction: `(bytes, photos)` after. `Ok(None)` when the gallery
+    /// vanished; errors are DB failures, not a missing gallery.
     /// `created` is the sort timestamp (capture time, or upload time).
     fn add_upload(
         &mut self,
@@ -267,10 +268,15 @@ pub trait GalleryDb {
         name: &str,
         bytes: u64,
         created: i64,
-    ) -> Option<(i64, i64)>;
+    ) -> rusqlite::Result<Option<(i64, i64)>>;
     /// Forget one removed file and its listing row (saturating counters):
-    /// `(bytes, photos)` after. None when the gallery is unknown.
-    fn remove_upload(&mut self, slug: &str, name: &str, bytes: u64) -> Option<(i64, i64)>;
+    /// `(bytes, photos)` after. `Ok(None)` when the gallery is unknown.
+    fn remove_upload(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+    ) -> rusqlite::Result<Option<(i64, i64)>>;
     /// Delete the gallery row and every `photos` row for it, one transaction.
     /// The key keeps working.
     fn remove_gallery(&mut self, slug: &str) -> bool;
@@ -363,59 +369,54 @@ impl GalleryDb for Connection {
         name: &str,
         bytes: u64,
         created: i64,
-    ) -> Option<(i64, i64)> {
-        let tx = self.transaction().ok()?;
-        let n = tx
-            .execute(
-                "UPDATE galleries SET bytes = bytes + ?1, photos = photos + 1 WHERE slug = ?2",
-                rusqlite::params![bytes as i64, slug],
-            )
-            .ok()?;
+    ) -> rusqlite::Result<Option<(i64, i64)>> {
+        let tx = self.transaction()?;
+        let n = tx.execute(
+            "UPDATE galleries SET bytes = bytes + ?1, photos = photos + 1 WHERE slug = ?2",
+            rusqlite::params![bytes as i64, slug],
+        )?;
         // Row vanished mid-upload: drop the transaction (rollback).
         if n == 0 {
-            return None;
+            return Ok(None);
         }
         tx.execute(
             "INSERT OR REPLACE INTO photos(slug, name, size, created) VALUES(?1, ?2, ?3, ?4)",
             rusqlite::params![slug, name, bytes as i64, created],
-        )
-        .ok()?;
-        let out = tx
-            .query_row(
-                "SELECT bytes, photos FROM galleries WHERE slug = ?1",
-                [slug],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok()?;
-        tx.commit().ok()?;
-        Some(out)
+        )?;
+        let out = tx.query_row(
+            "SELECT bytes, photos FROM galleries WHERE slug = ?1",
+            [slug],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.commit()?;
+        Ok(Some(out))
     }
 
-    fn remove_upload(&mut self, slug: &str, name: &str, bytes: u64) -> Option<(i64, i64)> {
-        let tx = self.transaction().ok()?;
-        let n = tx
-            .execute(
-                "UPDATE galleries SET bytes = MAX(bytes - ?1, 0), photos = MAX(photos - 1, 0) WHERE slug = ?2",
-                rusqlite::params![bytes as i64, slug],
-            )
-            .ok()?;
+    fn remove_upload(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+    ) -> rusqlite::Result<Option<(i64, i64)>> {
+        let tx = self.transaction()?;
+        let n = tx.execute(
+            "UPDATE galleries SET bytes = MAX(bytes - ?1, 0), photos = MAX(photos - 1, 0) WHERE slug = ?2",
+            rusqlite::params![bytes as i64, slug],
+        )?;
         if n == 0 {
-            return None;
+            return Ok(None);
         }
         tx.execute(
             "DELETE FROM photos WHERE slug = ?1 AND name = ?2",
             rusqlite::params![slug, name],
-        )
-        .ok()?;
-        let out = tx
-            .query_row(
-                "SELECT bytes, photos FROM galleries WHERE slug = ?1",
-                [slug],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok()?;
-        tx.commit().ok()?;
-        Some(out)
+        )?;
+        let out = tx.query_row(
+            "SELECT bytes, photos FROM galleries WHERE slug = ?1",
+            [slug],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.commit()?;
+        Ok(Some(out))
     }
 
     fn remove_gallery(&mut self, slug: &str) -> bool {
@@ -587,14 +588,14 @@ mod tests {
     fn counters_track_uploads_and_removals() {
         let mut db = mem();
         let slug = db.get_or_create_gallery("counters-key-01").expect("create");
-        assert_eq!(db.add_upload(&slug, "a.jpg", 40, 1_000), Some((40, 1)));
-        assert_eq!(db.add_upload(&slug, "b.jpg", 60, 2_000), Some((100, 2)));
-        assert_eq!(db.remove_upload(&slug, "a.jpg", 40), Some((60, 1)));
+        assert_eq!(db.add_upload(&slug, "a.jpg", 40, 1_000), Ok(Some((40, 1))));
+        assert_eq!(db.add_upload(&slug, "b.jpg", 60, 2_000), Ok(Some((100, 2))));
+        assert_eq!(db.remove_upload(&slug, "a.jpg", 40), Ok(Some((60, 1))));
         // Saturating: counters never go negative.
-        assert_eq!(db.remove_upload(&slug, "b.jpg", 1_000), Some((0, 0)));
+        assert_eq!(db.remove_upload(&slug, "b.jpg", 1_000), Ok(Some((0, 0))));
         assert_eq!(
             db.add_upload("no-such-gallery-aaaa", "x.jpg", 1, 3_000),
-            None
+            Ok(None)
         );
         // The listing rows tracked the same add/remove cycle.
         let rows: i64 = db
@@ -632,7 +633,7 @@ mod tests {
         let slug = db
             .get_or_create_gallery("recount-error-key")
             .expect("create");
-        assert_eq!(db.add_upload(&slug, "kept.jpg", 5, 500), Some((5, 1)));
+        assert_eq!(db.add_upload(&slug, "kept.jpg", 5, 500), Ok(Some((5, 1))));
         // read_dir on a regular file fails like a permission or mount error.
         let not_a_dir = dir.join("photos");
         std::fs::write(&not_a_dir, b"not a directory").unwrap();
@@ -672,11 +673,11 @@ mod tests {
             b"zz",
         )
         .unwrap();
-        assert_eq!(db.add_upload(&slug, "stale.jpg", 5, 500), Some((5, 1)));
+        assert_eq!(db.add_upload(&slug, "stale.jpg", 5, 500), Ok(Some((5, 1))));
         // Capture times already in the DB survive the rebuild.
         assert_eq!(
             db.add_upload(&slug, &name("a.jpg"), 40, 12_345),
-            Some((45, 2))
+            Ok(Some((45, 2)))
         );
         recount(&mut db, &photos).expect("recount");
         let meta = db.gallery_meta(&slug).expect("meta");
@@ -720,7 +721,7 @@ mod tests {
         let slug = db.get_or_create_gallery("backfill-key-01").expect("create");
         let name = format!("{slug}_{}_old.jpg", "b".repeat(32));
         // No such file: no EXIF, so nothing is rewritten.
-        assert_eq!(db.add_upload(&slug, &name, 3, 1), Some((3, 1)));
+        assert_eq!(db.add_upload(&slug, &name, 3, 1), Ok(Some((3, 1))));
         assert_eq!(backfill_exif(&mut db, &photos).expect("backfill"), 0);
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |r| r.get(0))
