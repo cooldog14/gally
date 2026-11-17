@@ -1427,6 +1427,60 @@ async fn startup_sweeps_stale_part_files() {
 }
 
 #[tokio::test]
+async fn legacy_db_without_token_version_migrates_and_locks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let slug = "velvet-lagoon-quiet-river-1a2b";
+    let photo = format!("{slug}_{}_legacy.jpg", "c".repeat(32));
+    let photos = tmp.path().join("photos");
+    std::fs::create_dir_all(&photos).unwrap();
+    std::fs::write(photos.join(&photo), jpeg()).unwrap();
+    {
+        let conn = rusqlite::Connection::open(tmp.path().join("galleries.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO galleries(slug, key_hash, created, pass_hash, public, bytes, photos) VALUES(?1, ?2, 1, ?3, 1, 10, 1)",
+            rusqlite::params![
+                slug,
+                gally_uring::db::key_hash(KEY_A),
+                gally_uring::db::hash_password("Viewer-Pass-9")
+            ],
+        )
+        .unwrap();
+    }
+    let state = AppState::new_with(tmp.path(), Limits::defaults())
+        .await
+        .expect("AppState starts on a pre-token_version db");
+
+    // Unlocking mints a viewer cookie whose version needs the new column.
+    let r = get(
+        &format!("/api/galleries/{slug}/photos"),
+        &[("x-gallery-pass", "Viewer-Pass-9")],
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = set_cookie_pair(&resp, &format!("galpass_{slug}")).expect("viewer cookie");
+
+    let r = get(&format!("/photos/{photo}"), &[("cookie", cookie.as_str())]);
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "viewer cookie authorizes media"
+    );
+
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":""}"#,
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "lock writes token_version");
+}
+
+#[tokio::test]
 async fn second_instance_cannot_share_the_data_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let first = AppState::new_with(tmp.path(), Limits::defaults())
@@ -3277,6 +3331,80 @@ async fn chunked_upload_resumes_and_is_idempotent() {
         .unwrap();
     let listed = body_json(resp).await;
     assert_eq!(listed["photos"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn abandoned_part_files_count_toward_quota_until_expired() {
+    let (state, _tmp) = test_state_with(Limits {
+        gallery_bytes: 10,
+        ..Limits::defaults()
+    })
+    .await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id1 = "1".repeat(32);
+    let id2 = "2".repeat(32);
+
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id1,
+        "bytes 0-5/8",
+        b"abcdef",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["received"], 6);
+
+    // The abandoned temp holds 6 of 10 quota bytes: another 6-byte upload is
+    // refused before it writes anything.
+    let (status, _) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id2,
+        "bytes 0-5/6",
+        b"abcdef",
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let part1 = state.dir.join(format!(".part-{slug}_{id1}"));
+    assert!(part1.exists(), "committed chunk temp is on disk");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part1)
+        .unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)),
+    )
+    .unwrap();
+    drop(file);
+
+    let (status, _) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id2,
+        "bytes 0-5/6",
+        b"abcdef",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "expired temp is swept and the new chunk fits"
+    );
+    assert!(!part1.exists(), "expired temp file was reclaimed");
 }
 
 #[tokio::test]
