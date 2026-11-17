@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -126,6 +126,9 @@ pub struct AppState {
     /// Live upload streams per IP. Guarded by `UploadSlotGuard`: a slow
     /// client pins at most `limits.upload_slots_per_ip` global slots.
     pub upload_ips: Mutex<HashMap<IpAddr, usize>>,
+    /// Upload ids with a request actively writing their `.part-` temp. A
+    /// retry must not append concurrently: it would duplicate bytes.
+    pub upload_ids: Mutex<HashSet<String>>,
     pub argon2: tokio::sync::Semaphore,
     /// Thumbnail decodes in flight. Hardcoded to 2: a small thumbnail can
     /// need the full source bitmap in RAM, so this bounds peak decode memory.
@@ -381,6 +384,7 @@ impl AppState {
             media_secret,
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
             upload_ips: Mutex::new(HashMap::new()),
+            upload_ids: Mutex::new(HashSet::new()),
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
             thumbs: tokio::sync::Semaphore::new(2),
             read: Mutex::new(HashMap::new()),
@@ -433,6 +437,33 @@ impl Drop for UploadSlotGuard<'_> {
                 guard.remove(&self.ip);
             }
         }
+    }
+}
+
+/// RAII registration of one in-flight resumable upload id: `try_acquire`
+/// refuses a second request writing the same `.part-` temp, so a retry cannot
+/// interleave bytes with the request it thinks failed.
+pub struct UploadIdGuard<'a> {
+    ids: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl<'a> UploadIdGuard<'a> {
+    pub fn try_acquire(ids: &'a Mutex<HashSet<String>>, id: &str) -> Option<Self> {
+        let mut guard = ids.lock().unwrap();
+        if !guard.insert(id.to_string()) {
+            return None;
+        }
+        Some(Self {
+            ids,
+            id: id.to_string(),
+        })
+    }
+}
+
+impl Drop for UploadIdGuard<'_> {
+    fn drop(&mut self) {
+        self.ids.lock().unwrap().remove(&self.id);
     }
 }
 

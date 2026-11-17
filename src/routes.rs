@@ -48,6 +48,27 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// fsync a directory so a rename/remove survives a power cut. Some
+/// filesystems reject directory fsync; that is best effort.
+async fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || match std::fs::File::open(&dir)?.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Cookie name for one kind of media token: owner and viewer never share one.
 fn media_cookie(slug: &str, kind: MediaToken) -> String {
     let prefix = match kind {
@@ -1687,6 +1708,26 @@ pub async fn put_photo(
     {
         return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
     }
+    // One writer per upload id: a retry must not append to the same temp
+    // concurrently. A busy retry reports the committed length (the client
+    // jumps to it) and leaves the active request alone.
+    let _id_guard = match &chunk {
+        Some((_, id)) => match crate::state::UploadIdGuard::try_acquire(&state.upload_ids, id) {
+            Some(g) => Some(g),
+            None => {
+                let received = tokio::fs::metadata(&temp_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "upload in progress", "received": received })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let t_body = Instant::now();
     // Stream into a dot-prefixed temp file: dot names are never listed or
     // served, so a stalled or aborted upload stays invisible. The real name
@@ -1878,6 +1919,12 @@ pub async fn put_photo(
         .is_err()
     {
         let _ = tokio::fs::remove_file(&temp_path).await;
+        return ApiError::Internal.into_response();
+    }
+    // The rename is atomic; flush the directory entry so a power cut cannot
+    // leave the bytes under the startup-swept `.part-` name.
+    if sync_dir(&state.dir).await.is_err() {
+        let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
         return ApiError::Internal.into_response();
     }
     // Counters are the quota truth: reconcile after the file exists so a
@@ -2226,8 +2273,18 @@ pub async fn delete_photo(
         Ok(()) => {
             // Best effort: an old photo may have no thumb, and a stale one is
             // removed by admin_sweep if this races.
-            let _ =
-                tokio::fs::remove_file(state.dir.join(".thumbs").join(format!("{name}.jpg"))).await;
+            let thumbs = state.dir.join(".thumbs");
+            let _ = tokio::fs::remove_file(thumbs.join(format!("{name}.jpg"))).await;
+            // Flush the removal before forgetting the row: a power cut must
+            // not bring a deleted photo back.
+            if sync_dir(&state.dir).await.is_err() {
+                return ApiError::Internal.into_response();
+            }
+            match sync_dir(&thumbs).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error = %e, "thumbnail dir sync failed"),
+            }
             let mut db = state.db.lock().unwrap();
             let _ = db.remove_upload(&slug, &name, size);
             drop(db);
