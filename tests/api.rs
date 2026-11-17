@@ -3351,6 +3351,84 @@ async fn chunked_upload_skips_rate_limit_after_first_chunk() {
 }
 
 #[tokio::test]
+async fn concurrent_chunks_with_one_upload_id_are_serialized() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert_eq!(
+        put_chunk(
+            &state,
+            "pic.jpg",
+            KEY_A,
+            &slug,
+            id,
+            "bytes 0-7/16",
+            b"abcdefgh",
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED
+    );
+
+    // Hold the final chunk before it writes, then retry it: only one request
+    // may own the temp, or both append a copy of the chunk.
+    let (write, gate) = tokio::sync::oneshot::channel::<()>();
+    let body = Body::from_stream(futures::stream::once(async move {
+        let _ = gate.await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"ijklmnop"))
+    }));
+    let req = request(
+        "PUT",
+        "/api/photos/pic.jpg",
+        &[
+            ("content-type", "image/jpeg"),
+            ("x-gallery-key", KEY_A),
+            ("x-gallery-slug", slug.as_str()),
+            ("x-upload-id", id),
+            ("content-range", "bytes 8-15/16"),
+        ],
+        body,
+    );
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move { router(state).oneshot(req).await.unwrap() }
+    });
+    let mut owned = false;
+    for _ in 0..200 {
+        if state.upload_ids.lock().unwrap().contains(id) {
+            owned = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(owned, "first request never claimed the upload id");
+
+    let (second, _) = put_chunk(
+        &state,
+        "pic.jpg",
+        KEY_A,
+        &slug,
+        id,
+        "bytes 8-15/16",
+        b"qrstuvwx",
+    )
+    .await;
+    assert_eq!(second, StatusCode::CONFLICT);
+
+    write.send(()).unwrap();
+    let resp = first.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let final_name = format!("{slug}_{id}_pic.jpg");
+    assert_eq!(
+        std::fs::read(state.dir.join(&final_name)).unwrap(),
+        b"abcdefghijklmnop",
+        "the retry's body must not be appended"
+    );
+    assert!(!state.upload_ids.lock().unwrap().contains(id));
+}
+
+#[tokio::test]
 async fn chunked_upload_requires_slug() {
     let (state, _tmp) = test_state().await;
     let id = "d".repeat(32);
