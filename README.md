@@ -78,9 +78,9 @@ GALLY_SECURE_COOKIES=1
 when the app is served over plain HTTP on a LAN.
 
 `docker compose stop` sends SIGTERM and waits up to `stop_grace_period: 120s`
-for in-flight requests; longer ones (a slow large upload) are cut, and the
-chunked client resumes from its committed offset after restart. `docker
-compose down` does the same.
+for in-flight requests; longer ones (a slow large upload) are cut. Startup
+deletes partial uploads, so an interrupted upload cannot resume across a
+restart and starts that file from zero. `docker compose down` does the same.
 
 Both services run as UID/GID `10001`, and the image creates `/data` and
 `/backups` with that ownership. The named volumes (`gally-data`,

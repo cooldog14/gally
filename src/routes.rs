@@ -569,8 +569,16 @@ async fn check_locked(state: &AppState, ip: IpAddr, slug: &str, pass: &str) -> L
     let Some(hash) = stored else {
         return Locked::Open;
     };
-    // The gallery key always opens its own gallery (owner bypass).
     if !pass.is_empty() {
+        // The owner key also works in the viewer-password field (the dialog
+        // promises it): it is the strongest credential for this gallery.
+        let owns = {
+            let db = state.db.lock().unwrap();
+            db.key_owns_slug(pass, slug)
+        };
+        if owns {
+            return Locked::Unlocked;
+        }
         let key = pass_cache_key(&hash, pass);
         if let Some(at) = state.pass_ok.lock().unwrap().get(&key)
             && at.elapsed() < PASS_CACHE_TTL
@@ -1384,6 +1392,9 @@ pub async fn lock_gallery(
     // Correct keys are checked before the failure bucket, so a valid key is
     // never locked out by someone else's guessing.
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
+    if rate_limited(&state, &ip) {
+        return ApiError::TooMany.into_response();
+    }
     let key = match request_key(&headers) {
         Some(k) => k,
         None => {

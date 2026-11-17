@@ -5,7 +5,8 @@ x-gally: &gally
   build: .
   restart: unless-stopped
   # SIGTERM stops accepting, then waits up to 120 s for in-flight requests.
-  # Longer requests (a slow large upload) are cut; the chunked client resumes.
+  # Longer requests (a slow large upload) are cut; startup deletes the partial
+  # upload, so the client starts that file from zero after a restart.
   stop_grace_period: 120s
 
 services:
