@@ -155,10 +155,11 @@ fn parse_range(headers: &HeaderMap, len: u64) -> Option<Result<(u64, u64), ()>> 
         let Some(suffix) = b.parse::<u64>().ok() else {
             return Some(Err(()));
         };
-        if suffix == 0 || suffix > len {
+        if suffix == 0 {
             return Some(Err(()));
         }
-        return Some(Ok((len - suffix, len - 1)));
+        // RFC 9110: a suffix longer than the file means the whole file.
+        return Some(Ok((len.saturating_sub(suffix), len - 1)));
     }
     let Some(start) = a.parse::<u64>().ok() else {
         return Some(Err(()));
@@ -231,7 +232,7 @@ fn content_type_for(ext: &str) -> &'static str {
         ".ogv" => "video/ogg",
         ".mp3" => "audio/mpeg",
         ".wav" => "audio/wav",
-        ".ogg" => "audio/ogg",
+        ".ogg" | ".oga" => "audio/ogg",
         ".flac" => "audio/flac",
         ".m4a" => "audio/mp4",
         ".pdf" => "application/pdf",
@@ -1128,12 +1129,10 @@ pub async fn spa_or_404(
     if slug.contains('/') || slug == "gally" {
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    let known = is_slug(&slug) && {
-        let db = state.db.lock().unwrap();
-        db.gallery_exists(&slug)
-    };
-    if !known {
-        // Unknown, deleted, or legacy slug: send the user home.
+    // Any valid slug gets the SPA: 404 here for an unknown slug would leak
+    // whether a private gallery exists. The client redirects home when its
+    // listing 404s.
+    if !is_slug(&slug) {
         tracing::debug!(stage = "spa_gone", slug = slug.as_str());
         return (StatusCode::FOUND, [(header::LOCATION, "/")], "").into_response();
     }
@@ -2030,19 +2029,30 @@ pub async fn put_photo(
         let mut db = state.db.lock().unwrap();
         db.add_upload(&slug, &final_name, accumulated, created)
     };
-    if let Some((bytes, photos)) = usage {
-        let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
-            || (limits.gallery_photos > 0 && photos > limits.gallery_photos);
-        if over {
-            let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
-            let mut db = state.db.lock().unwrap();
-            let _ = db.remove_upload(&slug, &final_name, accumulated);
-            return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
+    match usage {
+        Ok(Some((bytes, photos))) => {
+            let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
+                || (limits.gallery_photos > 0 && photos > limits.gallery_photos);
+            if over {
+                let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
+                let mut db = state.db.lock().unwrap();
+                let _ = db.remove_upload(&slug, &final_name, accumulated);
+                return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
+            }
         }
-    } else {
-        // Row vanished mid-upload (delete raced us): drop the orphan file.
-        let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
-        return err(StatusCode::NOT_FOUND, "unknown gallery");
+        Ok(None) => {
+            // Row vanished mid-upload (delete raced us): drop the orphan file.
+            let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
+            return err(StatusCode::NOT_FOUND, "unknown gallery");
+        }
+        Err(_) => {
+            // A transient DB failure must not lose bytes the recount can
+            // recover: keep the file (and a minted gallery row) and report 500.
+            if let Some(m) = &mut mint {
+                m.keep = true;
+            }
+            return ApiError::Internal.into_response();
+        }
     }
     // Bytes are stored and quota-checked: this gallery now exists for real.
     // Disarm the rollback before thumbnail work, so a client disconnect during
@@ -2246,13 +2256,14 @@ async fn serve_photo(
             _ => String::new(),
         };
         // .ogg is ambiguous (Theora video vs Vorbis/Opus audio): sniff content.
-        let ctype = if ext == ".ogg" || ext == ".ogv" || ext == ".ogm" || ext == ".opus" {
-            sniff_ogg(&canon_file)
-                .await
-                .unwrap_or_else(|| content_type_for(ext.as_str()))
-        } else {
-            content_type_for(ext.as_str())
-        };
+        let ctype =
+            if ext == ".ogg" || ext == ".oga" || ext == ".ogv" || ext == ".ogm" || ext == ".opus" {
+                sniff_ogg(&canon_file)
+                    .await
+                    .unwrap_or_else(|| content_type_for(ext.as_str()))
+            } else {
+                content_type_for(ext.as_str())
+            };
         (ext, ctype.to_string())
     };
     tracing::debug!(
@@ -2383,13 +2394,15 @@ pub async fn delete_photo(
                 Err(e) => tracing::warn!(error = %e, "thumbnail dir sync failed"),
             }
             let mut db = state.db.lock().unwrap();
-            let _ = db.remove_upload(&slug, &name, size);
-            drop(db);
-            (
-                StatusCode::OK,
-                Json(json!({ "deleted": name, "gallery_gone": false })),
-            )
-                .into_response()
+            match db.remove_upload(&slug, &name, size) {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(json!({ "deleted": name, "gallery_gone": false })),
+                )
+                    .into_response(),
+                // The file is gone; a startup recount drops the stale row.
+                Err(_) => ApiError::Internal.into_response(),
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             err(StatusCode::NOT_FOUND, "not found")

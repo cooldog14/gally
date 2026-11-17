@@ -498,7 +498,7 @@ async function workflowEdit() {
   assert.strictEqual(await photoCount(slug, key), 2, "cancel keeps the photo");
 
   await page.fire("delete-gallery-btn");
-  assert.match(page.els.get("confirm-text").textContent, /Delete this gallery and all 2 photos\?/);
+  assert.match(page.els.get("confirm-text").textContent, /Delete this gallery and all its photos\?/);
   await page.fire("confirm-form", { type: "submit", submitter: { value: "default" } });
   assert.strictEqual(page.location.assigned, "/", "deleted gallery returns home");
   assert.strictEqual(await galleryStatus(slug), 404);
@@ -810,6 +810,100 @@ async function testUploadRetriesLostChunk() {
 
 const UPLOAD_CHUNK = 8 * 1024 * 1024;
 
+async function testWrongInviteCodeIsAskedAgain() {
+  const resolves = [];
+  const page = homePage((url, opts) => {
+    if (url === "/api/galleries/resolve") {
+      const code = opts.headers["X-Invite-Code"] || "";
+      resolves.push(code);
+      if (code === "good-code") return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
+      // A cached wrong code would loop forever; fail loudly instead.
+      if (resolves.length > 2) throw new Error("rejected invite code re-sent");
+      return {
+        status: 403,
+        ok: false,
+        statusText: "status 403",
+        json: async () => ({ error: "invite required" }),
+      };
+    }
+    if (opts.method === "PUT") {
+      return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
+    }
+    throw new Error("unexpected " + url);
+  });
+  page.els.get("file-input").files = [filed("a.jpg")];
+  const done = page.fire("file-input", { type: "change" });
+  await tick();
+  await submitKey(page, "Home-Key-1234");
+  await waitFor(
+    () => resolves.length === 1 && /Invite code/.test(page.els.get("key-title").textContent),
+    "invite prompt"
+  );
+  assert.strictEqual(resolves[0], "", "the first mint has no invite header");
+
+  page.els.get("key-input").value = "wrong-code";
+  await page.fire("key-form", { type: "submit", submitter: { value: "default" }, preventDefault() {} });
+  await waitFor(() => resolves.length === 2, "second mint with the wrong code");
+  assert.strictEqual(resolves[1], "wrong-code");
+  // The rejected code is cleared and the dialog asks again instead of
+  // re-sending it in a tight loop.
+  await tick();
+  assert.strictEqual(resolves.length, 2, "the wrong code is not re-sent");
+  assert.strictEqual(page.els.get("key-dialog").open, true);
+  assert.match(page.els.get("key-title").textContent, /Invite code/);
+
+  page.els.get("key-input").value = "good-code";
+  await page.fire("key-form", { type: "submit", submitter: { value: "default" }, preventDefault() {} });
+  await done;
+  assert.strictEqual(resolves.length, 3);
+  assert.strictEqual(resolves[2], "good-code");
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+}
+
+async function testEmptyPasswordKeepsDialogOpen() {
+  const page = makePage({
+    pathname: "/" + SLUG,
+    handler: (url) => {
+      if (url.startsWith("/api/galleries/" + SLUG + "/photos")) {
+        return {
+          status: 401,
+          ok: false,
+          statusText: "status 401",
+          json: async () => ({ error: "locked" }),
+        };
+      }
+      throw new Error("unexpected " + url);
+    },
+  });
+  await waitFor(() => page.els.get("pass-dialog").open, "password prompt");
+  let prevented = false;
+  await page.fire("pass-form", {
+    type: "submit",
+    submitter: { value: "unlock" },
+    preventDefault() { prevented = true; },
+  });
+  assert.strictEqual(prevented, true, "empty submit is not the default dialog close");
+  assert.strictEqual(page.els.get("pass-dialog").open, true, "dialog stays open");
+  assert.strictEqual(page.els.get("pass-error").textContent, "Password required");
+  assert.strictEqual(page.session.get("gallery-pass:" + SLUG), undefined);
+}
+
+async function testRejectedFilesDoNotMintGallery() {
+  const page = homePage(() => {
+    throw new Error("unexpected request");
+  });
+  page.els.get("file-input").files = [
+    filed("empty.jpg", 0),
+    filed("huge.jpg", 11 * 1024 * 1024 * 1024),
+  ];
+  await page.fire("file-input", { type: "change" });
+  assert.strictEqual(page.calls.length, 0, "nothing is minted or sent for a doomed batch");
+  assert.strictEqual(page.els.get("key-dialog").open, false, "no key prompt without an upload");
+  const status = page.els.get("upload-status").textContent;
+  assert.match(status, /empty\.jpg: empty file/);
+  assert.match(status, /huge\.jpg: file is too large/);
+}
+
 async function testUploadResumesFromServerOffset() {
   const size = UPLOAD_CHUNK + 10;
   let putCount = 0;
@@ -851,6 +945,9 @@ async function testUploadResumesFromServerOffset() {
   await testLostReplyDoesNotMintAgain();
   await testUploadRetriesLostChunk();
   await testUploadResumesFromServerOffset();
+  await testWrongInviteCodeIsAskedAgain();
+  await testEmptyPasswordKeepsDialogOpen();
+  await testRejectedFilesDoNotMintGallery();
   if (BASE) {
     await workflowUpload();
     await workflowEdit();

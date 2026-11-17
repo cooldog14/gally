@@ -302,7 +302,7 @@ deleteBtn.addEventListener("click", () => {
 let pendingGalleryDelete = false;
 document.getElementById("delete-gallery-btn").addEventListener("click", () => {
   pendingGalleryDelete = true;
-  confirmText.textContent = "Delete this gallery and all " + photos.length + (photos.length === 1 ? " photo?" : " photos?") + " This cannot be undone.";
+  confirmText.textContent = "Delete this gallery and all its photos? This cannot be undone.";
   confirmDialog.showModal();
 });
 confirmForm.addEventListener("submit", async (e) => {
@@ -836,8 +836,10 @@ document.getElementById("pass-form").addEventListener("submit", (e) => {
   }
   const v = input.value;
   if (!v) {
+    // method="dialog" would close the form on submit; keep it open so the
+    // error is visible.
+    e.preventDefault();
     document.getElementById("pass-error").textContent = "Password required";
-    document.getElementById("pass-dialog").showModal();
     return;
   }
   try { sessionStorage.setItem("gallery-pass:" + slug, v); } catch (_) {}
@@ -928,21 +930,41 @@ async function newGallery(key) {
     const data = await res.json().catch(() => null);
     if (res.ok && data && data.slug) return data.slug;
     if (res.status !== 403 || !data || data.error !== "invite required") return "";
+    // A rejected code must not be cached and re-sent in a tight loop: clear
+    // it so needInvite asks again instead of flooding the upload limiter.
+    if (inviteCode) inviteCode = "";
     if (!(await needInvite())) return "";
   }
 }
 
 fileInput.addEventListener("change", async () => {
-  const key = await needKey(!slugFromPath(), slugFromPath() ? "enter" : "create");
-  if (!key) { fileInput.value = ""; return; }
   const files = Array.from(fileInput.files);
   fileInput.value = "";
   if (!files.length) return;
   const failures = [];
+  // Reject before minting: a batch that stores nothing must not leave an
+  // empty gallery behind.
+  const accepted = files.filter((file) => {
+    if (file.size === 0) {
+      failures.push(file.name + ": empty file");
+      return false;
+    }
+    if (file.size > MAX_BYTES) {
+      failures.push(file.name + ": file is too large (10GB max)");
+      return false;
+    }
+    return true;
+  });
+  const pageSlug = slugFromPath();
+  if (!accepted.length) {
+    uploadStatus.textContent = failures.join("; ");
+    return;
+  }
+  const key = await needKey(!pageSlug, pageSlug ? "enter" : "create");
+  if (!key) return;
   // One gallery per batch, picked before the first byte: if one upload's
   // reply is lost, the next file must not mint a second gallery that the
   // browser never navigates to.
-  const pageSlug = slugFromPath();
   const target = pageSlug || (await newGallery(key));
   if (!target) {
     uploadStatus.textContent = "Could not create gallery";
@@ -1007,16 +1029,8 @@ fileInput.addEventListener("change", async () => {
   }
   async function uploadWorker() {
     for (;;) {
-      const file = files.shift();
+      const file = accepted.shift();
       if (!file) return;
-      if (file.size === 0) {
-        failures.push(file.name + ": empty file");
-        continue;
-      }
-      if (file.size > MAX_BYTES) {
-        failures.push(file.name + ": file is too large (10GB max)");
-        continue;
-      }
       const res = await putFile(file, headersBase);
       if (!res) {
         failures.push(file.name + ": upload failed");
@@ -1036,7 +1050,7 @@ fileInput.addEventListener("change", async () => {
   }
   // The server allows 4 concurrent uploads per IP; 3 leaves room for the
   // listing request that follows the batch.
-  await Promise.all(Array.from({ length: Math.min(3, files.length) }, uploadWorker));
+  await Promise.all(Array.from({ length: Math.min(3, accepted.length) }, uploadWorker));
   if (pageSlug) {
     // Gallery page: show the new tiles without a manual reload.
     await loadPhotos(true);
