@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Binding rules for changing Gally, for humans and AI agents. If a rule here is
-wrong, change this file first (with the reason), then the code.
+Binding rules for AI agents changing Gally. If a rule here is wrong, change
+this file first (with the reason), then the code.
 
 ## North star
 
@@ -140,8 +140,11 @@ Don't: `Oops! Something went wrong.`
 
 ### Docs
 
-- **MUST** update `README.md` for operator-visible changes.
-- **MUST** update `docs/API.md` for HTTP contract changes.
+- **MUST** update `docs/configuration.md` for a new or changed environment
+  variable, `docs/deployment.md` for an operator-visible change, and
+  `docs/API.md` for an HTTP contract change.
+- **MUST** update `README.md` when the entry point, quickstart, or doc index
+  changes.
 - **MUST** keep this file current when a rule changes.
 - Commits **SHOULD** have a clear imperative subject and a body explaining
   why; conventional prefixes (`fix:`, `feat:`, `ci:`) are optional.

@@ -7,8 +7,7 @@ proxy.
 
 JSON is used for control responses. Upload bodies are raw bytes. Media
 responses are the stored file (or its JPEG preview). The bundled client in
-`app.js` is the reference consumer; [AGENTS.md](../AGENTS.md) is binding for
-changes.
+`app.js` is the reference consumer.
 
 ## Conventions
 
