@@ -2,7 +2,8 @@
 
 Gally is a small, self-hosted gallery for sharing photos. A gallery is
 identified by a key you choose, not an account: anyone with the key can
-upload, edit, publish, protect, or delete that gallery. New galleries are
+upload, edit, publish, protect, or delete that gallery. The URL contains a
+generated public slug; the key is the secret you type. New galleries are
 **private by default**; the owner can publish one from edit mode. There are no
 accounts, email, tracking, or key/password recovery.
 
@@ -23,6 +24,11 @@ Open <http://127.0.0.1:8000>. The first dialog asks for a key:
 - Existing key: 6–128 ASCII characters, no spaces or accents.
 - New key: at least 12 characters, with a capital letter and a symbol (for
   example `Sunset-Beach-42`).
+
+The 6 is the minimum owner-key length. The four-word string that appears in
+the URL after the first upload (for example
+`/brave-vole-juniper-badger-88e9`) is the generated gallery slug, not the key.
+The key banner shows what you typed; save it.
 
 Save the key; it is the only way to edit that gallery. New galleries are
 private until the owner ticks **Public** in edit mode. `ADMIN_PASS` and
