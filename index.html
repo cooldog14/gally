@@ -16,7 +16,8 @@ try {
 </head>
 <body>
 <div id="key-banner" role="status" hidden>
-  <span>Your key: <code id="key-banner-key"></code> &mdash; save it; it is the only way to edit this gallery.</span>
+  <span>Your key: <code id="key-banner-key"></code> &mdash; save it; it is the only way to edit this gallery. <span id="key-banner-hint"></span></span>
+  <button id="key-banner-copy" type="button">Copy key</button>
   <button id="key-banner-close" type="button" aria-label="Dismiss">&times;</button>
 </div>
 <header id="topbar">
@@ -24,16 +25,20 @@ try {
   <input type="file" id="file-input" multiple hidden>
   <button id="edit-btn" type="button" hidden>Edit</button>
   <span id="gallery-label"></span>
+  <span id="gallery-state" hidden></span>
   <div id="actions">
+    <a id="home-link" href="./" hidden>Home</a>
+    <button id="copy-link-btn" type="button" hidden>Copy link</button>
     <button id="theme-btn" type="button" aria-label="Toggle theme">&#9789;</button>
   </div>
 </header>
 <div id="editbar" hidden>
   <span id="sel-count">0 selected</span>
-  <label id="public-row" title="Anyone with the link can view this gallery">
+  <label id="public-row" title="Anyone with the link can view this gallery. A viewer password may still be required.">
     <input type="checkbox" id="public-check"> Public
   </label>
   <span id="edit-status" role="status"></span>
+  <button id="show-key-btn" type="button">Show key</button>
   <button id="lock-btn" type="button">Protect</button>
   <button id="delete-btn" type="button">Delete</button>
   <button id="delete-gallery-btn" type="button">Delete gallery</button>
@@ -52,6 +57,7 @@ try {
     <p id="key-help">6-128 ASCII characters, no spaces or accents. For a new key use at least 12, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery.</p>
     <p id="key-error" role="alert"></p>
     <div id="key-actions">
+      <button id="key-cancel" value="cancel" type="button">Cancel</button>
       <button id="key-confirm" value="default" type="submit">Continue</button>
     </div>
   </form>
@@ -72,6 +78,7 @@ try {
   <form method="dialog" id="setpass-form">
     <h2 id="setpass-title">Protect gallery</h2>
     <p id="setpass-help">Viewers will need this password to open the gallery.</p>
+    <p id="setpass-private" hidden><button id="setpass-public" type="button">Make public</button></p>
     <input type="password" id="setpass-input" placeholder="New password" autocomplete="new-password">
     <p id="setpass-error" role="alert"></p>
     <div id="key-actions">

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::db::{GalleryDb, GalleryMeta};
+use crate::db::GalleryDb;
 use crate::state::{
     AppState, MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL, is_admin, pass_fail_exceeded,
     pass_fail_record, rate_limited, read_limited,
@@ -90,8 +90,9 @@ fn media_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str, kind: Medi
         // Owner cookies are not revocable per gallery: only the key mints them.
         MediaToken::Owner => 0,
         MediaToken::Viewer => match state.db.lock().unwrap().gallery_token_version(slug) {
-            Some(v) => v,
-            None => return false,
+            Ok(Some(v)) => v,
+            // Unknown gallery or a DB error: deny the cookie, never guess.
+            _ => return false,
         },
     };
     crate::state::media_token_ok(&state.media_secret, tok, slug, kind, version)
@@ -592,6 +593,11 @@ async fn check_locked(state: &AppState, ip: IpAddr, slug: &str, pass: &str) -> L
         let db = state.db.lock().unwrap();
         db.gallery_pass_hash(slug)
     };
+    let stored = match stored {
+        Ok(hash) => hash,
+        // A read failure must never look like "this gallery is unlocked".
+        Err(_) => return Locked::Denied(ApiError::Internal.into_response()),
+    };
     let Some(hash) = stored else {
         return Locked::Open;
     };
@@ -689,8 +695,10 @@ pub async fn gallery_photos(
         stage = "list_db_check",
         latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0)
     );
-    let Some(meta) = meta else {
-        return err(StatusCode::NOT_FOUND, "unknown gallery");
+    let meta = match meta {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
+        Err(_) => return ApiError::Internal.into_response(),
     };
     let key = request_key(&headers);
     let key_ok = key
@@ -746,19 +754,26 @@ pub async fn gallery_photos(
     }
     let t_scan = Instant::now();
     // One query for the page plus the lock/cookie state.
-    let (page, locked, version) = {
+    let (page, lock) = {
         let db = state.db.lock().unwrap();
-        (
-            db.photos_page(&slug, before, limit),
-            // The owner's Protect dialog needs this: an unauthenticated probe
-            // cannot see the lock on a private gallery (it gets 404 first).
-            db.gallery_pass_hash(&slug).is_some(),
-            db.gallery_token_version(&slug).unwrap_or(0),
-        )
+        let page = db.photos_page(&slug, before, limit);
+        // The owner's Protect dialog needs this: an unauthenticated probe
+        // cannot see the lock on a private gallery (it gets 404 first).
+        let lock = match db.gallery_pass_hash(&slug) {
+            Ok(hash) => db
+                .gallery_token_version(&slug)
+                .map(|version| (hash.is_some(), version.unwrap_or(0))),
+            Err(e) => Err(e),
+        };
+        (page, lock)
     };
     // A DB failure must not masquerade as an empty gallery.
     let rows = match page {
         Ok(rows) => rows,
+        Err(_) => return ApiError::Internal.into_response(),
+    };
+    let (locked, version) = match lock {
+        Ok(lock) => lock,
         Err(_) => return ApiError::Internal.into_response(),
     };
     tracing::debug!(
@@ -1040,7 +1055,11 @@ pub async fn resolve_gallery(
     if let Some(t) = slug_param {
         let ok = {
             let db = state.db.lock().unwrap();
-            db.gallery_exists(&t) && db.key_owns_slug(&key, &t)
+            match db.gallery_exists(&t) {
+                Ok(true) => db.key_owns_slug(&key, &t),
+                Ok(false) => false,
+                Err(_) => return ApiError::Internal.into_response(),
+            }
         };
         return match ok {
             true => (StatusCode::OK, Json(json!({ "slug": t }))).into_response(),
@@ -1319,7 +1338,11 @@ pub async fn delete_own_gallery(
         let ok = match key {
             Some(k) => {
                 let db = state.db.lock().unwrap();
-                db.gallery_exists(&slug) && db.key_owns_slug(&k, &slug)
+                match db.gallery_exists(&slug) {
+                    Ok(true) => db.key_owns_slug(&k, &slug),
+                    Ok(false) => false,
+                    Err(_) => return ApiError::Internal.into_response(),
+                }
             }
             None => false,
         };
@@ -1393,8 +1416,11 @@ async fn sweep_orphans(
                 let db = state.db.lock().unwrap();
                 db.gallery_exists(slug)
             };
-            if exists {
-                continue;
+            match exists {
+                Ok(true) => continue,
+                Ok(false) => {}
+                // Never guess "missing" from a failed read.
+                Err(_) => return Err(()),
             }
             if tokio::fs::remove_file(ent.path()).await.is_ok() {
                 *deleted += 1;
@@ -1414,8 +1440,10 @@ async fn sweep_orphans(
         }
         {
             let db = state.db.lock().unwrap();
-            if db.gallery_exists(slug) {
-                continue;
+            match db.gallery_exists(slug) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => return Err(()),
             }
         }
         if tokio::fs::remove_file(ent.path()).await.is_ok() {
@@ -1434,13 +1462,26 @@ pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap)
     }
     let known: std::collections::HashSet<String> = {
         let db = state.db.lock().unwrap();
-        match db.prepare("SELECT slug FROM galleries") {
-            Ok(mut stmt) => stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
+        let mut stmt = match db.prepare("SELECT slug FROM galleries") {
+            Ok(stmt) => stmt,
             Err(_) => return ApiError::Internal.into_response(),
+        };
+        let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(_) => return ApiError::Internal.into_response(),
+        };
+        let mut known = std::collections::HashSet::new();
+        for row in rows {
+            match row {
+                Ok(slug) => {
+                    known.insert(slug);
+                }
+                // An incomplete snapshot could mark a live gallery as an
+                // orphan, so a failed read aborts the whole sweep.
+                Err(_) => return ApiError::Internal.into_response(),
+            }
         }
+        known
     };
     let mut deleted: usize = 0;
     let mut failed: usize = 0;
@@ -1676,7 +1717,11 @@ pub async fn put_photo(
         let db = state.db.lock().unwrap();
         match (&target, &key) {
             (Some(t), k) => {
-                if !(db.gallery_exists(t) && db.key_owns_slug(k, t)) {
+                let exists = match db.gallery_exists(t) {
+                    Ok(exists) => exists,
+                    Err(_) => return ApiError::Internal.into_response(),
+                };
+                if !(exists && db.key_owns_slug(k, t)) {
                     drop(db);
                     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
                     if pass_fail_record(&state, &ip) {
@@ -1743,12 +1788,11 @@ pub async fn put_photo(
     let limits = state.limits;
     let (used_bytes, used_photos) = {
         let db = state.db.lock().unwrap();
-        let m = db.gallery_meta(&slug).unwrap_or(GalleryMeta {
-            public: false,
-            bytes: 0,
-            photos: 0,
-        });
-        (m.bytes.max(0) as u64, m.photos)
+        match db.gallery_meta(&slug) {
+            Ok(Some(m)) => (m.bytes.max(0) as u64, m.photos),
+            Ok(None) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
+            Err(_) => return ApiError::Internal.into_response(),
+        }
     };
     // Live `.part-*` temps belong to this gallery too: a stalled chunked
     // upload must not let a second one bypass the byte quota.
@@ -2141,8 +2185,10 @@ async fn serve_photo(
         let db = state.db.lock().unwrap();
         db.gallery_meta(&slug)
     };
-    let Some(meta) = meta else {
-        return err(StatusCode::NOT_FOUND, "not found");
+    let meta = match meta {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "not found"),
+        Err(_) => return ApiError::Internal.into_response(),
     };
     // `?pass=` and `X-Gallery-Pass` stay accepted (old shared links); a
     // successful unlock sets a viewer cookie so later media needs neither.
@@ -2190,10 +2236,13 @@ async fn serve_photo(
     // (pass_hash set), and any ?pass=/viewer-cookie request stay private.
     let (locked, version) = {
         let db = state.db.lock().unwrap();
-        (
-            db.gallery_pass_hash(&slug).is_some(),
-            db.gallery_token_version(&slug).unwrap_or(0),
-        )
+        match db.gallery_pass_hash(&slug) {
+            Ok(hash) => match db.gallery_token_version(&slug) {
+                Ok(version) => (hash.is_some(), version.unwrap_or(0)),
+                Err(_) => return ApiError::Internal.into_response(),
+            },
+            Err(_) => return ApiError::Internal.into_response(),
+        }
     };
     let cache_control = if meta.public && !owner && !locked && pass.is_empty() && !viewer_cookie {
         "public, max-age=86400"
@@ -2350,7 +2399,11 @@ pub async fn delete_photo(
         let ok = match key {
             Some(k) => {
                 let db = state.db.lock().unwrap();
-                db.gallery_exists(&slug) && db.key_owns_slug(&k, slug.as_str())
+                match db.gallery_exists(&slug) {
+                    Ok(true) => db.key_owns_slug(&k, slug.as_str()),
+                    Ok(false) => false,
+                    Err(_) => return ApiError::Internal.into_response(),
+                }
             }
             None => false,
         };
@@ -2505,5 +2558,132 @@ mod tests {
 
         let public: IpAddr = "203.0.113.9".parse().unwrap();
         assert!(!metrics_direct_peer(public, &direct, &trusted));
+    }
+
+    #[tokio::test]
+    async fn sweep_orphans_keeps_files_on_db_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(tmp.path()).await.expect("state");
+        let slug = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("sweep-key-0001")
+            .expect("gallery");
+        let name = format!("{slug}_{}_x.jpg", "a".repeat(32));
+        std::fs::write(state.dir.join(&name), b"photo").unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE galleries")
+            .unwrap();
+
+        let mut deleted = 0;
+        let mut failed = 0;
+        let result = sweep_orphans(
+            &state,
+            &state.dir,
+            &std::collections::HashSet::new(),
+            true,
+            &mut deleted,
+            &mut failed,
+        )
+        .await;
+        assert!(result.is_err(), "a DB read error must abort the sweep");
+        assert_eq!((deleted, failed), (0, 0));
+        assert!(
+            state.dir.join(&name).exists(),
+            "a live photo must not be deleted on a failed lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_errors_are_500_not_unlocked_or_404() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(tmp.path()).await.expect("state");
+        let slug = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("dberr-key-0001")
+            .expect("gallery");
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE galleries SET public = 1 WHERE slug = ?1", [&slug])
+            .unwrap();
+        let name = format!("{slug}_{}_x.jpg", "b".repeat(32));
+        std::fs::write(state.dir.join(&name), b"photo").unwrap();
+
+        // A failed viewer-cookie version read must not be guessed as version 0.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE galleries RENAME COLUMN token_version TO token_version_off")
+            .unwrap();
+        let listing = gallery_photos(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:4242".parse().unwrap()),
+            HeaderMap::new(),
+            AxumPath(slug.clone()),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(listing.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let media = get_photo(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:4242".parse().unwrap()),
+            HeaderMap::new(),
+            AxumPath(name.clone()),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(media.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Keep the gallery row readable but break the lock read.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE galleries RENAME COLUMN pass_hash TO pass_hash_off")
+            .unwrap();
+        let listing = gallery_photos(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:4242".parse().unwrap()),
+            HeaderMap::new(),
+            AxumPath(slug.clone()),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(listing.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let media = get_photo(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:4242".parse().unwrap()),
+            HeaderMap::new(),
+            AxumPath(name),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(media.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Break the gallery lookup itself: still a server error, not 404.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE galleries")
+            .unwrap();
+        let listing = gallery_photos(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:4242".parse().unwrap()),
+            HeaderMap::new(),
+            AxumPath(slug),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(listing.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
