@@ -126,9 +126,8 @@ pub struct AppState {
     /// Live upload streams per IP. Guarded by `UploadSlotGuard`: a slow
     /// client pins at most `limits.upload_slots_per_ip` global slots.
     pub upload_ips: Mutex<HashMap<IpAddr, usize>>,
-    /// Upload ids with a request actively writing their `.part-` temp. A
-    /// retry must not append concurrently: it would duplicate bytes.
-    pub upload_ids: Mutex<HashSet<String>>,
+    /// Serializes part cleanup and reservation changes, never body streaming.
+    pub(crate) upload_budget: tokio::sync::Mutex<UploadBudget>,
     pub argon2: tokio::sync::Semaphore,
     /// Thumbnail decodes in flight. Hardcoded to 2: a small thumbnail can
     /// need the full source bitmap in RAM, so this bounds peak decode memory.
@@ -384,7 +383,7 @@ impl AppState {
             media_secret,
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
             upload_ips: Mutex::new(HashMap::new()),
-            upload_ids: Mutex::new(HashSet::new()),
+            upload_budget: tokio::sync::Mutex::new(UploadBudget::default()),
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
             thumbs: tokio::sync::Semaphore::new(2),
             read: Mutex::new(HashMap::new()),
@@ -440,47 +439,43 @@ impl Drop for UploadSlotGuard<'_> {
     }
 }
 
-/// RAII registration of one in-flight resumable upload id: `try_acquire`
-/// refuses a second request writing the same `.part-` temp, so a retry cannot
-/// interleave bytes with the request it thinks failed.
-pub struct UploadIdGuard<'a> {
-    ids: &'a Mutex<HashSet<String>>,
-    id: String,
+#[derive(Default)]
+pub(crate) struct UploadBudget {
+    pub active: HashMap<String, UploadReservation>,
+    pub idle: HashMap<String, u64>,
+    // Fully received originals kept for recount after a failed DB update.
+    pub unindexed: HashMap<String, u64>,
+    // Never advertise a partial offset if rollback itself failed.
+    pub damaged: HashSet<String>,
 }
 
-impl<'a> UploadIdGuard<'a> {
-    pub fn try_acquire(ids: &'a Mutex<HashSet<String>>, id: &str) -> Option<Self> {
-        let mut guard = ids.lock().unwrap();
-        if !guard.insert(id.to_string()) {
-            return None;
-        }
-        Some(Self {
-            ids,
-            id: id.to_string(),
-        })
+#[derive(Default)]
+pub(crate) struct UploadReservation {
+    pub bytes: u64,
+    pub unwritten: u64,
+    pub flushed: u64,
+}
+
+impl UploadReservation {
+    pub fn flush_bytes(&mut self, bytes: u64) {
+        self.unwritten -= bytes;
+        self.flushed += bytes;
     }
 }
 
-impl Drop for UploadIdGuard<'_> {
-    fn drop(&mut self) {
-        self.ids.lock().unwrap().remove(&self.id);
-    }
-}
-
-/// Fixed-window rate limit: at most `max` hits per window (0 = off).
-/// Returns true when the caller is over the limit (hit NOT recorded).
+/// Sliding-window rate limit. A refused hit returns the time until a slot opens.
 /// shortcut: hard cap at 10k IPs, evicts oldest — switch to LRU when NAT-heavy.
 pub fn window_hit(
     map: &Mutex<HashMap<IpAddr, Vec<Instant>>>,
     ip: &IpAddr,
     max: usize,
     window_secs: u64,
-) -> bool {
+) -> Option<Duration> {
     if max == 0 {
-        return false;
+        return None;
     }
-    let now = Instant::now();
     let mut hits_map = map.lock().unwrap();
+    let now = Instant::now();
     // Bound memory: drop the oldest entry when full (dead IPs never return).
     if !hits_map.contains_key(ip)
         && hits_map.len() >= 10_000
@@ -494,20 +489,20 @@ pub fn window_hit(
     let hits = hits_map.entry(*ip).or_default();
     hits.retain(|t| now.duration_since(*t).as_secs() < window_secs);
     if hits.len() >= max {
-        return true;
+        return Some(Duration::from_secs(window_secs) - now.duration_since(hits[hits.len() - max]));
     }
     hits.push(now);
-    false
+    None
 }
 
 /// Upload throttle (per IP).
-pub fn rate_limited(state: &AppState, ip: &IpAddr) -> bool {
+pub fn rate_limited(state: &AppState, ip: &IpAddr) -> Option<Duration> {
     window_hit(&state.rate, ip, state.limits.rate_max, RATE_WINDOW_SECS)
 }
 
 /// Read throttle for listings and photo serving (per IP).
 pub fn read_limited(state: &AppState, ip: &IpAddr) -> bool {
-    window_hit(&state.read, ip, state.limits.read_max, RATE_WINDOW_SECS)
+    window_hit(&state.read, ip, state.limits.read_max, RATE_WINDOW_SECS).is_some()
 }
 
 /// True when `ip` already burned `PASS_FAIL_MAX` attempts in the window.
@@ -526,21 +521,7 @@ pub fn pass_fail_exceeded(state: &AppState, ip: &IpAddr) -> bool {
 /// shortcut: same 10k-IP bound as rate_limited, evicts oldest — switch to LRU
 /// when NAT-heavy.
 pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
-    let now = Instant::now();
-    let mut fail = state.pass_fail.lock().unwrap();
-    if !fail.contains_key(ip)
-        && fail.len() >= 10_000
-        && let Some(oldest) = fail
-            .iter()
-            .min_by_key(|(_, v)| v.first().copied())
-            .map(|(k, _)| *k)
-    {
-        fail.remove(&oldest);
-    }
-    let hits = fail.entry(*ip).or_default();
-    hits.retain(|t| now.duration_since(*t).as_secs() < PASS_FAIL_WINDOW_SECS);
-    hits.push(now);
-    hits.len() > PASS_FAIL_MAX
+    window_hit(&state.pass_fail, ip, PASS_FAIL_MAX, PASS_FAIL_WINDOW_SECS).is_some()
 }
 
 /// Admin tokens live 24h from issue; expired ones are dropped on sight.
@@ -634,6 +615,26 @@ pub fn is_admin(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn denied_credentials_do_not_extend_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::new_with(root.path(), Limits::defaults())
+            .await
+            .unwrap();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        for _ in 0..PASS_FAIL_MAX {
+            assert!(!pass_fail_record(&state, &ip));
+        }
+        let timestamps = state.pass_fail.lock().unwrap()[&ip].clone();
+        for _ in 0..100 {
+            assert!(pass_fail_record(&state, &ip));
+        }
+        assert_eq!(state.pass_fail.lock().unwrap()[&ip], timestamps);
+        state.pass_fail.lock().unwrap().get_mut(&ip).unwrap()[0] -=
+            Duration::from_secs(PASS_FAIL_WINDOW_SECS + 1);
+        assert!(!pass_fail_record(&state, &ip));
+    }
 
     /// One gallery view (listing + one request per photo) comes out of the
     /// same bucket: a cap above `gallery_photos` is what keeps a big gallery

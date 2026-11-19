@@ -47,19 +47,31 @@ The app listens on `0.0.0.0:8000` inside the container and publishes to
 `127.0.0.1:8000` on the host. Terminate TLS in a reverse proxy:
 
 - Host proxy (nginx/Caddy on this host): upstream `http://127.0.0.1:8000`.
-  The default `GALLY_TRUST_PROXY` covers the Docker bridge peer.
 - Proxy container: attach it to the `gally` network and use
-  `http://gally:8000`; its bridge address is trusted by default.
-- Proxy on another host: set `GALLY_BIND=0.0.0.0` and narrow
-  `GALLY_TRUST_PROXY` to the proxy IP/CIDR, then firewall port 8000 to that
+  `http://gally:8000`.
+- Proxy on another host: set `GALLY_BIND=0.0.0.0` and set
+  `GALLY_TRUST_PROXY` to the exact proxy IP, then firewall port 8000 to that
   host.
 
-`GALLY_TRUST_PROXY` lists every reverse-proxy hop. The app walks
-`X-Forwarded-For` right-to-left and accepts the first address outside that
-list; a malformed chain falls back to the connection peer. Never extend it to
-a directly reachable client range. For two hops (an edge proxy forwarding to a
-local Caddy) list the edge proxy's address too, or every client resolves to
-the edge and shares its rate limits.
+Forwarded IPs are not trusted by default, including on Docker. Set
+`GALLY_TRUST_PROXY` to the exact peer IP(s) of your proxy hops as seen by the
+app (for a host proxy this can be the Docker gateway's individual address).
+Use stable addresses and do not trust a whole Docker bridge or any client
+range. The app walks `X-Forwarded-For` right-to-left and accepts the first
+address outside that list; a malformed chain falls back to the connection
+peer. Configure your proxies to set the chain, and list every trusted hop
+if there are multiple. Without this, clients can share the proxy's rate
+limits.
+
+At the public reverse proxy, block `/metrics`, `/gally/admin` and
+`/gally/admin/` (including subpaths), and `/api/admin` and its subpaths.
+Keep authenticated admin access on a separate private path to the service,
+such as the loopback-published port over an SSH tunnel.
+
+When upgrading from a version that allowed public media to be cached, purge
+all cached originals and previews under `/photos/` from any CDN or caching
+proxy. New response headers cannot invalidate copies already cached by public
+clients, and previously downloaded files cannot be recalled.
 
 `docker compose stop` sends SIGTERM and waits up to `stop_grace_period: 120s`
 for in-flight requests; longer uploads are cut. Startup deletes partial
@@ -101,11 +113,16 @@ access. Existing galleries never need the invite.
 - `GET /healthz` returns 200 when SQLite answers, the photos directory is
   readable, and free space is at least `GALLY_MIN_FREE_BYTES`; otherwise 503
   with `{"ok":false,...}`. Use it for proxy and container checks.
-- `GET /metrics` exposes Prometheus text metrics and is local-only: a direct
-  connection from a trusted peer (the Docker gateway for a host scrape) or a
-  forwarded client that resolves to loopback. Scrape
-  `http://127.0.0.1:8000/metrics` on the host. Forwarded public requests get
-  404, so the proxy never exposes it.
+- `GET /metrics` exposes Prometheus text only to an actual loopback socket
+  peer that is not a trusted proxy, without `X-Forwarded-For`. A forwarded
+  address does not make a scrape local. On Docker, scrape from the app's
+  network namespace; the published host port is not a loopback peer as seen
+  by the app. For a local check on the Linux Docker host:
+
+  ```sh
+  pid=$(docker inspect -f '{{.State.Pid}}' "$(docker compose ps -q gally)")
+  sudo nsenter --target "$pid" --net curl --noproxy '*' -fsS http://127.0.0.1:8000/metrics
+  ```
 
 ## Backup and restore
 
@@ -114,57 +131,134 @@ immediately when it starts, then every 24 hours into `/backups/current`
 (the `gally-backups` volume). A failed run exits and the container restarts;
 watch its restart count. There is no separate timer to install.
 
-The snapshot copies `photos/` first and then snapshots the database with
-`VACUUM INTO`, so a failed photo copy leaves the previous snapshot's database
-intact; prune failures fail the run. A photo uploaded after the first copy but
-before the database snapshot is copied in a second pass, and rows whose file
-is gone are removed before the snapshot is installed; the installed database
-is reconciled again after pruning, so it never lists a file the snapshot does
-not hold. Copied photos and the database are fsynced before their temp names
-are renamed. In-flight `.part-` files and thumbnail temp files are skipped,
-while the derived `.thumbs/` previews are copied so a restore keeps them. The
-destination is `0700`, the database copy `0600`, and it is overwritten in
-place: deleted top-level photos are pruned, but stale previews inside
-`.thumbs/` may remain in the snapshot and are never served. A destination
-inside the live data dir is refused.
+The sidecar takes a SQLite `VACUUM INTO` snapshot, then copies its indexed
+originals and their available `.thumbs/` previews into a private sibling
+directory (`0700`, database `0600`). Unindexed files and upload/thumbnail
+temps are not copied. An original already gone when copied is dropped from
+the snapshot's index and counts; other I/O errors fail the run. Changes to
+the live gallery after the DB snapshot are not guaranteed to be included.
+
+After syncing the files and directories, the sidecar publishes the complete
+directory as `current` with an atomic rename. Replacing an existing snapshot
+requires Linux/filesystem support for `renameat2(RENAME_EXCHANGE)`, as on
+ordinary Linux Docker local volumes. Without it the previous snapshot stays
+in place and the command fails; there is no non-atomic fallback. Budget disk
+space for both versions during the copy. A failed pre-publication run does
+not change the installed snapshot. After publication is synced, removing the
+previous version is best-effort; an interrupted run can leave a private
+`.gally-stage-*` sibling. Inspect any such directory with the sidecar stopped
+before deciding whether it is safe to remove.
+
+For manual `--backup DEST`, use a dedicated backup location with no nested
+mounts, under a parent you control. `DEST` must be missing, empty, or an
+existing Gally snapshot (`galleries.db` and `photos/` only). Destination
+symlinks and overlaps with the live data or photo tree are refused.
+If an older directory has extra entries, leave it intact rather than
+deleting files to make it pass validation. Stop the sidecar, inspect and
+archive the old directory, and use `--backup` to write a fresh unused
+sibling. After verifying that sibling, point the sidecar and off-host copy
+at the new path explicitly.
 
 **Retention:** `current` is a single snapshot; the app keeps no history. Add
 retention in the off-host tool, for example `restic forget --keep-daily 7
 --keep-weekly 4` after its backup.
 
-**Off-host copy is not configured.** Copy `gally-backups` into rclone/restic
-from the host and alert on failures, for example:
+**Off-host copy is not configured.** Save an archive somewhere private, then
+copy it to your off-host storage with rclone/restic and alert on failures.
+Stop only the sidecar while reading `current`, so the archive cannot span
+two different snapshots:
 
 ```sh
+umask 077
+work=$(mktemp -d)
+archive_status=0
 docker compose stop backup
-mkdir -p extract
 docker compose run --rm -T --no-deps --entrypoint tar backup \
-  -C /backups/current -cf - . | tar -xf - -C extract
+  -C /backups/current -cf - galleries.db photos > "$work/gally.tar" || archive_status=$?
 docker compose start backup
+test "$archive_status" -eq 0
+# Copy "$work/gally.tar" off-host only after this test passed.
 ```
 
-**Restore drill** (rehearse it on a copy before you need it):
+**Restore drill:** Fetch a known-good archive you created into a fresh,
+private working directory. Never extract an untrusted archive or restore over
+an existing data volume. The commands below run in a shell from the Compose
+directory. Set `archive` to the absolute path of the downloaded archive.
 
 ```sh
-docker compose stop gally backup
-mkdir -p extract
-docker compose run --rm -T --no-deps --entrypoint tar backup \
-  -C /backups/current -cf - . | tar -xf - -C extract
-docker compose run --rm -T --no-deps --entrypoint sh backup \
-  -c 'find /data -mindepth 1 -delete'
-tar -C extract -cf - . | docker compose run --rm -T --no-deps \
-  --entrypoint tar backup -C /data -xf -
-docker compose start gally backup
-curl -fsS http://127.0.0.1:8000/healthz
+set -e
+umask 077
+: "${archive:?Set archive to the absolute path of the backup archive}"
+test -f "$archive"
+work=$(mktemp -d)
+restore_volume="gally-restore-${work##*.}"
+image=$(docker compose config --images | sort -u)  # server and sidecar use one image
+if docker volume inspect "$restore_volume" >/dev/null 2>&1; then
+  echo "Restore volume already exists; choose a fresh name" >&2
+  exit 1
+fi
+docker volume create "$restore_volume"
+docker run --rm -i --network none --read-only --user 10001:10001 \
+  --mount "type=volume,src=$restore_volume,dst=/data" \
+  --entrypoint /bin/sh "$image" -ec '
+    umask 077
+    entries=$(ls -A /data); test -z "$entries"
+    tar -x -C /data --no-same-owner --no-same-permissions
+    test -f /data/galleries.db
+    test -s /data/galleries.db
+    test -d /data/photos
+    types=$(find /data -mindepth 1 ! -type f ! -type d -print -quit); test -z "$types"
+    links=$(find /data -type f -links +1 -print -quit); test -z "$links"
+    extras=$(find /data -mindepth 1 -maxdepth 1 ! -name galleries.db ! -name photos -print -quit); test -z "$extras"
+  ' < "$archive"
+
+override="compose.$restore_volume.yaml"
+(set -C; cat > "$override" <<EOF
+volumes:
+  data:
+    external: true
+    name: $restore_volume
+EOF
+)
+drill=$(docker compose -f compose.yaml -f "$override" run --rm -d --no-deps \
+  -e GALLY_SECURE_COOKIES=0 -p 127.0.0.1::8000 gally)
+docker port "$drill" 8000/tcp
 ```
 
-Setting `GALLY_MEDIA_SECRET` in `.env` keeps media cookies valid across
-restores; the generated `<GALLY_ROOT>/.gally-media-secret` is not in the
-snapshot. Then open a gallery and confirm the listing and photos load. On
-startup the server recounts photo counts and byte totals, rebuilds the listing
-table from the photos directory, and sweeps stray `.part`/`.tmp-*` temp files;
-this repairs a restored database whose counters or index disagree with the
-files.
+`GALLY_SECURE_COOKIES=0` is only for this isolated HTTP drill. Never use it in
+production or for a TLS test. Only the fresh volume is writable during
+extraction, and the temporary app uses it without changing live routing or
+running the sidecar. Open the printed
+loopback address in a browser. Use a known gallery URL from the archive and
+its owner key or viewer password if required. Confirm the expected listing
+and open or download an **original**, not just a preview. Compare the bytes
+or checksum with a known copy if available. A 200 from `/healthz` alone says
+nothing about the recovered photos. If verification fails, stop the temporary
+container and leave the active deployment untouched.
+
+After a successful check, stop the temporary container before switching (only
+one writer can open the restored volume). Keep the generated override beside
+`compose.yaml` and include it in subsequent commands:
+
+```sh
+docker stop "$drill"
+docker compose stop gally backup
+docker compose -f compose.yaml -f "$override" up -d --no-build gally backup
+```
+
+Both services now use the recovered data volume. Before the sidecar is allowed
+to replace it, keep an off-host copy of the currently installed snapshot.
+Retain the former volume and the off-host archive. To roll back, stop both
+services using the override,
+then run `docker compose up -d --no-build gally backup` without it (or use
+your prior override). New writes to the recovered volume will not be on the
+former volume. Do not use `down -v` or delete either volume during the drill
+or cutover.
+
+Setting `GALLY_MEDIA_SECRET` in `.env` keeps media-cookie signing stable
+across restores; the generated `<GALLY_ROOT>/.gally-media-secret` is not in
+the snapshot. Startup recounts photo counts and byte totals, rebuilds the
+listing from the restored photos directory, and sweeps upload/thumbnail temps.
 
 ## Monitoring
 

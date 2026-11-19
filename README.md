@@ -42,10 +42,11 @@ cookies off; do not expose it directly.
 
 Uploads are stored as sent; previews and EXIF capture times are derived. Photos
 are ordered by EXIF `DateTimeOriginal` when present, falling back to upload
-time; existing libraries are backfilled once on the first startup after the
-upgrade. The browser uploads in 8 MiB chunks and resumes from the server's
-committed offset after a failure; other clients can send the whole body in one
-`PUT`.
+time. Files above 16 MiB skip EXIF extraction and still upload unchanged with
+that fallback; only the timestamp read is skipped, never the upload. Existing
+libraries are backfilled once on the first startup after the upgrade. The
+browser uploads in 8 MiB chunks and resumes from the server's committed offset
+after a failure; other clients can send the whole body in one `PUT`.
 
 ## Docs
 

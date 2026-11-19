@@ -5,11 +5,19 @@
 
 use std::path::Path;
 
+// kamadak-exif can buffer the entire container. This only limits extraction.
+const MAX_EXIF_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Capture time of the photo at `path`, in Unix milliseconds.
 pub(crate) fn taken_millis(path: &Path) -> Option<i64> {
     let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_EXIF_FILE_BYTES {
+        return None;
+    }
+    use std::io::Read;
     let exif = exif::Reader::new()
-        .read_from_container(&mut std::io::BufReader::new(&file))
+        .read_from_container(&mut std::io::BufReader::new(file.take(MAX_EXIF_FILE_BYTES)))
         .ok()?;
     let field = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
     let exif::Value::Ascii(values) = &field.value else {

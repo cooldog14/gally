@@ -46,6 +46,32 @@ function retryableStatus(status) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+let uploadRetryAt = 0;
+async function uploadRequest(url, options) {
+  let delay;
+  while ((delay = uploadRetryAt - performance.now()) > 0) {
+    uploadStatus.textContent = "Upload rate limit reached. Retrying in " + Math.ceil(delay / 1000) + " seconds…";
+    await sleep(Math.ceil(delay));
+  }
+  const res = await fetch(url, options);
+  if (res.status === 429) {
+    const raw = res.headers.get("Retry-After") || "";
+    const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    // Fall back to the server's one-minute window for older servers.
+    const seconds = Number.isSafeInteger(n) && n <= 2_147_483 ? n : 60;
+    uploadRetryAt = Math.max(uploadRetryAt, performance.now() + seconds * 1000);
+  }
+  return res;
+}
+
+async function resolveForUpload(url, options) {
+  for (let retries = 0; ; retries += 1) {
+    const res = await uploadRequest(url, options);
+    if (res.status !== 429 || retries === UPLOAD_RETRIES) return res;
+    await res.json().catch(() => null);
+  }
+}
+
 const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4})$/;
 
 let photos = [];
@@ -204,11 +230,10 @@ const PAGE_SIZE = 200;
 
 /** Password as a percent-encoded header, never a URL: fetch() refuses
     non-ASCII header values, so encodeURIComponent + server-side decode. */
-function listingHeaders(slug) {
+function listingHeaders(slug, pass = storedPass(slug)) {
   const headers = {};
   if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
-  const p = storedPass(slug);
-  if (p) headers["X-Gallery-Pass"] = encodeURIComponent(p);
+  if (pass) headers["X-Gallery-Pass"] = encodeURIComponent(pass);
   return headers;
 }
 
@@ -246,6 +271,7 @@ async function loadPhotos(retry = false) {
       showUnavailable("This gallery is private or does not exist. Ask the owner for a public link, or for the owner key.");
       return;
     }
+    let data;
     if (res.status === 401) {
       // Locked: prompt for the viewer password (owner key also accepted).
       // Only a public gallery reaches here, so its state is known.
@@ -253,17 +279,19 @@ async function loadPhotos(retry = false) {
       galleryLocked = true;
       updateGalleryState();
       showKeyBannerOnce(slug);
-      const ok = await needPass(slug);
-      if (ok) return loadPhotos();
-      photos = [];
-      nextCursor = null;
-      renderGrid();
-      empty.hidden = false;
-      empty.textContent = "This gallery is locked.";
-      return;
+      data = await needPass(slug);
+      if (!data) {
+        photos = [];
+        nextCursor = null;
+        renderGrid();
+        empty.hidden = false;
+        empty.textContent = "This gallery is locked.";
+        return;
+      }
+    } else {
+      if (!res.ok) throw new Error("bad status " + res.status);
+      data = await res.json();
     }
-    if (!res.ok) throw new Error("bad status " + res.status);
-    const data = await res.json();
     galleryPublic = data.public !== false;
     galleryLocked = data.locked === true;
     publicCheck.checked = galleryPublic;
@@ -935,10 +963,10 @@ function newKeyProblem(v) {
 }
 
 /** Resolves {ok:true} or {ok:false,status,error}. status 0 = network. */
-async function verifyGalleryKey(slug, key) {
+async function verifyGalleryKey(slug, key, request = fetch) {
   let res;
   try {
-    res = await fetch("/api/galleries/resolve", {
+    res = await request("/api/galleries/resolve", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
       body: JSON.stringify({ slug }),
@@ -955,10 +983,10 @@ async function verifyGalleryKey(slug, key) {
 }
 
 /** Return a key the server accepts for `slug`; prompt and verify when needed. */
-async function askKeyForGallery(slug, help) {
+async function askKeyForGallery(slug, help, request = fetch) {
   let promptHelp = help;
   if (galleryKey) {
-    const check = await verifyGalleryKey(slug, galleryKey);
+    const check = await verifyGalleryKey(slug, galleryKey, request);
     if (check.ok) return galleryKey;
     if (check.status === 429) {
       uploadStatus.textContent = check.error;
@@ -972,7 +1000,7 @@ async function askKeyForGallery(slug, help) {
   }
   return needKey(true, "enter", {
     help: promptHelp,
-    validate: async (key) => (await verifyGalleryKey(slug, key)).error || "",
+    validate: async (key) => (await verifyGalleryKey(slug, key, request)).error || "",
   });
 }
 
@@ -1004,52 +1032,75 @@ function resetKeyDialog() {
   keyValidator = null;
 }
 
-let passResolver = null;
-/** Prompt for a locked gallery's viewer password. Resolves true on unlock. */
+const passDialog = document.getElementById("pass-dialog");
+const passInput = document.getElementById("pass-input");
+const passError = document.getElementById("pass-error");
+const passConfirm = document.getElementById("pass-confirm");
+let passPrompt = null;
+
+/** Resolve to the listing that granted the viewer cookie, or null on cancel. */
 function needPass(slug) {
-  const dialog = document.getElementById("pass-dialog");
-  const input = document.getElementById("pass-input");
-  const errEl = document.getElementById("pass-error");
-  errEl.textContent = "";
-  input.value = "";
-  dialog.showModal();
-  input.focus();
-  return new Promise((resolve) => { passResolver = { resolve, slug }; });
+  passError.textContent = "";
+  passInput.value = "";
+  passConfirm.disabled = false;
+  passDialog.showModal();
+  passInput.focus();
+  return new Promise((resolve) => { passPrompt = { resolve, slug, controller: new AbortController() }; });
 }
 
-document.getElementById("pass-form").addEventListener("submit", (e) => {
-  if (!passResolver) return;
-  const { resolve, slug } = passResolver;
-  const input = document.getElementById("pass-input");
-  if (e.submitter?.value === "cancel") {
-    passResolver = null;
-    resolve(false);
-    return;
-  }
-  const v = input.value;
+document.getElementById("pass-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const prompt = passPrompt;
+  if (!prompt || passConfirm.disabled) return;
+  const v = passInput.value;
   if (!v) {
-    // method="dialog" would close the form on submit; keep it open so the
-    // error is visible.
-    e.preventDefault();
-    document.getElementById("pass-error").textContent = "Password required";
+    passError.textContent = "Enter the gallery password.";
+    passInput.focus();
     return;
   }
-  try { sessionStorage.setItem("gallery-pass:" + slug, v); } catch (_) {}
-  passResolver = null;
-  resolve(true);
+  passError.textContent = "";
+  passConfirm.disabled = true;
+  let data;
+  let error = "Could not check the password. Try again.";
+  try {
+    const res = await fetch(listingUrl(prompt.slug), {
+      headers: listingHeaders(prompt.slug, v),
+      signal: prompt.controller.signal,
+    });
+    if (res.status === 401) error = "Incorrect password. Check it and try again.";
+    else if (res.status === 429) error = "Too many attempts. Wait and try again.";
+    else if (res.ok) {
+      const listing = await res.json().catch(() => null);
+      // Only the listing this gallery granted may close the prompt and set the cookie.
+      if (listing?.slug === prompt.slug && Array.isArray(listing.photos)) data = listing;
+    }
+  } catch (_) {
+    error = "Could not check the password. Check your connection and try again.";
+  }
+  if (passPrompt !== prompt || !passDialog.open) return;
+  passConfirm.disabled = false;
+  if (!data) {
+    passError.textContent = error;
+    passInput.focus();
+    return;
+  }
+  try { sessionStorage.setItem("gallery-pass:" + prompt.slug, v); } catch (_) {}
+  passPrompt = null;
+  passInput.value = "";
+  passDialog.close();
+  prompt.resolve(data);
 });
-document.getElementById("pass-cancel").addEventListener("click", () => {
-  document.getElementById("pass-dialog").close();
-});
+document.getElementById("pass-cancel").addEventListener("click", () => passDialog.close());
 document.getElementById("setpass-cancel").addEventListener("click", () => {
   document.getElementById("setpass-dialog").close();
 });
-document.getElementById("pass-dialog").addEventListener("close", () => {
-  if (passResolver) {
-    const { resolve } = passResolver;
-    passResolver = null;
-    resolve(false);
-  }
+passDialog.addEventListener("close", () => {
+  if (passDialog.open || !passPrompt) return;
+  const { resolve, controller } = passPrompt;
+  passPrompt = null;
+  controller.abort();
+  passInput.value = "";
+  resolve(null);
 });
 // Invite code for NEW galleries: memory-only, asked once per batch when the
 // server answers "invite required". Contributing to an existing gallery
@@ -1139,17 +1190,73 @@ async function newGallery(key) {
     if (inviteCode) headers["X-Invite-Code"] = inviteCode;
     let res;
     try {
-      res = await fetch("/api/galleries/resolve", { method: "POST", headers, body: "{}" });
+      res = await resolveForUpload("/api/galleries/resolve", { method: "POST", headers, body: "{}" });
     } catch (_) {
-      return "";
+      throw new Error("Could not create the gallery. Check your connection and try again.");
     }
     const data = await res.json().catch(() => null);
-    if (res.ok && data && data.slug) return data.slug;
-    if (res.status !== 403 || !data || data.error !== "invite required") return "";
-    // A rejected code must not be cached and re-sent in a tight loop: clear
-    // it so needInvite asks again instead of flooding the upload limiter.
-    if (inviteCode) inviteCode = "";
+    if (res.ok && data?.slug) return data.slug;
+    if (res.status === 429) {
+      throw new Error("Upload rate limit reached. Wait and try again.");
+    }
+    if (res.status !== 403 || data?.error !== "invite required") {
+      throw new Error("Could not create the gallery. Try again.");
+    }
+    // A rejected code must not be cached and re-sent in a tight loop.
+    inviteCode = "";
     if (!(await needInvite())) return "";
+  }
+}
+
+// A stable upload id lets a lost or failed request resume committed bytes.
+async function putFile(file, headersBase) {
+  const headersFor = { ...headersBase };
+  if (file.type) headersFor["Content-Type"] = file.type;
+  const id = randomUploadId();
+  let offset = 0;
+  let furthest = 0;
+  let failures = 0;
+  for (;;) {
+    const end = Math.min(offset + UPLOAD_CHUNK, file.size);
+    const headers = {
+      ...headersFor,
+      "X-Upload-Id": id,
+      "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`,
+    };
+    let res = null;
+    try {
+      res = await uploadRequest("/api/photos/" + encodeURIComponent(file.name), {
+        method: "PUT",
+        headers,
+        body: file.slice(offset, end),
+      });
+    } catch (_) { /* network failure: retried below */ }
+    if (res?.status === 201) return res;
+    if (res?.status === 202 || res?.status === 409) {
+      const data = await (res.status === 409 ? res.clone() : res).json().catch(() => null);
+      // A saved file or row for this id cannot be resumed with different bytes.
+      if (res.status === 409 && data?.error === "upload id already used") return res;
+      const received = data?.received;
+      // A busy writer's temp length may include bytes it still has to roll back.
+      const authoritative = res.status === 202 ? received === end : data?.error === "offset mismatch";
+      if (authoritative && Number.isInteger(received) && received >= 0 && received < file.size) {
+        offset = received;
+        // A rewind must not replenish the budget for the same bytes.
+        if (offset > furthest) {
+          furthest = offset;
+          failures = 0;
+          continue;
+        }
+        if (res.status === 202) continue;
+      }
+    } else if (res?.status === 410) {
+      // The temp expired; restart with the same upload id.
+      offset = 0;
+    } else if (res && !retryableStatus(res.status)) {
+      return res;
+    }
+    if (++failures > UPLOAD_RETRIES) return res;
+    if (res?.status !== 429) await sleep(500 * 2 ** Math.min(failures - 1, 4));
   }
 }
 
@@ -1180,77 +1287,34 @@ fileInput.addEventListener("change", async () => {
     uploadStatus.textContent = failures.join("; ");
     return;
   }
+  uploading = true;
+  uploadBtn.disabled = true;
+  try {
+    await uploadBatch(pageSlug, accepted, failures);
+  } finally {
+    uploading = false;
+    uploadBtn.disabled = false;
+  }
+});
+
+async function uploadBatch(pageSlug, accepted, failures) {
   const key = pageSlug
-    ? await askKeyForGallery(pageSlug, "Enter the owner key for this gallery to upload.")
+    ? await askKeyForGallery(pageSlug, "Enter the owner key for this gallery to upload.", resolveForUpload)
     : await needKey(true, "create");
   if (!key) return;
-  // One gallery per batch, picked before the first byte: if one upload's
-  // reply is lost, the next file must not mint a second gallery that the
-  // browser never navigates to.
-  const target = pageSlug || (await newGallery(key));
-  if (!target) {
-    uploadStatus.textContent = "Could not create gallery";
+  // One gallery per batch, picked before the first byte.
+  let target;
+  try {
+    target = pageSlug || (await newGallery(key));
+  } catch (e) {
+    uploadStatus.textContent = e.message;
     return;
   }
+  if (!target) return;
   let stored = 0;
   let started = 0;
   const total = accepted.length;
   const headersBase = { "X-Gallery-Key": key, "X-Gallery-Slug": target };
-  /**
-   * One sequential chunk loop per file, keyed by a stable upload id: a lost
-   * or failed request resumes from the server's committed byte offset.
-   * Returns the final 201 response, or the last failed response / null.
-   */
-  async function putFile(file, headersBase) {
-    const headersFor = { ...headersBase };
-    if (file.type) headersFor["Content-Type"] = file.type;
-    const id = randomUploadId();
-    let offset = 0;
-    let failures = 0;
-    while (offset < file.size) {
-      const end = Math.min(offset + UPLOAD_CHUNK, file.size);
-      const headers = {
-        ...headersFor,
-        "X-Upload-Id": id,
-        "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`,
-      };
-      let res = null;
-      try {
-        res = await fetch("/api/photos/" + encodeURIComponent(file.name), {
-          method: "PUT",
-          headers,
-          body: file.slice(offset, end),
-        });
-      } catch (_) { /* network failure: retried below */ }
-      if (res && res.status === 201) return res;
-      if (res && res.status === 202) {
-        // Chunk stored, more expected: the server owns the committed offset.
-        const data = await res.json().catch(() => null);
-        const received = data && Number.isInteger(data.received) ? data.received : end;
-        if (received > offset) { offset = received; failures = 0; continue; }
-        failures += 1;
-      } else if (res && res.status === 409) {
-        // Another request committed bytes (or this one did not land): jump
-        // to the server's offset when it moved forward.
-        const data = await res.json().catch(() => null);
-        if (data && Number.isInteger(data.received) && data.received >= 0 && data.received <= file.size) {
-          if (data.received > offset) { offset = data.received; failures = 0; continue; }
-        }
-        failures += 1;
-      } else if (res && res.status === 410) {
-        // Temp gone (restart/expiry): restart the file with the same id.
-        offset = 0;
-        failures += 1;
-      } else if (!res || retryableStatus(res.status)) {
-        failures += 1;
-      } else {
-        return res;
-      }
-      if (failures > UPLOAD_RETRIES) return res;
-      await sleep(500 * 2 ** Math.min(failures - 1, 4));
-    }
-    return null;
-  }
   async function uploadWorker() {
     for (;;) {
       const file = accepted.shift();
@@ -1258,17 +1322,24 @@ fileInput.addEventListener("change", async () => {
       started += 1;
       uploadStatus.textContent = "Uploading " + started + " of " + total + " — " + file.name;
       const res = await putFile(file, headersBase);
-      if (!res) {
-        failures.push(file.name + ": upload failed");
-        continue;
-      }
-      if (!res.ok) {
-        let msg = res.statusText;
-        try {
-          const err = await res.json();
-          if (err.error) msg = err.error;
-        } catch (_) { /* keep status text */ }
-        failures.push(file.name + ": " + msg);
+      if (res?.status !== 201) {
+        let failure = "Upload was not confirmed. Try again.";
+        if (res?.status === 429) {
+          failure = "Upload rate limit reached. Wait and try again.";
+        } else if (res?.status === 409) {
+          // Other 409s stay generic; only a definite id conflict is actionable.
+          const err = await res.clone().json().catch(() => null);
+          if (err?.error === "upload id already used") {
+            failure = "This upload ID is already used. Select the file again to start a new upload.";
+          }
+        } else if (res && !res.ok) {
+          failure = res.statusText || failure;
+          try {
+            const err = await res.json();
+            if (err.error) failure = err.error;
+          } catch (_) { /* keep status text */ }
+        }
+        failures.push(file.name + ": " + failure);
         continue;
       }
       stored += 1;
@@ -1276,33 +1347,26 @@ fileInput.addEventListener("change", async () => {
   }
   // The server allows 4 concurrent uploads per IP; 3 leaves room for the
   // listing request that follows the batch.
-  uploading = true;
-  uploadBtn.disabled = true;
   uploadStatus.textContent = "Uploading 0 of " + total + "…";
-  try {
-    await Promise.all(Array.from({ length: Math.min(3, accepted.length) }, uploadWorker));
-    if (pageSlug) {
-      // Gallery page: show the new tiles without a manual reload.
-      await loadPhotos(true);
-      uploadStatus.textContent = failures.length
-        ? (stored ? "Uploaded " + stored + " of " + total + ". " : "") + failures.join("; ")
-        : "Uploaded " + stored + (stored === 1 ? " photo." : " photos.");
-      return;
-    }
-    if (!stored) {
-      // Nothing landed: stay put so the errors stay visible.
-      uploadStatus.textContent = failures.join("; ") || "Upload failed.";
-      return;
-    }
-    // Carry the key to the next page so the banner can show it once (the field
-    // itself is never prefilled again).
-    try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
-    location.assign("/" + target);
-  } finally {
-    uploading = false;
-    uploadBtn.disabled = false;
+  await Promise.all(Array.from({ length: Math.min(3, accepted.length) }, uploadWorker));
+  if (pageSlug) {
+    // Gallery page: show the new tiles without a manual reload.
+    await loadPhotos(true);
+    uploadStatus.textContent = failures.length
+      ? (stored ? "Uploaded " + stored + " of " + total + ". " : "") + failures.join("; ")
+      : "Uploaded " + stored + (stored === 1 ? " photo." : " photos.");
+    return;
   }
-});
+  if (!stored) {
+    // Nothing landed: stay put so the errors stay visible.
+    uploadStatus.textContent = failures.join("; ") || "Upload failed.";
+    return;
+  }
+  // Carry the key to the next page so the banner can show it once (the field
+  // itself is never prefilled again).
+  try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
+  location.assign("/" + target);
+}
 
 themeBtn.addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";

@@ -16,10 +16,8 @@ services:
       HOST: 0.0.0.0
       PORT: "8000"
       GALLY_ROOT: /data
-      # Reverse proxies allowed to set X-Forwarded-For (IPs/CIDRs); list
-      # every hop. The default covers loopback and Docker bridge peers
-      # (published host port, proxy container).
-      GALLY_TRUST_PROXY: ${GALLY_TRUST_PROXY:-127.0.0.0/8,172.16.0.0/12}
+      # Trust forwarding only when every actual proxy hop is listed explicitly.
+      GALLY_TRUST_PROXY: ${GALLY_TRUST_PROXY:-}
       # TLS terminates at the proxy; set 0 only for plain-HTTP LAN use.
       GALLY_SECURE_COOKIES: ${GALLY_SECURE_COOKIES:-1}
       RUST_LOG: ${RUST_LOG:-gally_uring=info}

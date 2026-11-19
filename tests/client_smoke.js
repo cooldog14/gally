@@ -5,6 +5,7 @@
 "use strict";
 
 const assert = require("assert");
+const { webcrypto } = require("node:crypto");
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
@@ -142,6 +143,9 @@ class El {
     this.children.push(node);
     return node;
   }
+  append(...nodes) {
+    for (const node of nodes) this.appendChild(node);
+  }
   prepend(node) {
     node.remove();
     node.parentNode = this;
@@ -183,12 +187,11 @@ class El {
   select() { this.selected = true; }
 }
 
-function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, clipboardApi = true } = {}) {
+function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, clipboardApi = true, clock = null, script = APP } = {}) {
   const els = new Map();
   const calls = [];
   const docListeners = new Map();
   const session = store || new Map();
-  let randomCalls = 0;
   const local = new Map();
   const clipboard = [];
   const page = { calls, els, session, local, clipboard, location: null, document: null };
@@ -263,16 +266,10 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
     location,
     matchMedia: () => ({ matches: false }),
     fetch: fetchImpl,
-    // Deterministic but distinct per call: two concurrent files must not
-    // share an upload id, or they would collide on the server's `.part-` temp.
-    crypto: {
-      getRandomValues(arr) {
-        randomCalls += 1;
-        for (let i = 0; i < arr.length; i += 1) arr[i] = (randomCalls + i) & 0xff;
-        return arr;
-      },
-    },
-    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    crypto: webcrypto,
+    performance: clock || performance,
+    setTimeout: clock ? clock.setTimeout : setTimeout,
+    AbortController,
     Image: class {},
     URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
     IntersectionObserver: class {
@@ -283,7 +280,7 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
   };
   context.globalThis = context;
   vm.createContext(context);
-  vm.runInContext(APP, context, { filename: "app.js" });
+  vm.runInContext(script, context);
 
   async function fire(id, event) {
     const target = els.get(id);
@@ -317,6 +314,29 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
 const tick = async () => {
   for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
 };
+
+function virtualClock() {
+  let now = 0;
+  let timers = [];
+  return {
+    now: () => now,
+    setTimeout: (fn, delay) => timers.push({ fn, at: now + delay }),
+    async run(batch) {
+      let settled = false;
+      batch.then(() => { settled = true; }, () => { settled = true; });
+      for (let i = 0; i < 50; i += 1) {
+        await tick();
+        if (settled) return batch;
+        assert(timers.length, "batch is waiting without a timer");
+        now = Math.min(...timers.map((timer) => timer.at));
+        const ready = timers.filter((timer) => timer.at === now);
+        timers = timers.filter((timer) => timer.at !== now);
+        for (const timer of ready) timer.fn();
+      }
+      throw new Error("batch did not settle on the virtual clock");
+    },
+  };
+}
 
 async function waitFor(fn, what, ms = 10000) {
   const deadline = Date.now() + ms;
@@ -609,7 +629,8 @@ async function workflowView() {
   await page.fire("done-btn");
 
   // Locked gallery: pass dialog cancel, then unlock with the password.
-  await setLock(slug, key, "Viewer-Pass-9");
+  const pass = "Viewer-Pass-9-é";
+  await setLock(slug, key, pass);
   const locked = makePage({ pathname: "/" + slug });
   await waitFor(() => locked.els.get("pass-dialog").open, "password prompt");
   await locked.fire("pass-cancel");
@@ -620,11 +641,44 @@ async function workflowView() {
   assert.strictEqual(locked.els.get("gallery-state").textContent, "Public · Protected", "locked state");
   assert.strictEqual(locked.els.get("grid").children.length, 0);
 
-  const unlocking = makePage({ pathname: "/" + slug });
+  let viewerCookie = "";
+  const unlocking = makePage({
+    pathname: "/" + slug,
+    handler: async (url, opts) => {
+      const res = await globalThis.fetch(BASE + url, opts);
+      const cookie = res.headers.get("Set-Cookie");
+      if (cookie) viewerCookie = cookie.split(";")[0];
+      return res;
+    },
+  });
+  const field = "gallery-pass:" + slug;
   await waitFor(() => unlocking.els.get("pass-dialog").open, "password prompt");
-  unlocking.els.get("pass-input").value = "Viewer-Pass-9";
-  await unlocking.fire("pass-form", { type: "submit", submitter: { value: "unlock" } });
+  unlocking.els.get("pass-input").value = "wrong-password";
+  await unlocking.fire("pass-form", { type: "submit" });
+  assert.strictEqual(unlocking.els.get("pass-dialog").open, true, "wrong password keeps the prompt open");
+  assert.match(unlocking.els.get("pass-error").textContent, /Incorrect password/);
+  assert.strictEqual(unlocking.session.has(field), false, "incorrect password is not saved");
+  assert.strictEqual(unlocking.els.get("grid").children.length, 0);
+
+  unlocking.els.get("pass-input").value = pass;
+  const check = unlocking.fire("pass-form", { type: "submit" });
+  assert.strictEqual(unlocking.els.get("pass-dialog").open, true, "prompt stays open during the request");
+  assert.strictEqual(unlocking.session.has(field), false, "pending password is not saved");
+  await check;
   await waitFor(() => unlocking.els.get("grid").children.length === 200, "unlocked listing");
+  assert.strictEqual(unlocking.els.get("pass-dialog").open, false);
+  assert.strictEqual(unlocking.session.get(field), pass);
+  assert.strictEqual(unlocking.calls.length, 3, "renders the listing that accepted the password");
+  assert(viewerCookie, "the accepted listing issues a media cookie");
+  const res = await globalThis.fetch(BASE + shown.src, { headers: { Cookie: viewerCookie } });
+  assert.strictEqual(res.status, 200, "the viewer cookie authorizes the original");
+  assert.deepStrictEqual(Buffer.from(await res.arrayBuffer()), PNG);
+
+  const ownerAsViewer = makePage({ pathname: "/" + slug });
+  await waitFor(() => ownerAsViewer.els.get("pass-dialog").open, "owner-as-viewer prompt");
+  ownerAsViewer.els.get("pass-input").value = key;
+  await ownerAsViewer.fire("pass-form", { type: "submit" });
+  await waitFor(() => ownerAsViewer.els.get("grid").children.length === 200, "owner key works in viewer prompt");
 
   // Private gallery without a key: prompt, cancel, stay on an explained page.
   await publish(slug, key, false);
@@ -756,10 +810,11 @@ async function testHeicFetchesOnlyWhenVisible() {
   );
 }
 
-function homePage(uploadHandler) {
+function homePage(uploadHandler, clock) {
   return makePage({
     pathname: "/",
     handler: uploadHandler,
+    clock,
   });
 }
 
@@ -926,8 +981,79 @@ async function testEmptyPasswordKeepsDialogOpen() {
   });
   assert.strictEqual(prevented, true, "empty submit is not the default dialog close");
   assert.strictEqual(page.els.get("pass-dialog").open, true, "dialog stays open");
-  assert.strictEqual(page.els.get("pass-error").textContent, "Password required");
+  assert.match(page.els.get("pass-error").textContent, /Enter the gallery password/);
   assert.strictEqual(page.session.get("gallery-pass:" + SLUG), undefined);
+}
+
+async function testPasswordCheckErrorsAndCancel() {
+  let finish;
+  const page = makePage({
+    pathname: "/" + SLUG,
+    handler: (_url, { headers }) => {
+      const pass = headers["X-Gallery-Pass"];
+      if (!pass) return new Response(null, { status: 401 });
+      if (pass === "rate") return new Response(null, { status: 429 });
+      if (pass === "network") throw new TypeError("network down");
+      if (pass === "empty") return Response.json({});
+      return new Promise((resolve) => { finish = resolve; });
+    },
+  });
+  await waitFor(() => page.els.get("pass-dialog").open, "password prompt");
+  for (const [value, message] of [["rate", /Too many attempts/], ["network", /Check your connection/], ["empty", /Could not check the password\. Try again\./]]) {
+    page.els.get("pass-input").value = value;
+    await page.fire("pass-form", { type: "submit" });
+    assert.match(page.els.get("pass-error").textContent, message);
+    assert.strictEqual(page.els.get("pass-dialog").open, true);
+    assert.strictEqual(page.els.get("pass-input").value, value);
+    assert.strictEqual(page.session.has("gallery-pass:" + SLUG), false);
+  }
+
+  page.els.get("pass-input").value = "pending";
+  const check = page.fire("pass-form", { type: "submit" });
+  const signal = page.calls.at(-1).opts.signal;
+  assert.strictEqual(page.els.get("pass-confirm").disabled, true);
+  await page.fire("pass-cancel");
+  assert.strictEqual(signal.aborted, true);
+  finish(Response.json({ slug: SLUG, photos: [{ name: "would-have-rendered.png" }] }));
+  await check;
+  assert.strictEqual(page.session.has("gallery-pass:" + SLUG), false, "late success after cancelling is ignored");
+  assert.strictEqual(page.els.get("grid").children.length, 0);
+}
+
+async function testAdminLogout() {
+  const html = fs.readFileSync(path.join(__dirname, "..", "admin.html"), "utf8");
+  let logout;
+  const page = makePage({
+    script: html.match(/<script>([\s\S]*?)<\/script>/)[1],
+    handler: (url) => {
+      if (url.endsWith("/unlock")) return Response.json({ ok: true });
+      if (url.endsWith("/galleries")) return Response.json({ galleries: [{ slug: SLUG, photos: 1 }] });
+      assert(url.endsWith("/logout"));
+      return logout();
+    },
+  });
+  for (const result of [{ status: 200, body: { ok: true } }, { status: 403, body: { error: "admin session inactive" } }]) {
+    page.els.get("password").value = "admin-password";
+    await page.fire("unlock");
+    for (const failure of [
+      () => { throw new TypeError("network down"); },
+      () => Response.json({ error: "internal" }, { status: 500 }),
+      () => new Response("Forbidden by proxy", { status: 403 }),
+      () => Response.json({ error: "forbidden" }, { status: 403 }),
+    ]) {
+      logout = failure;
+      await page.fire("logout");
+      assert.strictEqual(page.els.get("panel").hidden, false);
+      assert.strictEqual(page.els.get("login").hidden, true);
+      assert.match(page.els.get("galleries").textContent, new RegExp(SLUG));
+      assert.match(page.els.get("panel-error").textContent, /Could not confirm logout.*try again/);
+    }
+    logout = () => Response.json(result.body, { status: result.status });
+    await page.fire("logout");
+    assert.strictEqual(page.els.get("panel").hidden, true);
+    assert.strictEqual(page.els.get("login").hidden, false);
+    assert.strictEqual(page.els.get("password").value, "");
+  }
 }
 
 async function testRejectedFilesDoNotMintGallery() {
@@ -947,35 +1073,148 @@ async function testRejectedFilesDoNotMintGallery() {
 }
 
 async function testUploadResumesFromServerOffset() {
+  const chunks = 7;
+  const size = chunks * UPLOAD_CHUNK + 10;
+  const clock = virtualClock();
+  const puts = [];
+  let committed = 0;
+  const page = homePage((url, opts) => {
+    if (url === "/api/galleries/resolve") return Response.json({ slug: SLUG });
+    puts.push(opts.headers);
+    const [, start, end] = opts.headers["Content-Range"].match(/^bytes (\d+)-(\d+)\//);
+    if (Number(start) !== committed) {
+      return Response.json({ error: "offset mismatch", received: committed }, { status: 409 });
+    }
+    committed = Number(end) + 1;
+    if (committed < size) throw new TypeError("202 response lost");
+    return Response.json({ ok: true }, { status: 201 });
+  }, clock);
+  await clock.run(startBatch(page, [filed("big.jpg", size)]));
+  assert.strictEqual(puts.length, chunks * 2 + 1, "each lost reply is reconciled");
+  assert.strictEqual(new Set(puts.map((p) => p["X-Upload-Id"])).size, 1);
+  assert.strictEqual(puts.at(-1)["Content-Range"], `bytes ${chunks * UPLOAD_CHUNK}-${size - 1}/${size}`);
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+}
+
+async function testUploadBusyAndInvalidOffsets() {
   const size = UPLOAD_CHUNK + 10;
-  let putCount = 0;
+  const clock = virtualClock();
+  const replies = [
+    Response.json({ error: "upload in progress", received: size }, { status: 409 }),
+    Response.json({ received: UPLOAD_CHUNK }, { status: 202 }),
+    Response.json({ error: "offset mismatch", received: size }, { status: 409 }),
+    Response.json({ received: size }, { status: 202 }),
+    Response.json({ error: "offset mismatch", received: UPLOAD_CHUNK - 5 }, { status: 409 }),
+    Response.json({ ok: true }, { status: 201 }),
+  ];
   const puts = [];
   const page = homePage((url, opts) => {
-    if (url === "/api/galleries/resolve") return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
-    if (opts.method === "PUT") {
-      puts.push(opts);
-      putCount += 1;
-      if (putCount === 1) {
-        return {
-          status: 409,
-          ok: false,
-          json: async () => ({ error: "offset mismatch", received: UPLOAD_CHUNK }),
-        };
-      }
-      return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
-    }
-    throw new Error("unexpected " + url);
-  });
-  await startBatch(page, [filed("big.jpg", size)]);
-  assert.strictEqual(puts.length, 2, "the second chunk was sent");
-  assert.strictEqual(puts[0].headers["Content-Range"], `bytes 0-${UPLOAD_CHUNK - 1}/${size}`);
-  assert.strictEqual(
-    puts[1].headers["Content-Range"],
-    `bytes ${UPLOAD_CHUNK}-${size - 1}/${size}`,
-    "resumes at the server's committed offset"
-  );
-  assert.strictEqual(puts[1].headers["X-Upload-Id"], puts[0].headers["X-Upload-Id"]);
+    if (url === "/api/galleries/resolve") return Response.json({ slug: SLUG });
+    puts.push(opts.headers);
+    return replies.shift();
+  }, clock);
+  await clock.run(startBatch(page, [filed("big.jpg", size)]));
+  const first = `bytes 0-${UPLOAD_CHUNK - 1}/${size}`;
+  const last = `bytes ${UPLOAD_CHUNK}-${size - 1}/${size}`;
+  assert.deepStrictEqual(puts.map((p) => p["Content-Range"]), [first, first, last, last, last, `bytes ${UPLOAD_CHUNK - 5}-${size - 1}/${size}`]);
+  assert.strictEqual(new Set(puts.map((p) => p["X-Upload-Id"])).size, 1);
+  assert.strictEqual(replies.length, 0, "the final 201 was reached");
   assert.strictEqual(page.location.assigned, "/" + SLUG);
+
+  const badClock = virtualClock();
+  let attempts = 0;
+  const bad = homePage((url) => {
+    if (url === "/api/galleries/resolve") return Response.json({ slug: SLUG });
+    attempts += 1;
+    return Response.json({ received: 10 }, { status: 202 });
+  }, badClock);
+  await badClock.run(startBatch(bad, [filed("never.jpg")]));
+  assert(attempts > 1, "invalid EOF is retried but never counted as success");
+  assert.strictEqual(bad.location.assigned, "");
+  assert.match(bad.els.get("upload-status").textContent, /Upload was not confirmed/);
+
+  const dupClock = virtualClock();
+  let dupPuts = 0;
+  const dup = homePage((url) => {
+    if (url === "/api/galleries/resolve") return Response.json({ slug: SLUG });
+    dupPuts += 1;
+    return Response.json({ error: "upload id already used" }, { status: 409 });
+  }, dupClock);
+  await dupClock.run(startBatch(dup, [filed("dup.jpg")]));
+  assert.strictEqual(dupPuts, 1, "a definite id conflict is not retried");
+  assert.match(dup.els.get("upload-status").textContent, /This upload ID is already used\. Select the file again/);
+  assert.strictEqual(dup.location.assigned, "");
+}
+
+async function testUploadRateWait() {
+  const clock = virtualClock();
+  const limit = 2;
+  const window = 60_000;
+  let resetAt = 17_000;
+  let used = limit;
+  let shorter = true;
+  const sent = [];
+  const stored = [];
+  const mints = [];
+  const page = homePage((url, opts) => {
+    const now = clock.now();
+    const mint = opts.method === "POST";
+    if (mint) mints.push(now);
+    else sent.push(now);
+    if (now >= resetAt) {
+      resetAt = now + window;
+      used = 0;
+    }
+    if (used === limit) {
+      // In-flight responses can disagree; the longest observed wait wins.
+      const seconds = !mint && shorter ? 2 : (resetAt - now) / 1000;
+      if (!mint) shorter = false;
+      return Response.json({ error: "too many requests" }, { status: 429, headers: { "Retry-After": String(seconds) } });
+    }
+    used += 1;
+    if (mint) return Response.json({ slug: SLUG });
+    stored.push(url);
+    return Response.json({ ok: true }, { status: 201 });
+  }, clock);
+
+  const names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "f.jpg"];
+  page.els.get("file-input").files = names.map((name) => filed(name));
+  const batch = page.fire("file-input", { type: "change" });
+  assert.strictEqual(page.els.get("upload-btn").disabled, true, "batch owns the picker while prompting");
+  page.els.get("file-input").files = [filed("competing.jpg")];
+  await page.fire("file-input", { type: "change" });
+  await submitKey(page, "Home-Key-1234");
+  await clock.run(batch);
+  assert.deepStrictEqual(mints, [0, 17_000], "mint honors Retry-After");
+  assert(sent.every((t) => t >= 17_000 && (t - 17_000) % window === 0), "no worker sends before the shared deadline");
+  assert.deepStrictEqual(stored.sort(), names.map((name) => "/api/photos/" + name), "a batch above the limit completes");
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+}
+
+async function testUploadKeyCheckWaitsForRateLimit() {
+  const clock = virtualClock();
+  const started = [];
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    clock,
+    listing: { slug: SLUG, photos: [] },
+    handler: (url, opts) => {
+      started.push([opts.method, clock.now()]);
+      if (url === "/api/galleries/resolve") {
+        assert.strictEqual(JSON.parse(opts.body).slug, SLUG, "checks the existing gallery, not minting");
+        if (clock.now() === 0) {
+          return Response.json({ error: "too many requests" }, { status: 429, headers: { "Retry-After": "48" } });
+        }
+        return Response.json({ slug: SLUG });
+      }
+      return Response.json({ ok: true }, { status: 201 });
+    },
+  });
+  page.els.get("file-input").files = [filed("a.jpg")];
+  await clock.run(page.fire("file-input", { type: "change" }));
+  assert.deepStrictEqual(started, [["POST", 0], ["POST", 48_000], ["PUT", 48_000]]);
+  assert.strictEqual(page.els.get("upload-status").textContent, "Uploaded 1 photo.");
 }
 
 async function testLandingExplainsKeys() {
@@ -1106,8 +1345,13 @@ async function testPrivateGalleryKeyOpens() {
   await testLostReplyDoesNotMintAgain();
   await testUploadRetriesLostChunk();
   await testUploadResumesFromServerOffset();
+  await testUploadBusyAndInvalidOffsets();
+  await testUploadRateWait();
+  await testUploadKeyCheckWaitsForRateLimit();
   await testWrongInviteCodeIsAskedAgain();
   await testEmptyPasswordKeepsDialogOpen();
+  await testPasswordCheckErrorsAndCancel();
+  await testAdminLogout();
   await testRejectedFilesDoNotMintGallery();
   if (BASE) {
     await workflowUpload();

@@ -120,10 +120,7 @@ pub fn photo_slug(name: &str) -> Option<&str> {
     let us = name.find('_')?;
     let slug = &name[..us];
     let rest = &name[us + 1..];
-    if rest.len() < 33 {
-        return None;
-    }
-    let (hexpart, tail) = rest.split_at(32);
+    let (hexpart, tail) = rest.split_at_checked(32)?;
     if !tail.starts_with('_') {
         return None;
     }
@@ -329,6 +326,13 @@ mod tests {
     #[test]
     fn photo_slug_bad() {
         assert!(photo_slug("nope.jpg").is_none());
+        assert!(
+            photo_slug(&format!(
+                "velvet-lagoon-quiet-river-1a2b_{}é_x.jpg",
+                "a".repeat(31)
+            ))
+            .is_none()
+        );
         let h = "z".repeat(32); // not hex
         assert!(photo_slug(&format!("velvet-lagoon-quiet-river-1a2b_{}_x.jpg", h)).is_none());
         assert!(

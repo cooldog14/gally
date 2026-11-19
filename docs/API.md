@@ -56,7 +56,7 @@ percent-decoded too. Prefer the cookie for subsequent media requests.
 
 | Bucket | Default | Scope |
 |---|---|---|
-| Uploads | 60/min/IP | Full-body PUTs, or the first chunk (`start=0`) of a resumable upload |
+| Uploads | 60/min/IP | Resolve/mint, full-body PUTs, the first chunk (`start=0`) of a resumable upload, visibility/password changes, and admin unlock |
 | Reads | 12,000/min/IP | Listings and every media/thumbnail request |
 | Failed keys/passwords | 10/min/IP | Wrong key or viewer password, including admin login |
 
@@ -64,6 +64,8 @@ percent-decoded too. Prefer the cookie for subsequent media requests.
 the 10/min failure lockout always applies. A rate-limited request returns
 `429`; the error string depends on the endpoint (`too many uploads`, `too many
 requests`, or `too many attempts`).
+Only a throttle from the upload bucket includes `Retry-After`: whole seconds,
+rounded up until a slot opens. Pause new uploads in the batch until then.
 
 ### Errors and status codes
 
@@ -73,7 +75,7 @@ Errors are JSON:
 { "error": "unknown gallery" }
 ```
 
-Some responses add fields: `received` on upload conflicts, `locked` on a lock
+Some responses add fields: `received` on upload offset mismatches, `locked` on a lock
 denial, `deleted`/`files` on deletes, `ok`/`free_bytes` on health.
 
 | Status | Meaning |
@@ -103,13 +105,12 @@ repeated guesses become `429`.
 
 ### Caching, ETags, and ranges
 
-- Listings, owner media, and any media requested with a password or viewer
-  cookie: `Cache-Control: private, no-store`.
-- Public, unlocked media without `?pass=` or a viewer cookie:
-  `public, max-age=86400`.
+- Listings and all authorized originals and previews, including public media
+  and `206` and `304` responses: `Cache-Control: private, no-store`.
+  Requests always have to pass the current gallery access checks.
 - Static files: `Cache-Control: no-cache` plus an ETag; `If-None-Match`
   returns `304`.
-- Media responses carry an ETag and `Accept-Ranges: bytes`. One range is
+- Full media responses carry an ETag; all media supports `Accept-Ranges: bytes`. One range is
   supported, including a suffix (`bytes=-N`, where `N` larger than the file
   means the whole file). Multiple ranges are answered with the full file.
   An unsatisfiable range is `416` with `Content-Range: bytes */<len>`.
@@ -130,9 +131,10 @@ files.
 
 ### `GET /metrics`
 
-Prometheus text. Local-only: a direct connection from a trusted peer (for
-example the Docker gateway) or a forwarded client that resolves to loopback.
-Otherwise `404`.
+Prometheus text. Only a direct loopback socket with no forwarding header and
+whose peer is not listed in `GALLY_TRUST_PROXY` may scrape; otherwise `404`.
+In Compose, scrape inside the app container's network namespace. Explicitly
+block `/metrics` and the admin paths at the public reverse proxy.
 
 Metrics: `gally_uptime_seconds`, `gally_free_bytes`, `gally_galleries`,
 `gally_photos`, `gally_bytes`, `gally_requests_total`,
@@ -205,7 +207,8 @@ silently clears an existing lock.
 ```
 
 Changing the password bumps the token version, so all existing viewer cookies
-stop working. `401`/`403`/`404`/`429` as above.
+stop working. Viewer requests overlapping a change may be denied; retry with
+the current password. `401`/`403`/`404`/`429` as above.
 
 ### `PUT /api/photos/{name}`
 
@@ -238,42 +241,50 @@ Content-Range: bytes 0-8388607/12582912
 
 `start` and `end` are inclusive; `total` is the final file size; `start <= end
 < total`; `total` cannot be 0. `X-Gallery-Slug` is required. Chunks must be
-contiguous: the existing temp length must equal `start`.
+contiguous: the existing temp length must equal `start`. Keep the filename
+and total unchanged, and use a different ID for each file in a gallery.
 
 | Response | Meaning |
 |---|---|
-| `202 {"received":N}` | Chunk committed; continue from `N` |
-| `201 {name,slug}` | Final chunk stored; also returned on a retried final chunk whose file and row already exist |
+| `202 {"received":N}` | Chunk written and flushed; continue from `N` |
+| `201 {name,slug}` | Final chunk stored, or the matching upload is already complete |
 | `409 {"error":"offset mismatch","received":N}` | Server has N bytes; jump to N |
-| `409 {"error":"upload in progress","received":N}` | Another request owns this upload id; back off and retry |
+| `409 {"error":"upload in progress"}` | Another request owns this gallery's upload ID; back off and retry the same offset |
+| `409 {"error":"upload id already used"}` | A saved file or row for this ID does not match this request; use a different ID for a different file |
 | `410 {"error":"upload expired"}` | Temp is gone (restart, startup sweep, or 1 h TTL); restart at 0 with the same id |
 | `400` | Bad headers, a chunk overrun, an empty body, or `temp > total` |
 | `408` | Idle timeout, short body, or a chunk shorter than its declared range |
 | `413` / `507` / `503` | File/gallery limits, free-space floor, or no slot |
-| `429` | Only the first chunk (`start=0`) consumes the upload bucket |
+| `429` | Only the first chunk (`start=0`) consumes the upload bucket; honor `Retry-After` |
 
-On an interrupted or rejected chunk the server keeps the previously committed
-prefix (and truncates the failed request's bytes), so the client can resume
-from `received`. The final chunk is made durable (file sync, rename, directory
-sync) before the DB row is added, and SQLite runs with `synchronous=FULL`, so
-the row commit is durable before the `201` response. A DB error after the
-rename returns `500` and keeps the file; the next startup recount adopts it.
-Abandoned `.part-*` files count toward the gallery byte quota while live and
-are swept after one hour.
+On an interrupted or rejected chunk the server rolls back to the last
+flushed, accepted prefix. A lost final response can be retried without
+writing the same bytes again. The final chunk is made durable (file sync,
+rename, directory sync) before the quota-checked DB commit and `201`.
+A DB error after rename returns `500` and keeps the unindexed original;
+a matching retry or the next startup recount can restore the row.
+Active uploads reserve gallery bytes and space before writing. Full-body
+uploads without `Content-Length` reserve incrementally. Idle `.part-*`
+prefixes still count toward gallery quota and use disk space until reclaimed
+after one hour. Disk accounting cannot reserve space against other processes.
 
 Limits: `GALLY_MAX_BYTES` (10 GiB), `GALLY_GALLERY_MAX_BYTES` (5 GiB),
 `GALLY_GALLERY_MAX_PHOTOS` (5000), `GALLY_MIN_FREE_BYTES` (2 GiB),
 `GALLY_UPLOAD_SLOTS` (32 global), `GALLY_UPLOAD_SLOTS_PER_IP` (4). Disable the
 gallery/free-space limits with `0`.
 
+EXIF capture time is extracted only from files of 16 MiB or less (also for
+startup backfill). Larger files are stored unchanged and keep the normal
+upload-time or existing-date fallback.
+
 ### `GET /photos/{name}` and `GET /photos/thumb/{name}.jpg`
 
 Serve the original or its preview. Auth: `X-Gallery-Key`, owner/viewer media
 cookie, `?pass=`, or `X-Gallery-Pass`. A private gallery without the owner is
 `404`; a public locked gallery without a password is
-`401 {"error":"gallery locked","locked":true}`. A thumbnail requires the
-original's DB row: a stale `.thumbs` file is `404`, and the client falls back
-to the original.
+`401 {"error":"gallery locked","locked":true}`. Both originals and previews
+require the original's DB row. A missing preview is `404`; the client falls
+back to the original.
 
 | Extension | Served as |
 |---|---|
@@ -319,7 +330,7 @@ All admin routes require the `admin` cookie except the unlock route. If
 | `GET /api/admin/galleries` | — | `200 {"galleries":[{slug,created,photos,bytes,public}]}`; `created` is Unix ms |
 | `POST /api/admin/galleries/{slug}/remove` | — | `200 {"deleted":slug,"files":N}`; `404`; `500` partial |
 | `POST /api/admin/sweep` | — | `200 {"deleted":N,"failed":N}`; removes orphaned files and expired temps |
-| `POST /api/admin/logout` | — | `200 {"ok":true}`; clears the cookie |
+| `POST /api/admin/logout` | — | `200 {"ok":true}`; clears the cookie. Without a live admin session: `403 {"error":"admin session inactive"}`; a generic `403` is not proof of logout |
 
 The admin cannot recover keys or passwords, and cannot read a private
 gallery's photos. Deleting a gallery does not revoke its key.

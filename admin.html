@@ -125,11 +125,27 @@ document.getElementById("sweep").addEventListener("click", async () => {
   } catch (e) { panelError.textContent = e.message; }
 });
 
-document.getElementById("logout").addEventListener("click", async () => {
-  try { await post("/api/admin/logout"); } catch (_) { /* already gone */ }
-  panel.hidden = true;
-  document.getElementById("login").hidden = false;
-  password.value = "";
+const logoutBtn = document.getElementById("logout");
+logoutBtn.addEventListener("click", async () => {
+  if (logoutBtn.disabled) return;
+  logoutBtn.disabled = true;
+  panelError.textContent = "";
+  try {
+    const res = await fetch("/api/admin/logout", { method: "POST" });
+    const data = await res.json();
+    // A proxy's 403 is not proof that the server invalidated the session.
+    if (!(res.ok && data?.ok === true) && !(res.status === 403 && data?.error === "admin session inactive")) {
+      throw new Error();
+    }
+    panel.hidden = true;
+    document.getElementById("login").hidden = false;
+    password.value = "";
+    password.focus();
+  } catch (_) {
+    panelError.textContent = "Could not confirm logout. Check your connection and try again.";
+  } finally {
+    logoutBtn.disabled = false;
+  }
 });
 </script>
 </body>

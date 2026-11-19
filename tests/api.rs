@@ -1002,6 +1002,7 @@ async fn photo_etag_revalidates_with_304() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(resp.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(resp.headers()["cache-control"], "private, no-store");
     assert!(body_bytes(resp).await.is_empty());
 
     // Range requests are never 304: they still slice.
@@ -1017,6 +1018,7 @@ async fn photo_etag_revalidates_with_304() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.headers()["cache-control"], "private, no-store");
 }
 
 #[tokio::test]
@@ -1756,9 +1758,9 @@ async fn visibility_endpoint_publishes_and_hides() {
 }
 
 #[tokio::test]
-async fn photo_cache_control_never_public_for_owners() {
+async fn photo_and_preview_cache_control_never_allows_storage() {
     let (state, _tmp) = test_state().await;
-    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let (_, v) = put_photo(&state, "pic.png", Some(KEY_A), None, "image/png", png()).await;
     let slug = v["slug"].as_str().unwrap().to_string();
     let name = v["name"].as_str().unwrap().to_string();
     let photo = format!("/photos/{name}");
@@ -1774,16 +1776,23 @@ async fn photo_cache_control_never_public_for_owners() {
     );
 
     assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
-    // Public gallery, anonymous viewer: cacheable.
-    let resp = router(state.clone())
-        .oneshot(get(&photo, &[]))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("cache-control").unwrap(),
-        "public, max-age=86400"
-    );
+    let mut etags = Vec::new();
+    for uri in [&photo, &format!("/photos/thumb/{name}.jpg")] {
+        let resp = router(state.clone()).oneshot(get(uri, &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["cache-control"], "private, no-store");
+        let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+        etags.push((uri.clone(), etag));
+    }
+    // A file version is not proof of access: hiding must beat a matching ETag.
+    assert_eq!(publish(&state, &slug, false).await, StatusCode::OK);
+    for (uri, etag) in etags {
+        let resp = router(state.clone())
+            .oneshot(get(&uri, &[("if-none-match", etag.as_str())]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
     // Owner key on a public gallery still stays out of shared caches.
     let resp = router(state.clone())
         .oneshot(get(&photo, &[key_header(KEY_A)]))
@@ -2047,6 +2056,7 @@ async fn range_requests_slice_the_file() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.headers()["cache-control"], "private, no-store");
     assert_eq!(
         resp.headers().get("content-range").unwrap(),
         "bytes 10-19/1000"
@@ -2430,12 +2440,23 @@ async fn admin_logout_clears_cookie_and_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    // Not an admin: refused.
+    // Not an admin: refused with a precise sentinel the UI can trust.
     let r = request("POST", "/api/admin/logout", &[], Body::empty());
-    assert_eq!(
-        router(state.clone()).oneshot(r).await.unwrap().status(),
-        StatusCode::FORBIDDEN
-    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["error"], "admin session inactive");
+    // The revoked token has the same precise response (a generic proxy 403 is not trusted).
+    let resp = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/api/admin/logout",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["error"], "admin session inactive");
 }
 
 #[tokio::test]
@@ -3579,13 +3600,21 @@ async fn concurrent_chunks_with_one_upload_id_are_serialized() {
         StatusCode::ACCEPTED
     );
 
-    // Hold the final chunk before it writes, then retry it: only one request
-    // may own the temp, or both append a copy of the chunk.
+    // The second body poll means the first frame was written and the handler
+    // is waiting for the rest; the busy response must not reveal that tail.
+    use futures::StreamExt;
     let (write, gate) = tokio::sync::oneshot::channel::<()>();
-    let body = Body::from_stream(futures::stream::once(async move {
-        let _ = gate.await;
-        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"ijklmnop"))
-    }));
+    let (started, polled) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(
+        futures::stream::iter([Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            b"ijkl",
+        ))])
+        .chain(futures::stream::once(async move {
+            started.send(()).unwrap();
+            gate.await.unwrap();
+            Ok(axum::body::Bytes::from_static(b"mnop"))
+        })),
+    );
     let req = request(
         "PUT",
         "/api/photos/pic.jpg",
@@ -3602,17 +3631,9 @@ async fn concurrent_chunks_with_one_upload_id_are_serialized() {
         let state = state.clone();
         async move { router(state).oneshot(req).await.unwrap() }
     });
-    let mut owned = false;
-    for _ in 0..200 {
-        if state.upload_ids.lock().unwrap().contains(id) {
-            owned = true;
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(owned, "first request never claimed the upload id");
+    polled.await.unwrap();
 
-    let (second, _) = put_chunk(
+    let (second, busy) = put_chunk(
         &state,
         "pic.jpg",
         KEY_A,
@@ -3623,6 +3644,7 @@ async fn concurrent_chunks_with_one_upload_id_are_serialized() {
     )
     .await;
     assert_eq!(second, StatusCode::CONFLICT);
+    assert_eq!(busy, serde_json::json!({ "error": "upload in progress" }));
 
     write.send(()).unwrap();
     let resp = first.await.unwrap();
@@ -3633,7 +3655,18 @@ async fn concurrent_chunks_with_one_upload_id_are_serialized() {
         b"abcdefghijklmnop",
         "the retry's body must not be appended"
     );
-    assert!(!state.upload_ids.lock().unwrap().contains(id));
+    let (replayed, json) = put_chunk(
+        &state,
+        "pic.jpg",
+        KEY_A,
+        &slug,
+        id,
+        "bytes 8-15/16",
+        b"ignored!",
+    )
+    .await;
+    assert_eq!(replayed, StatusCode::CREATED);
+    assert_eq!(json["name"], final_name);
 }
 
 #[tokio::test]
@@ -3761,9 +3794,27 @@ async fn chunked_upload_short_body_reports_interrupted() {
         .expect("gallery");
     let id = "f".repeat(32);
 
-    // Declared 3 bytes, sent 2: interrupted, but the committed bytes stay.
-    let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 0-2/6", b"ab").await;
+    assert_eq!(
+        put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 0-1/6", b"ab")
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    // The rejected request supplied one byte, but only the acknowledged prefix stays.
+    let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 2-3/6", b"X").await;
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    let (status, mismatch) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 3-5/6",
+        b"def",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(mismatch["received"], 2);
 
     let (status, body) = put_chunk(
         &state,
@@ -3778,4 +3829,437 @@ async fn chunked_upload_short_body_reports_interrupted() {
     assert_eq!(status, StatusCode::CREATED);
     let name = body["name"].as_str().unwrap();
     assert_eq!(std::fs::read(state.dir.join(name)).unwrap(), b"abcdef");
+}
+
+#[tokio::test]
+async fn password_rotation_denies_inflight_listing_and_media() {
+    let (state, _tmp) = test_state().await;
+    let (_, stored) = put_photo(
+        &state,
+        "rotate.txt",
+        Some(KEY_A),
+        None,
+        "text/plain",
+        b"photo".to_vec(),
+    )
+    .await;
+    let slug = stored["slug"].as_str().unwrap();
+    let name = stored["name"].as_str().unwrap();
+    assert_eq!(publish(&state, slug, true).await, StatusCode::OK);
+    let old = gally_uring::db::hash_password("old-password");
+    let new = gally_uring::db::hash_password("new-password");
+
+    for uri in [
+        format!("/api/galleries/{slug}/photos"),
+        format!("/photos/{name}"),
+    ] {
+        assert!(state.db.lock().unwrap().set_gallery_pass(slug, Some(&old)));
+        state.pass_ok.lock().unwrap().clear();
+        let permits = state
+            .argon2
+            .acquire_many(state.limits.argon2_slots as u32)
+            .await
+            .unwrap();
+        let request =
+            router(state.clone()).oneshot(get(&uri, &[("x-gallery-pass", "old-password")]));
+        let mut request = std::pin::pin!(request);
+        // Before password verification the handler has no other await point.
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(state.db.lock().unwrap().set_gallery_pass(slug, Some(&new)));
+        drop(permits);
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(!state.pass_ok.lock().unwrap().is_empty());
+        let response = router(state.clone())
+            .oneshot(get(&uri, &[("x-gallery-pass", "old-password")]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = router(state.clone())
+            .oneshot(get(&uri, &[("x-gallery-pass", "new-password")]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(set_cookie_pair(&response, "galpass_").is_some());
+    }
+}
+
+fn gated_body(
+    prefix: &'static [u8],
+) -> (
+    Body,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use futures::StreamExt;
+    let (started, polled) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let body = futures::stream::iter([Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+        prefix,
+    ))])
+    .chain(futures::stream::once(async move {
+        started.send(()).unwrap();
+        gate.await.unwrap();
+        Ok(axum::body::Bytes::new())
+    }));
+    (Body::from_stream(body), polled, release)
+}
+
+#[tokio::test]
+async fn canceled_chunk_rolls_back_before_retry_can_resume() {
+    let (state, _tmp) = test_state().await;
+    let (_, resolved) = resolve(&state, KEY_A).await;
+    let slug = resolved["slug"].as_str().unwrap();
+    let id = "12345678901234567890123456789012";
+    assert_eq!(
+        put_chunk(&state, "photo.txt", KEY_A, slug, id, "bytes 0-1/6", b"ab")
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    let (body, polled, _release) = gated_body(b"XX");
+    let req = request(
+        "PUT",
+        "/api/photos/photo.txt",
+        &[
+            key_header(KEY_A),
+            ("x-gallery-slug", slug),
+            ("x-upload-id", id),
+            ("content-range", "bytes 2-5/6"),
+        ],
+        body,
+    );
+    let job = tokio::spawn(router(state.clone()).oneshot(req));
+    polled.await.unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    // Acquiring all slots waits for the owned upload task to finish rollback.
+    drop(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.uploads.acquire_many(state.limits.upload_slots as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    let (status, mismatch) =
+        put_chunk(&state, "photo.txt", KEY_A, slug, id, "bytes 4-5/6", b"ef").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(mismatch["received"], 2);
+    let (status, saved) =
+        put_chunk(&state, "photo.txt", KEY_A, slug, id, "bytes 2-5/6", b"cdef").await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        std::fs::read(state.dir.join(saved["name"].as_str().unwrap())).unwrap(),
+        b"abcdef"
+    );
+}
+
+#[tokio::test]
+async fn parallel_uploads_reserve_gallery_bytes_before_writing() {
+    let (state, _tmp) = test_state_with(Limits {
+        gallery_bytes: 10,
+        ..Limits::defaults()
+    })
+    .await;
+    let (_, resolved) = resolve(&state, KEY_A).await;
+    let slug = resolved["slug"].as_str().unwrap();
+    let (body, polled, release) = gated_body(b"abcdef");
+    let req = request(
+        "PUT",
+        "/api/photos/a.txt",
+        &[key_header(KEY_A), ("x-gallery-slug", slug)],
+        body,
+    );
+    let job = tokio::spawn(router(state.clone()).oneshot(req));
+    polled.await.unwrap();
+
+    let id = "01234567890123456789012345678901";
+    let (rejected, _) = put_chunk(&state, "b.txt", KEY_A, slug, id, "bytes 0-5/6", b"uvwxyz").await;
+    assert_eq!(rejected, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(std::fs::read_dir(&state.dir).unwrap().count(), 1);
+    let (accepted, _) = put_chunk(&state, "b.txt", KEY_A, slug, id, "bytes 0-3/4", b"wxyz").await;
+    assert_eq!(accepted, StatusCode::CREATED);
+    release.send(()).unwrap();
+    assert_eq!(job.await.unwrap().unwrap().status(), StatusCode::CREATED);
+    let meta = state
+        .db
+        .lock()
+        .unwrap()
+        .gallery_meta(slug)
+        .unwrap()
+        .unwrap();
+    assert_eq!((meta.bytes, meta.photos), (10, 2));
+}
+
+#[tokio::test]
+async fn upload_bucket_sends_retry_after_for_mint_and_first_chunk() {
+    let (state, _tmp) = test_state_with(Limits {
+        rate_max: 1,
+        ..Limits::defaults()
+    })
+    .await;
+    let (status, resolved) = resolve(&state, KEY_A).await;
+    assert_eq!(status, StatusCode::OK);
+    let slug = resolved["slug"].as_str().unwrap();
+    let mint = post_json("/api/galleries/resolve", &[key_header(KEY_A)], "{}");
+    let first = request(
+        "PUT",
+        "/api/photos/p.txt",
+        &[
+            key_header(KEY_A),
+            ("x-gallery-slug", slug),
+            ("x-upload-id", "01234567890123456789012345678901"),
+            ("content-range", "bytes 0-0/1"),
+        ],
+        Body::from("a"),
+    );
+    for req in [mint, first] {
+        let response = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let seconds: u64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&seconds));
+        assert_eq!(body_json(response).await["error"], "too many uploads");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_uploads_reserve_free_space_across_galleries() {
+    let (probe, root) = test_state().await;
+    let health = router(probe.clone())
+        .oneshot(get("/healthz", &[]))
+        .await
+        .unwrap();
+    let free = body_json(health).await["free_bytes"].as_u64().unwrap();
+    drop(probe);
+    let state = AppState::new_with(
+        root.path(),
+        Limits {
+            min_free: free.checked_sub(256 * 1024 * 1024).unwrap(),
+            ..Limits::defaults()
+        },
+    )
+    .await
+    .unwrap();
+    let (_, a) = resolve(&state, KEY_A).await;
+    let (_, b) = resolve(&state, KEY_A).await;
+    let (slug_a, slug_b) = (a["slug"].as_str().unwrap(), b["slug"].as_str().unwrap());
+    let id = "aabbccddeeff00112233445566778899";
+    let range = "bytes 0-0/201326592"; // 192 MiB promised, one byte written.
+    let (body, polled, release) = gated_body(b"a");
+    let req = request(
+        "PUT",
+        "/api/photos/a.txt",
+        &[
+            key_header(KEY_A),
+            ("x-gallery-slug", slug_a),
+            ("x-upload-id", id),
+            ("content-range", range),
+        ],
+        body,
+    );
+    let job = tokio::spawn(router(state.clone()).oneshot(req));
+    polled.await.unwrap();
+    let (status, _) = put_chunk(&state, "b.txt", KEY_A, slug_b, id, range, b"b").await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(std::fs::read_dir(&state.dir).unwrap().count(), 1);
+    let (status, _) = put_chunk(&state, "b.txt", KEY_A, slug_b, id, "bytes 0-0/1", b"b").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "same ID in a different gallery must not conflict"
+    );
+    release.send(()).unwrap();
+    assert_eq!(job.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+    let (status, _) = put_chunk(&state, "c.txt", KEY_A, slug_b, &"c".repeat(32), range, b"c").await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "only persisted bytes count when a part becomes idle"
+    );
+}
+
+#[tokio::test]
+async fn exif_budget_preserves_original_and_backfill_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let photos = root.path().join("photos");
+    std::fs::create_dir(&photos).unwrap();
+    let mut db = gally_uring::db::open(&root.path().join("galleries.db")).unwrap();
+    let slug = db.get_or_create_gallery(KEY_A).unwrap();
+    let large = 16 * 1024 * 1024 + 1;
+    let old = format!("{slug}_{}_old.jpg", "d".repeat(32));
+    let invalid = format!("{slug}_{}é_old.jpg", "d".repeat(31));
+    let mut sample = jpeg_with_exif("2020:01:02 03:04:05");
+    std::fs::write(photos.join(&old), &sample).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(photos.join(&old))
+        .unwrap()
+        .set_len(large as u64)
+        .unwrap();
+    std::fs::write(photos.join(&invalid), b"ignored").unwrap();
+    db.add_upload(&slug, &old, large as u64, 123).unwrap();
+    drop(db);
+    let state = AppState::new_with(root.path(), Limits::defaults())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .photos_page(&slug, None, 10)
+            .unwrap(),
+        [(123, old)]
+    );
+
+    let encoded = invalid.replace('é', "%C3%A9");
+    for (method, path) in [
+        ("GET", format!("/photos/{encoded}")),
+        ("GET", format!("/photos/thumb/{encoded}.jpg")),
+        ("DELETE", format!("/api/photos/{encoded}")),
+    ] {
+        let response = router(state.clone())
+            .oneshot(request(method, &path, &[key_header(KEY_A)], Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert!(photos.join(&invalid).exists());
+
+    sample.resize(large, 0);
+    let (status, saved) = put_photo(
+        &state,
+        "new.bin",
+        Some(KEY_A),
+        Some(&slug),
+        "application/octet-stream",
+        sample.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let name = saved["name"].as_str().unwrap();
+    let page = state
+        .db
+        .lock()
+        .unwrap()
+        .photos_page(&slug, None, 10)
+        .unwrap();
+    assert_eq!(page[0].1, name);
+    assert!(
+        page[0].0 > 1_577_934_245_000,
+        "large upload falls back to upload time"
+    );
+    assert_eq!(std::fs::read(photos.join(name)).unwrap(), sample);
+}
+
+#[tokio::test]
+async fn failed_upload_index_preserves_unserved_file_for_recovery_or_deletion() {
+    let (state, _tmp) = test_state_with(Limits {
+        gallery_bytes: 8,
+        ..Limits::defaults()
+    })
+    .await;
+    let (_, resolved) = resolve(&state, KEY_A).await;
+    let slug = resolved["slug"].as_str().unwrap();
+    assert_eq!(publish(&state, slug, true).await, StatusCode::OK);
+    let exec = |sql: &str| state.db.lock().unwrap().execute_batch(sql).unwrap();
+    let stop_insert = "CREATE TRIGGER test_upload_index_failure BEFORE INSERT ON photos BEGIN SELECT RAISE(ABORT, 'test index error'); END;";
+    let a = "a".repeat(32);
+    let b = "b".repeat(32);
+    exec(stop_insert);
+    assert_eq!(
+        put_chunk(&state, "a.txt", KEY_A, slug, &a, "bytes 0-3/4", b"abcd")
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let name_a = format!("{slug}_{a}_a.txt");
+    assert_eq!(std::fs::read(state.dir.join(&name_a)).unwrap(), b"abcd");
+    for headers in [&[][..], &[key_header(KEY_A)][..]] {
+        assert_eq!(
+            router(state.clone())
+                .oneshot(get(&format!("/photos/{name_a}"), headers))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    exec("DROP TRIGGER test_upload_index_failure;");
+    assert_eq!(
+        put_chunk(&state, "b.txt", KEY_A, slug, &b, "bytes 0-4/5", b"12345")
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        put_chunk(
+            &state,
+            "renamed.txt",
+            KEY_A,
+            slug,
+            &a,
+            "bytes 0-3/4",
+            b"eeee"
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put_chunk(&state, "a.txt", KEY_A, slug, &a, "bytes 0-3/4", b"eeee")
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(std::fs::read(state.dir.join(&name_a)).unwrap(), b"abcd");
+
+    exec(stop_insert);
+    assert_eq!(
+        put_chunk(&state, "b.txt", KEY_A, slug, &b, "bytes 0-3/4", b"1234")
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    exec("DROP TRIGGER test_upload_index_failure;");
+    let delete = request(
+        "DELETE",
+        &format!("/api/photos/{slug}_{b}_b.txt"),
+        &[key_header(KEY_A)],
+        Body::empty(),
+    );
+    assert_eq!(
+        router(state.clone())
+            .oneshot(delete)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let meta = state
+        .db
+        .lock()
+        .unwrap()
+        .gallery_meta(slug)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (meta.bytes, meta.photos),
+        (4, 1),
+        "orphan deletion must not debit the existing photo"
+    );
+    assert_eq!(
+        put_chunk(&state, "b.txt", KEY_A, slug, &b, "bytes 0-3/4", b"1234")
+            .await
+            .0,
+        StatusCode::CREATED
+    );
 }

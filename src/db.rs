@@ -141,6 +141,20 @@ pub struct GalleryMeta {
     pub photos: i64,
 }
 
+#[derive(PartialEq, Eq)]
+pub struct GalleryAccess {
+    pub public: bool,
+    pub hash: Option<Vec<u8>>,
+    pub version: i64,
+}
+
+pub enum StoreUpload {
+    Stored(i64, i64),
+    Missing,
+    Full,
+    PhotoLimit,
+}
+
 /// Recount `galleries.bytes`/`.photos` from the files on disk. Runs at
 /// startup: repairs counters after a crash. A directory we cannot read aborts
 /// the rebuild before the transaction, leaving the previous listing intact.
@@ -270,6 +284,14 @@ pub trait GalleryDb {
         bytes: u64,
         created: i64,
     ) -> rusqlite::Result<Option<(i64, i64)>>;
+    fn add_upload_limited(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+        created: i64,
+        caps: (u64, i64),
+    ) -> rusqlite::Result<StoreUpload>;
     /// Forget one removed file and its listing row (saturating counters):
     /// `(bytes, photos)` after. `Ok(None)` when the gallery is unknown.
     fn remove_upload(
@@ -291,15 +313,13 @@ pub trait GalleryDb {
     ) -> rusqlite::Result<Vec<(i64, String)>>;
     /// Does this stored file still have a listing row?
     fn photo_exists(&self, slug: &str, name: &str) -> bool;
-    /// (Empty galleries keep their row; see delete_photo.)
-    /// Raw stored password hash, if the gallery is locked. `Ok(None)` means
-    /// no password or no such gallery; DB failures are errors.
-    fn gallery_pass_hash(&self, slug: &str) -> rusqlite::Result<Option<Vec<u8>>>;
+    fn photo_size(&self, slug: &str, name: &str) -> rusqlite::Result<Option<i64>>;
+    fn upload_name(&self, slug: &str, prefix: &str) -> rusqlite::Result<Option<String>>;
+    /// Visibility, password hash, and viewer-cookie generation from one row.
+    fn gallery_access(&self, slug: &str) -> rusqlite::Result<Option<GalleryAccess>>;
     /// Set (Some) or clear (None) the gallery password. False when unknown.
     /// Also bumps `token_version`, revoking old viewer cookies.
     fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> bool;
-    /// Current viewer-cookie generation; `Ok(None)` when the slug is unknown.
-    fn gallery_token_version(&self, slug: &str) -> rusqlite::Result<Option<i64>>;
 }
 
 impl GalleryDb for Connection {
@@ -373,26 +393,49 @@ impl GalleryDb for Connection {
         bytes: u64,
         created: i64,
     ) -> rusqlite::Result<Option<(i64, i64)>> {
-        let tx = self.transaction()?;
-        let n = tx.execute(
-            "UPDATE galleries SET bytes = bytes + ?1, photos = photos + 1 WHERE slug = ?2",
-            rusqlite::params![bytes as i64, slug],
-        )?;
-        // Row vanished mid-upload: drop the transaction (rollback).
-        if n == 0 {
-            return Ok(None);
+        match self.add_upload_limited(slug, name, bytes, created, (0, 0))? {
+            StoreUpload::Stored(bytes, photos) => Ok(Some((bytes, photos))),
+            _ => Ok(None),
         }
+    }
+
+    fn add_upload_limited(
+        &mut self,
+        slug: &str,
+        name: &str,
+        bytes: u64,
+        created: i64,
+        (byte_cap, photo_cap): (u64, i64),
+    ) -> rusqlite::Result<StoreUpload> {
+        let tx = self.transaction()?;
+        let Some(meta) = tx.gallery_meta(slug)? else {
+            return Ok(StoreUpload::Missing);
+        };
+        let total = (meta.bytes.max(0) as u64).saturating_add(bytes);
+        if byte_cap > 0 && total > byte_cap {
+            return Ok(StoreUpload::Full);
+        }
+        if photo_cap > 0 && meta.photos >= photo_cap {
+            return Ok(StoreUpload::PhotoLimit);
+        }
+        let too_large = |_| {
+            rusqlite::Error::ToSqlConversionFailure(
+                "photo size exceeds SQLite integer range".into(),
+            )
+        };
+        let bytes = i64::try_from(bytes).map_err(too_large)?;
+        let total = i64::try_from(total).map_err(too_large)?;
         tx.execute(
-            "INSERT OR REPLACE INTO photos(slug, name, size, created) VALUES(?1, ?2, ?3, ?4)",
-            rusqlite::params![slug, name, bytes as i64, created],
+            "INSERT INTO photos(slug, name, size, created) VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![slug, name, bytes, created],
         )?;
-        let out = tx.query_row(
-            "SELECT bytes, photos FROM galleries WHERE slug = ?1",
-            [slug],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+        let photos = meta.photos + 1;
+        tx.execute(
+            "UPDATE galleries SET bytes = ?1, photos = ?2 WHERE slug = ?3",
+            rusqlite::params![total, photos, slug],
         )?;
         tx.commit()?;
-        Ok(Some(out))
+        Ok(StoreUpload::Stored(total, photos))
     }
 
     fn remove_upload(
@@ -402,24 +445,28 @@ impl GalleryDb for Connection {
         bytes: u64,
     ) -> rusqlite::Result<Option<(i64, i64)>> {
         let tx = self.transaction()?;
-        let n = tx.execute(
-            "UPDATE galleries SET bytes = MAX(bytes - ?1, 0), photos = MAX(photos - 1, 0) WHERE slug = ?2",
-            rusqlite::params![bytes as i64, slug],
-        )?;
-        if n == 0 {
-            return Ok(None);
-        }
-        tx.execute(
+        let size = tx
+            .photo_size(slug, name)?
+            .unwrap_or(bytes.min(i64::MAX as u64) as i64);
+        let removed = tx.execute(
             "DELETE FROM photos WHERE slug = ?1 AND name = ?2",
             rusqlite::params![slug, name],
         )?;
-        let out = tx.query_row(
-            "SELECT bytes, photos FROM galleries WHERE slug = ?1",
-            [slug],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        if removed != 0 {
+            tx.execute(
+                "UPDATE galleries SET bytes = MAX(bytes - ?1, 0), photos = MAX(photos - 1, 0) WHERE slug = ?2",
+                rusqlite::params![size, slug],
+            )?;
+        }
+        let out = tx
+            .query_row(
+                "SELECT bytes, photos FROM galleries WHERE slug = ?1",
+                [slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         tx.commit()?;
-        Ok(Some(out))
+        Ok(out)
     }
 
     fn remove_gallery(&mut self, slug: &str) -> bool {
@@ -463,14 +510,37 @@ impl GalleryDb for Connection {
         .is_ok()
     }
 
-    fn gallery_pass_hash(&self, slug: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+    fn photo_size(&self, slug: &str, name: &str) -> rusqlite::Result<Option<i64>> {
         self.query_row(
-            "SELECT pass_hash FROM galleries WHERE slug = ?1",
-            [slug],
-            |r| r.get::<_, Option<Vec<u8>>>(0),
+            "SELECT size FROM photos WHERE slug = ?1 AND name = ?2",
+            rusqlite::params![slug, name],
+            |r| r.get(0),
         )
         .optional()
-        .map(Option::flatten)
+    }
+
+    fn upload_name(&self, slug: &str, prefix: &str) -> rusqlite::Result<Option<String>> {
+        self.query_row(
+            "SELECT name FROM photos WHERE slug = ?1 AND substr(name, 1, length(?2)) = ?2 LIMIT 1",
+            rusqlite::params![slug, prefix],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
+    fn gallery_access(&self, slug: &str) -> rusqlite::Result<Option<GalleryAccess>> {
+        self.query_row(
+            "SELECT public, pass_hash, token_version FROM galleries WHERE slug = ?1",
+            [slug],
+            |r| {
+                Ok(GalleryAccess {
+                    public: r.get::<_, i64>(0)? != 0,
+                    hash: r.get(1)?,
+                    version: r.get(2)?,
+                })
+            },
+        )
+        .optional()
     }
 
     fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> bool {
@@ -480,15 +550,6 @@ impl GalleryDb for Connection {
         )
         .map(|n| n > 0)
         .unwrap_or(false)
-    }
-
-    fn gallery_token_version(&self, slug: &str) -> rusqlite::Result<Option<i64>> {
-        self.query_row(
-            "SELECT token_version FROM galleries WHERE slug = ?1",
-            [slug],
-            |r| r.get(0),
-        )
-        .optional()
     }
 }
 
@@ -526,11 +587,7 @@ mod tests {
         // A broken table must not look like "no gallery" or "no password".
         assert!(db.gallery_exists("quiet-river-calm-pond-1a2b").is_err());
         assert!(db.gallery_meta("quiet-river-calm-pond-1a2b").is_err());
-        assert!(db.gallery_pass_hash("quiet-river-calm-pond-1a2b").is_err());
-        assert!(
-            db.gallery_token_version("quiet-river-calm-pond-1a2b")
-                .is_err()
-        );
+        assert!(db.gallery_access("quiet-river-calm-pond-1a2b").is_err());
     }
 
     #[test]
@@ -604,11 +661,11 @@ mod tests {
             .unwrap();
         }
         let mut db = open(&path).expect("open migrates pre-token_version db");
-        assert_eq!(db.gallery_token_version(slug).expect("version"), Some(0));
+        assert_eq!(db.gallery_access(slug).expect("access").unwrap().version, 0);
         assert!(db.set_gallery_pass(slug, Some(&hash_password("Viewer-Pass-9"))));
         assert_eq!(
-            db.gallery_token_version(slug).expect("version"),
-            Some(1),
+            db.gallery_access(slug).expect("access").unwrap().version,
+            1,
             "changing the password bumps the new column"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,17 +13,15 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::db::GalleryDb;
+use crate::db::{GalleryAccess, GalleryDb, StoreUpload};
 use crate::state::{
-    AppState, MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL, is_admin, pass_fail_exceeded,
-    pass_fail_record, rate_limited, read_limited,
+    AppState, MediaToken, OWNER_TOKEN_TTL, PASS_CACHE_TTL, UploadBudget, UploadSlotGuard, is_admin,
+    pass_fail_exceeded, pass_fail_record, rate_limited, read_limited,
 };
 use crate::validate::{
     is_slug, normalize_key, percent_decode_bytes, photo_slug, sanitize_filename,
 };
 
-/// Re-check free space at most this often while a large body streams in.
-const FREE_CHECK_EVERY: u64 = 64 * 1024 * 1024;
 /// A stalled upload socket is dropped after this long without a chunk.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard ceiling on one upload, however fast the client.
@@ -31,8 +30,8 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(6 * 3600);
 /// this age, then a sweep reclaims them.
 const PART_TTL: Duration = Duration::from_secs(3600);
 
-/// Free bytes on the data volume, or `None` when unknown (never blocks).
-fn free_bytes(path: &std::path::Path) -> Option<u64> {
+/// Available bytes and allocation unit on the data volume.
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -42,13 +41,18 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
-        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+        let unit = (st.f_frsize as u64).max(1);
+        Some(((st.f_bavail as u64).saturating_mul(unit), unit))
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         None
     }
+}
+
+fn free_bytes(path: &Path) -> Option<u64> {
+    disk_space(path).map(|(free, _)| free)
 }
 
 /// fsync a directory so a rename/remove survives a power cut. Some
@@ -82,18 +86,15 @@ fn media_cookie(slug: &str, kind: MediaToken) -> String {
 }
 
 /// True when the request carries a live media cookie of `kind` for `slug`.
-fn media_cookie_ok(headers: &HeaderMap, state: &AppState, slug: &str, kind: MediaToken) -> bool {
+fn media_cookie_ok(
+    headers: &HeaderMap,
+    state: &AppState,
+    slug: &str,
+    kind: MediaToken,
+    version: i64,
+) -> bool {
     let Some(tok) = crate::state::cookie_value(headers, &media_cookie(slug, kind)) else {
         return false;
-    };
-    let version = match kind {
-        // Owner cookies are not revocable per gallery: only the key mints them.
-        MediaToken::Owner => 0,
-        MediaToken::Viewer => match state.db.lock().unwrap().gallery_token_version(slug) {
-            Ok(Some(v)) => v,
-            // Unknown gallery or a DB error: deny the cookie, never guess.
-            _ => return false,
-        },
     };
     crate::state::media_token_ok(&state.media_secret, tok, slug, kind, version)
 }
@@ -265,7 +266,6 @@ async fn write_thumb(state: &AppState, src: &std::path::Path, name: &str) {
     let dir = state.dir.join(".thumbs");
     let dest = dir.join(format!("{name}.jpg"));
     // Write-then-rename: a concurrent GET must never see a half-written JPEG
-    // (a public gallery would cache that for a day).
     let temp = dir.join(format!(".tmp-{}.jpg", uuid::Uuid::new_v4().as_simple()));
     let src = src.to_path_buf();
     // Two decodes at a time: even a small result needs the source bitmap
@@ -341,6 +341,15 @@ fn err(status: StatusCode, msg: &'static str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
+fn upload_throttle(wait: Duration) -> Response {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() != 0);
+    (
+        [(header::RETRY_AFTER, seconds.to_string())],
+        ApiError::TooMany.into_response(),
+    )
+        .into_response()
+}
+
 /// Liveness/readiness probe: DB reachable, photos dir readable, and free
 /// space above `GALLY_MIN_FREE_BYTES` (0 = ignore).
 pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
@@ -349,7 +358,7 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
         db.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok()
     };
     let dir_ok = tokio::fs::read_dir(&state.dir).await.is_ok();
-    let _ = sweep_and_measure_parts(&state, None, None).await;
+    let _ = sweep_parts(&state, &mut *state.upload_budget.lock().await, None).await;
     let free = free_bytes(&state.dir);
     let free_ok = state.limits.min_free == 0 || free.is_some_and(|f| f >= state.limits.min_free);
     let ok = db_ok && dir_ok && free_ok;
@@ -365,16 +374,13 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// Prometheus scrape. Loopback only (honours `GALLY_TRUST_PROXY`, so a
-/// trusted reverse proxy can resolve the real client IP): never public.
+/// Prometheus scrape from a local socket, never through a proxy.
 pub async fn metrics(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    let local = ip.is_loopback() || metrics_direct_peer(addr.ip(), &headers, &TRUSTED_PROXIES);
-    if !local {
+    if !metrics_direct_peer(addr.ip(), &headers, &TRUSTED_PROXIES) {
         return err(StatusCode::NOT_FOUND, "not found");
     }
     let (galleries, photos, bytes) = {
@@ -455,12 +461,13 @@ fn parse_trust_proxy(raw: &str) -> Vec<ipnet::IpNet> {
     nets
 }
 
-/// A direct (not proxied) connection from a trusted peer is local for
-/// `/metrics`: in a container the host reaches the app through the Docker
-/// bridge gateway, not loopback. A forwarded request is only local if the
-/// resolved client is loopback, so public `/metrics` stays 404.
+/// A trusted proxy never counts as a local scraper, even without forwarding.
 fn metrics_direct_peer(peer: IpAddr, headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> bool {
-    !headers.contains_key("x-forwarded-for") && trusted.iter().any(|net| net.contains(&peer))
+    peer.is_loopback()
+        && !headers.contains_key("x-forwarded-for")
+        && !headers.contains_key("forwarded")
+        && !headers.contains_key("x-real-ip")
+        && !trusted.iter().any(|net| net.contains(&peer))
 }
 
 pub(crate) fn client_ip(
@@ -484,22 +491,25 @@ fn client_ip_from(
     if !trusted.iter().any(|net| net.contains(&peer)) {
         return peer;
     }
-    let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-        return peer;
-    };
-    let mut leftmost = None;
-    for hop in xff.rsplit(',').map(str::trim) {
-        let Ok(ip) = hop.parse::<IpAddr>() else {
-            // A malformed hop makes the whole chain unverifiable: fall back
-            // to the peer rather than guess a spoofable address.
-            return peer;
+    let mut first = None;
+    let mut rightmost_untrusted = None;
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(xff) = value.to_str() else {
+            rightmost_untrusted = Some(peer);
+            continue;
         };
-        if !trusted.iter().any(|net| net.contains(&ip)) {
-            return ip;
+        for hop in xff.split(',').map(str::trim) {
+            let Ok(ip) = hop.parse::<IpAddr>() else {
+                rightmost_untrusted = Some(peer);
+                continue;
+            };
+            first.get_or_insert(ip);
+            if !trusted.iter().any(|net| net.contains(&ip)) {
+                rightmost_untrusted = Some(ip);
+            }
         }
-        leftmost = Some(ip);
     }
-    leftmost.unwrap_or(peer)
+    rightmost_untrusted.or(first).unwrap_or(peer)
 }
 
 fn request_key(headers: &HeaderMap) -> Option<String> {
@@ -576,81 +586,89 @@ fn pass_cache_key(hash: &[u8], pass: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
-/// Result of the viewer lock check: the caller needs to know not just
-/// "refused" but whether a password was proven, so it can set the cookie.
-enum Locked {
-    /// No viewer password set on the gallery.
-    Open,
-    /// Password proven just now (or by the pass cache): set the cookie.
-    Unlocked,
-    /// Locked and unproven: return this response as-is.
-    Denied(Response),
+fn locked_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "gallery locked", "locked": true })),
+    )
+        .into_response()
 }
 
-/// Slow Argon2 work runs on the blocking pool: never stall the runtime.
-async fn check_locked(state: &AppState, ip: IpAddr, slug: &str, pass: &str) -> Locked {
-    let stored = {
-        let db = state.db.lock().unwrap();
-        db.gallery_pass_hash(slug)
+/// `true` means this request proved the password and can issue a cookie
+/// signed for this snapshot, but only after checking it is still current.
+#[allow(clippy::result_large_err)]
+async fn check_viewer(
+    state: &AppState,
+    headers: &HeaderMap,
+    ip: IpAddr,
+    slug: &str,
+    pass: &str,
+    access: &GalleryAccess,
+) -> Result<bool, Response> {
+    let Some(hash) = access.hash.as_deref() else {
+        return Ok(false);
     };
-    let stored = match stored {
-        Ok(hash) => hash,
-        // A read failure must never look like "this gallery is unlocked".
-        Err(_) => return Locked::Denied(ApiError::Internal.into_response()),
-    };
-    let Some(hash) = stored else {
-        return Locked::Open;
-    };
-    if !pass.is_empty() {
-        // The owner key also works in the viewer-password field (the dialog
-        // promises it): it is the strongest credential for this gallery.
-        let owns = {
-            let db = state.db.lock().unwrap();
-            db.key_owns_slug(pass, slug)
-        };
-        if owns {
-            return Locked::Unlocked;
-        }
-        let key = pass_cache_key(&hash, pass);
-        if let Some(at) = state.pass_ok.lock().unwrap().get(&key)
-            && at.elapsed() < PASS_CACHE_TTL
-        {
-            return Locked::Unlocked;
-        }
-        if pass_fail_exceeded(state, &ip) {
-            return Locked::Denied(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({ "error": "too many attempts" })),
-                )
-                    .into_response(),
-            );
-        }
-        // Bound Argon2 work: guessing must not exhaust the blocking pool.
-        let _permit = state.argon2.acquire().await.ok();
-        let ok = tokio::task::spawn_blocking({
-            let pass = pass.to_string();
-            move || crate::db::verify_password(&pass, &hash)
-        })
-        .await
-        .unwrap_or(false);
-        if ok {
-            let mut cache = state.pass_ok.lock().unwrap();
-            if cache.len() >= 10_000 {
-                cache.retain(|_, at| at.elapsed() < PASS_CACHE_TTL);
-            }
-            cache.insert(key, std::time::Instant::now());
-            return Locked::Unlocked;
-        }
-        pass_fail_record(state, &ip);
+    if media_cookie_ok(headers, state, slug, MediaToken::Viewer, access.version) {
+        return Ok(false);
     }
-    Locked::Denied(
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "gallery locked", "locked": true })),
-        )
-            .into_response(),
-    )
+    if pass.is_empty() {
+        if request_key(headers).is_some() && pass_fail_record(state, &ip) {
+            return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"));
+        }
+        return Err(locked_response());
+    }
+    // The owner key also works in the viewer-password field.
+    if state.db.lock().unwrap().key_owns_slug(pass, slug) {
+        return Ok(true);
+    }
+    let key = pass_cache_key(hash, pass);
+    if let Some(at) = state.pass_ok.lock().unwrap().get(&key)
+        && at.elapsed() < PASS_CACHE_TTL
+    {
+        return Ok(true);
+    }
+    if pass_fail_exceeded(state, &ip) {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"));
+    }
+    // Bound Argon2 work and keep it off the runtime.
+    let _permit = state
+        .argon2
+        .acquire()
+        .await
+        .map_err(|_| ApiError::Internal.into_response())?;
+    let pass = pass.to_string();
+    let hash = hash.to_vec();
+    let ok = tokio::task::spawn_blocking(move || crate::db::verify_password(&pass, &hash))
+        .await
+        .map_err(|_| ApiError::Internal.into_response())?;
+    if ok {
+        let mut cache = state.pass_ok.lock().unwrap();
+        if cache.len() >= 10_000 {
+            cache.retain(|_, at| at.elapsed() < PASS_CACHE_TTL);
+        }
+        cache.insert(key, Instant::now());
+        return Ok(true);
+    }
+    if pass_fail_record(state, &ip) {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"));
+    }
+    Err(locked_response())
+}
+
+#[allow(clippy::result_large_err)]
+fn current_access(
+    db: &rusqlite::Connection,
+    slug: &str,
+    initial: &GalleryAccess,
+    owner: bool,
+    missing: &'static str,
+) -> Result<GalleryAccess, Response> {
+    match db.gallery_access(slug) {
+        Ok(Some(access)) if owner || &access == initial => Ok(access),
+        Ok(Some(access)) if access.public => Err(locked_response()),
+        Ok(_) => Err(err(StatusCode::NOT_FOUND, missing)),
+        Err(_) => Err(ApiError::Internal.into_response()),
+    }
 }
 
 /// True when gallery creation is allowed: no invite configured, or the
@@ -687,33 +705,28 @@ pub async fn gallery_photos(
     }
     // No cache: plain scan is fast and never goes stale under concurrent upload.
     let t_db = Instant::now();
-    let meta = {
+    let key = request_key(&headers);
+    let (access, key_ok) = {
         let db = state.db.lock().unwrap();
-        db.gallery_meta(&slug)
+        (
+            db.gallery_access(&slug),
+            key.as_ref().is_some_and(|k| db.key_owns_slug(k, &slug)),
+        )
     };
     tracing::debug!(
         stage = "list_db_check",
         latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0)
     );
-    let meta = match meta {
-        Ok(Some(meta)) => meta,
+    let access = match access {
+        Ok(Some(access)) => access,
         Ok(None) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
         Err(_) => return ApiError::Internal.into_response(),
     };
-    let key = request_key(&headers);
-    let key_ok = key
-        .as_ref()
-        .map(|k| {
-            let db = state.db.lock().unwrap();
-            // Scoped: the key must own THIS slug, not just any gallery.
-            db.key_owns_slug(k, &slug)
-        })
-        .unwrap_or(false);
-    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner);
+    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner, 0);
     // Private gallery: nothing exists for anyone but the owner. A
     // supplied-but-wrong key is a guess: throttle it before the 404, so
     // private slugs cannot be probed at read-limit speed.
-    if !meta.public && !owner {
+    if !access.public && !owner {
         if key.is_some() && pass_fail_record(&state, &ip) {
             return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
         }
@@ -731,49 +744,27 @@ pub async fn gallery_photos(
             None => return err(StatusCode::BAD_REQUEST, "bad cursor"),
         },
     };
-    // Viewer lock: owner bypasses; a live viewer cookie for THIS gallery is
-    // the password, already proven (no Argon2, no URL secret). A wrong key
-    // with no pass was not counted yet, so count it once on denial
-    // (check_locked already counted a non-empty wrong pass).
-    let mut unlocked = false;
-    if !owner {
-        let viewer = media_cookie_ok(&headers, &state, &slug, MediaToken::Viewer);
-        if !viewer {
-            let pass = request_pass(&headers, &query);
-            match check_locked(&state, ip, &slug, &pass).await {
-                Locked::Open => {}
-                Locked::Unlocked => unlocked = true,
-                Locked::Denied(deny) => {
-                    if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
-                        return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
-                    }
-                    return deny;
-                }
-            }
+    let unlocked = if owner {
+        false
+    } else {
+        let pass = request_pass(&headers, &query);
+        match check_viewer(&state, &headers, ip, &slug, &pass, &access).await {
+            Ok(unlocked) => unlocked,
+            Err(deny) => return deny,
         }
-    }
+    };
     let t_scan = Instant::now();
-    // One query for the page plus the lock/cookie state.
-    let (page, lock) = {
+    let (page, current) = {
         let db = state.db.lock().unwrap();
-        let page = db.photos_page(&slug, before, limit);
-        // The owner's Protect dialog needs this: an unauthenticated probe
-        // cannot see the lock on a private gallery (it gets 404 first).
-        let lock = match db.gallery_pass_hash(&slug) {
-            Ok(hash) => db
-                .gallery_token_version(&slug)
-                .map(|version| (hash.is_some(), version.unwrap_or(0))),
-            Err(e) => Err(e),
+        let current = match current_access(&db, &slug, &access, owner, "unknown gallery") {
+            Ok(current) => current,
+            Err(deny) => return deny,
         };
-        (page, lock)
+        (db.photos_page(&slug, before, limit), current)
     };
     // A DB failure must not masquerade as an empty gallery.
     let rows = match page {
         Ok(rows) => rows,
-        Err(_) => return ApiError::Internal.into_response(),
-    };
-    let (locked, version) = match lock {
-        Ok(lock) => lock,
         Err(_) => return ApiError::Internal.into_response(),
     };
     tracing::debug!(
@@ -799,8 +790,8 @@ pub async fn gallery_photos(
     );
     let body = Json(json!({
         "slug": slug,
-        "public": meta.public,
-        "locked": locked,
+        "public": current.public,
+        "locked": current.hash.is_some(),
         "photos": photos,
         "next": next,
     }));
@@ -820,7 +811,7 @@ pub async fn gallery_photos(
             &state,
             &slug,
             MediaToken::Viewer,
-            version,
+            access.version,
         ))
     } else {
         None
@@ -850,8 +841,8 @@ pub async fn set_visibility(
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    if rate_limited(&state, &ip) {
-        return ApiError::TooMany.into_response();
+    if let Some(wait) = rate_limited(&state, &ip) {
+        return upload_throttle(wait);
     }
     let key = match request_key(&headers) {
         Some(k) => k,
@@ -928,7 +919,7 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
 /// Drop the admin token; the browser cookie is cleared in the response.
 pub async fn admin_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_admin(&headers, &state) {
-        return err(StatusCode::FORBIDDEN, "forbidden");
+        return err(StatusCode::FORBIDDEN, "admin session inactive");
     }
     if let Some(tok) = crate::state::admin_token(&headers) {
         state.admin_tokens.lock().unwrap().remove(&tok);
@@ -957,8 +948,8 @@ pub async fn admin_unlock(
     body: Body,
 ) -> Response {
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    if rate_limited(&state, &ip) {
-        return ApiError::TooMany.into_response();
+    if let Some(wait) = rate_limited(&state, &ip) {
+        return upload_throttle(wait);
     }
     // Own failure lockout: GALLY_RATE_MAX=0 must not open brute force.
     if pass_fail_exceeded(&state, &ip) {
@@ -1024,8 +1015,8 @@ pub async fn resolve_gallery(
     body: Body,
 ) -> Response {
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    if rate_limited(&state, &ip) {
-        return ApiError::TooMany.into_response();
+    if let Some(wait) = rate_limited(&state, &ip) {
+        return upload_throttle(wait);
     }
     let mut key = request_key(&headers);
     // Always read the body: a header key plus a body slug must resolve, not
@@ -1169,49 +1160,55 @@ pub async fn spa_or_404(
     }
 }
 
-/// Reap abandoned `.part-*` uploads older than `PART_TTL` and return how many
-/// bytes of `slug` the live ones hold. `exclude` is the current request's own
-/// temp: its committed prefix is already accounted for by the caller.
-async fn sweep_and_measure_parts(
+/// Reap expired parts and account for idle parts under the admission lock.
+/// The just-claimed slot has not opened its file yet and may reap its own stale part.
+async fn sweep_parts(
     state: &AppState,
-    slug: Option<&str>,
-    exclude: Option<&std::path::Path>,
-) -> u64 {
-    let Ok(mut rd) = tokio::fs::read_dir(&state.dir).await else {
-        return 0;
-    };
-    let mut pending = 0u64;
-    while let Ok(Some(ent)) = rd.next_entry().await {
-        let name = ent.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(".part-") else {
-            continue;
-        };
-        // `.part-{slug}_{upload-id}`: neither part contains a stray underscore.
-        let id = rest.rsplit('_').next().unwrap_or(rest);
-        let active = state.upload_ids.lock().unwrap().contains(id);
-        let Ok(md) = ent.metadata().await else {
-            continue;
-        };
-        let expired = !active
-            && md
+    budget: &mut UploadBudget,
+    slot: Option<&str>,
+) -> std::io::Result<Option<String>> {
+    let mut rd = tokio::fs::read_dir(&state.dir).await?;
+    let mut idle: std::collections::HashMap<_, _> = budget
+        .idle
+        .iter()
+        .filter(|(id, _)| budget.active.contains_key(*id) && slot != Some(id.as_str()))
+        .map(|(id, len)| (id.clone(), *len))
+        .collect();
+    let mut final_name = None;
+    while let Some(ent) = rd.next_entry().await? {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(id) = name.strip_prefix(".part-") {
+            if budget.active.contains_key(id) && slot != Some(id) {
+                continue;
+            }
+            let md = match ent.metadata().await {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let expired = md
                 .modified()
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age >= PART_TTL);
-        // A failed removal keeps the bytes on disk, so they keep counting.
-        if expired && tokio::fs::remove_file(ent.path()).await.is_ok() {
-            continue;
-        }
-        if exclude.is_some_and(|ex| ex == ent.path().as_path()) {
-            continue;
-        }
-        if let Some(s) = slug
-            && name.starts_with(&format!(".part-{s}_"))
-        {
-            pending = pending.saturating_add(md.len());
+            if expired && tokio::fs::remove_file(ent.path()).await.is_ok() {
+                budget.damaged.remove(id);
+            } else {
+                idle.insert(id.to_string(), md.len());
+            }
+        } else if slot.is_some_and(|id| {
+            name.strip_prefix(id)
+                .is_some_and(|tail| tail.starts_with('_'))
+        }) {
+            final_name = Some(name.to_string());
         }
     }
-    pending
+    budget
+        .damaged
+        .retain(|id| idle.contains_key(id) || budget.active.contains_key(id));
+    budget.idle = idle;
+    Ok(final_name)
 }
 
 /// Remove `prefix*` files directly under `dir`; a missing dir is empty.
@@ -1266,6 +1263,7 @@ async fn has_prefixed(dir: &std::path::Path, prefix: &str) -> bool {
 /// Delete every file belonging to `slug`, originals and thumbs. Returns
 /// (removed, failed, still_remaining).
 async fn sweep_files(state: &AppState, slug: &str) -> (usize, usize, bool) {
+    let mut budget = state.upload_budget.lock().await;
     let prefix = format!("{slug}_");
     let part_prefix = format!(".part-{slug}_");
     let thumbs = state.dir.join(".thumbs");
@@ -1281,6 +1279,13 @@ async fn sweep_files(state: &AppState, slug: &str) -> (usize, usize, bool) {
     let remaining = has_prefixed(&state.dir, &prefix).await
         || has_prefixed(&state.dir, &part_prefix).await
         || has_prefixed(&thumbs, &prefix).await;
+    if !remaining {
+        budget.idle.retain(|id, _| !id.starts_with(&prefix));
+        budget.damaged.retain(|id| !id.starts_with(&prefix));
+        budget
+            .unindexed
+            .retain(|name, _| !name.starts_with(&prefix));
+    }
     (removed, failed, remaining)
 }
 
@@ -1301,10 +1306,12 @@ pub async fn remove_gallery(
     if tokio::fs::read_dir(&state.dir).await.is_err() {
         return ApiError::Internal.into_response();
     }
+    let budget = state.upload_budget.lock().await;
     let ok = {
         let mut db = state.db.lock().unwrap();
         db.remove_gallery(&slug)
     };
+    drop(budget);
     if !ok {
         return err(StatusCode::NOT_FOUND, "unknown gallery");
     }
@@ -1362,10 +1369,12 @@ pub async fn delete_own_gallery(
     if tokio::fs::read_dir(&state.dir).await.is_err() {
         return ApiError::Internal.into_response();
     }
+    let budget = state.upload_budget.lock().await;
     let ok = {
         let mut db = state.db.lock().unwrap();
         db.remove_gallery(&slug)
     };
+    drop(budget);
     if !ok {
         return err(StatusCode::NOT_FOUND, "not found");
     }
@@ -1408,8 +1417,8 @@ async fn sweep_orphans(
             let Some((slug, _)) = rest.split_once('_') else {
                 continue;
             };
-            let id = rest.rsplit('_').next().unwrap_or(rest);
-            if !is_slug(slug) || state.upload_ids.lock().unwrap().contains(id) {
+            let mut budget = state.upload_budget.lock().await;
+            if !is_slug(slug) || budget.active.contains_key(rest) {
                 continue;
             }
             let exists = {
@@ -1423,6 +1432,8 @@ async fn sweep_orphans(
                 Err(_) => return Err(()),
             }
             if tokio::fs::remove_file(ent.path()).await.is_ok() {
+                budget.idle.remove(rest);
+                budget.damaged.remove(rest);
                 *deleted += 1;
             } else {
                 *failed += 1;
@@ -1438,6 +1449,7 @@ async fn sweep_orphans(
         if known.contains(slug) {
             continue;
         }
+        let mut budget = state.upload_budget.lock().await;
         {
             let db = state.db.lock().unwrap();
             match db.gallery_exists(slug) {
@@ -1447,6 +1459,9 @@ async fn sweep_orphans(
             }
         }
         if tokio::fs::remove_file(ent.path()).await.is_ok() {
+            if dir == state.dir {
+                budget.unindexed.remove(&name);
+            }
             *deleted += 1;
         } else {
             *failed += 1;
@@ -1486,7 +1501,7 @@ pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap)
     let mut deleted: usize = 0;
     let mut failed: usize = 0;
     // Reap expired temps first; the orphan pass below handles the rest.
-    let _ = sweep_and_measure_parts(&state, None, None).await;
+    let _ = sweep_parts(&state, &mut *state.upload_budget.lock().await, None).await;
     // The directory listing is a snapshot: an upload mid-stream (.part-) or a
     // gallery created after the query keeps its files, so never delete those.
     if sweep_orphans(&state, &state.dir, &known, true, &mut deleted, &mut failed)
@@ -1533,8 +1548,8 @@ pub async fn lock_gallery(
     // Correct keys are checked before the failure bucket, so a valid key is
     // never locked out by someone else's guessing.
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
-    if rate_limited(&state, &ip) {
-        return ApiError::TooMany.into_response();
+    if let Some(wait) = rate_limited(&state, &ip) {
+        return upload_throttle(wait);
     }
     let key = match request_key(&headers) {
         Some(k) => k,
@@ -1690,8 +1705,8 @@ pub async fn put_photo(
         None => true,
         Some((c, _)) => c.start == 0,
     };
-    if first_or_legacy && rate_limited(&state, &ip) {
-        return ApiError::TooMany.into_response();
+    if first_or_legacy && let Some(wait) = rate_limited(&state, &ip) {
+        return upload_throttle(wait);
     }
     let key = match request_key(&headers) {
         Some(k) => k,
@@ -1749,382 +1764,605 @@ pub async fn put_photo(
         stage = "db_get_or_create",
         latency_ms = format!("{:.2}", t_db.elapsed().as_secs_f64() * 1000.0)
     );
-    // Minted here? Then the row exists only because of this request: drop it
-    // again unless a file actually lands.
-    let mut mint = target.is_none().then(|| MintGuard {
-        state: &state,
-        slug: slug.clone(),
-        keep: false,
-    });
     let (sanitized, ext) = sanitize_filename(&raw_name);
-    // Resumable uploads name the final file after the client's upload id, so
-    // every retried chunk targets the same file; legacy keeps a random uuid.
-    let uuid = uuid::Uuid::new_v4().as_simple().to_string();
-    let (final_name, temp_path) = match &chunk {
-        Some((_, id)) => (
-            format!("{slug}_{id}_{sanitized}"),
-            state.dir.join(format!(".part-{slug}_{id}")),
-        ),
-        None => (
-            format!("{slug}_{uuid}_{sanitized}"),
-            state.dir.join(format!(".part-{slug}_{uuid}")),
-        ),
+    let (chunk, id) = match chunk {
+        Some((chunk, id)) => (Some(chunk), id),
+        None => (None, uuid::Uuid::new_v4().as_simple().to_string()),
     };
-    // Lost reply to the final chunk: the file is already stored, answer
-    // success without reading the body again.
-    if chunk.is_some()
-        && tokio::fs::metadata(state.dir.join(&final_name))
-            .await
-            .is_ok()
-        && state.db.lock().unwrap().photo_exists(&slug, &final_name)
-    {
-        return (
-            StatusCode::CREATED,
-            Json(json!({ "name": final_name, "slug": slug })),
-        )
-            .into_response();
-    }
-    // Quota check before any bytes land: a full gallery costs a JSON reply.
-    let limits = state.limits;
-    let (used_bytes, used_photos) = {
-        let db = state.db.lock().unwrap();
-        match db.gallery_meta(&slug) {
-            Ok(Some(m)) => (m.bytes.max(0) as u64, m.photos),
-            Ok(None) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
-            Err(_) => return ApiError::Internal.into_response(),
-        }
+    let slot = format!("{slug}_{id}");
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse().ok());
+    let upload = Upload {
+        part: state.dir.join(format!(".part-{slot}")),
+        name: format!("{slot}_{sanitized}"),
+        slot,
+        slug,
+        chunk,
+        content_length,
     };
-    // Live `.part-*` temps belong to this gallery too: a stalled chunked
-    // upload must not let a second one bypass the byte quota.
-    let pending = sweep_and_measure_parts(&state, Some(&slug), Some(&temp_path)).await;
-    let used_bytes = used_bytes.saturating_add(pending);
-    if limits.gallery_bytes > 0 && used_bytes >= limits.gallery_bytes {
-        return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
-    }
-    if limits.gallery_photos > 0 && used_photos >= limits.gallery_photos {
-        return err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached");
-    }
-    // Chunked uploads know the file size up front: refuse one that cannot
-    // fit before accepting any of its bytes.
-    if let Some((c, _)) = &chunk {
-        if c.total > limits.max_file as u64 {
-            return err(StatusCode::PAYLOAD_TOO_LARGE, "file too large");
-        }
-        if limits.gallery_bytes > 0 && used_bytes.saturating_add(c.total) > limits.gallery_bytes {
-            return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
-        }
-    }
-    // Bounded concurrency: refuse outright instead of queueing disk writers.
-    // The global cap is shared; the per-IP cap stops one slow client from
-    // pinning every global slot (global first, then per-IP: fixed order).
-    let _permit = match state.uploads.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
-    };
-    let _ip_permit = match crate::state::UploadSlotGuard::try_acquire(
-        &state.upload_ips,
-        &ip,
-        limits.upload_slots_per_ip,
-    ) {
-        Some(g) => g,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "busy"),
-    };
-    if let Some(free) = free_bytes(&state.dir)
-        && limits.min_free > 0
-        && free < limits.min_free
-    {
-        return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
-    }
-    // One writer per upload id: a retry must not append to the same temp
-    // concurrently. A busy retry reports the committed length (the client
-    // jumps to it) and leaves the active request alone.
-    let _id_guard = match &chunk {
-        Some((_, id)) => match crate::state::UploadIdGuard::try_acquire(&state.upload_ids, id) {
-            Some(g) => Some(g),
-            None => {
-                let received = tokio::fs::metadata(&temp_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "upload in progress", "received": received })),
-                )
-                    .into_response();
-            }
-        },
-        None => None,
-    };
-    let t_body = Instant::now();
-    // Stream into a dot-prefixed temp file: dot names are never listed or
-    // served, so a stalled or aborted upload stays invisible. The real name
-    // (and its DB row) only appears after a successful `rename`.
-    let base_len = chunk.as_ref().map_or(0, |(c, _)| c.start);
-    let chunk_len = chunk.as_ref().map(|(c, _)| c.end - c.start + 1);
-    let mut out = match &chunk {
-        None => match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
-        },
-        Some((c, _)) => match tokio::fs::metadata(&temp_path).await {
-            Ok(md) => {
-                let len = md.len();
-                if len > c.total {
-                    return err(StatusCode::BAD_REQUEST, "upload too large");
-                }
-                if len != c.start {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({ "error": "offset mismatch", "received": len })),
-                    )
-                        .into_response();
-                }
-                match tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&temp_path)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if c.start > 0 {
-                    // Restart, startup sweep, or expiry: the client restarts
-                    // the file with the same upload id.
-                    return (StatusCode::GONE, Json(json!({ "error": "upload expired" })))
-                        .into_response();
-                }
-                match tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp_path)
-                    .await
-                {
-                    Ok(f) => f,
-                    // Lost a create race: report the committed length.
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let len = tokio::fs::metadata(&temp_path)
-                            .await
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(json!({ "error": "offset mismatch", "received": len })),
-                        )
-                            .into_response();
-                    }
-                    Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
-                }
-            }
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "cannot store"),
-        },
-    };
-    let started = Instant::now();
-    let mut next_free_check = FREE_CHECK_EVERY;
-    let mut written: u64 = 0;
-    let mut stream = body.into_data_stream();
-    loop {
-        // Idle timeout: a dead socket must not pin an upload slot forever.
-        let next = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-            Ok(n) => n,
-            Err(_) => {
-                drop(out);
-                if chunk.is_some() {
-                    // Keep the committed prefix: the client resumes it. An
-                    // empty first chunk would otherwise pin an idle temp file.
-                    if base_len == 0 && written == 0 {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                    }
-                    return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
-                }
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return err(StatusCode::REQUEST_TIMEOUT, "upload timed out");
-            }
-        };
-        let Some(data) = next else { break };
-        let data = match data {
-            Ok(c) => c,
-            Err(_) => {
-                drop(out);
-                if chunk.is_some() {
-                    if base_len == 0 && written == 0 {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                    }
-                    return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
-                }
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return ApiError::TooLarge.into_response();
-            }
-        };
-        if data.is_empty() {
-            continue;
-        }
-        written += data.len() as u64;
-        if chunk_len.is_some_and(|l| written > l) {
-            // Bytes outside this request's range: drop this request's writes
-            // but keep the chunks committed by earlier requests.
-            let _ = out.set_len(base_len).await;
-            drop(out);
-            return err(StatusCode::BAD_REQUEST, "content-range overrun");
-        }
-        let accumulated = base_len + written;
-        let ok = started.elapsed() <= UPLOAD_DEADLINE
-            && chunk.as_ref().is_none_or(|(c, _)| accumulated <= c.total)
-            && accumulated <= limits.max_file as u64
-            && (limits.gallery_bytes == 0 || used_bytes + accumulated <= limits.gallery_bytes);
-        if !ok {
-            if base_len == 0 {
-                drop(out);
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            } else {
-                // Keep the committed prefix resumable, but do not let this
-                // rejected chunk's bytes eat the quota until the TTL sweep.
-                let _ = out.set_len(base_len).await;
-            }
-            return ApiError::TooLarge.into_response();
-        }
-        if accumulated >= next_free_check {
-            next_free_check = accumulated + FREE_CHECK_EVERY;
-            if let Some(free) = free_bytes(&state.dir)
-                && limits.min_free > 0
-                && free < limits.min_free
-            {
-                if base_len == 0 {
-                    drop(out);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                } else {
-                    let _ = out.set_len(base_len).await;
-                }
-                return err(StatusCode::INSUFFICIENT_STORAGE, "storage full");
-            }
-        }
-        if out.write_all(&data).await.is_err() {
-            drop(out);
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return ApiError::Internal.into_response();
-        }
-    }
-    let accumulated = base_len + written;
-    // A chunk shorter than its declared range is a broken request: keep the
-    // committed prefix and let the client resend from the real offset.
-    if chunk_len.is_some_and(|l| written < l) {
-        drop(out);
-        return err(StatusCode::REQUEST_TIMEOUT, "upload interrupted");
-    }
-    // Non-final chunk: report the committed offset; no fsync, no rename.
-    if let Some((c, _)) = &chunk
-        && accumulated < c.total
-    {
-        drop(out);
-        return (
-            StatusCode::ACCEPTED,
-            Json(json!({ "received": accumulated })),
-        )
-            .into_response();
-    }
-    // Durability: the rename below is atomic, but only a synced temp file
-    // survives a crash after the fact.
-    if out.sync_all().await.is_err() {
-        drop(out);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return ApiError::Internal.into_response();
-    }
-    drop(out);
-    tracing::debug!(
-        stage = "body_stream",
-        bytes = accumulated,
-        latency_ms = format!("{:.2}", t_body.elapsed().as_secs_f64() * 1000.0)
-    );
-    if accumulated == 0 {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return err(StatusCode::BAD_REQUEST, "empty body");
-    }
-    // Capture time decides listing order; fall back to upload time.
-    let created = tokio::task::spawn_blocking({
-        let path = temp_path.clone();
-        move || crate::exif_time::taken_millis(&path)
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(crate::db::now_millis);
-    if tokio::fs::rename(&temp_path, state.dir.join(&final_name))
+    let (mut reply, response) = tokio::sync::oneshot::channel();
+    // A canceled HTTP future cannot drop a Tokio file with writes in flight
+    // or release the writer slot before rollback. Only body polling is cancelable.
+    tokio::spawn(async move {
+        let mut mint = target.is_none().then(|| MintGuard {
+            state: &state,
+            slug: upload.slug.clone(),
+            keep: false,
+        });
+        let result = run_upload(&state, &upload, ip, &ext, body, &mut reply, &mut mint).await;
+        drop(mint);
+        tracing::debug!(
+            stage = "put_total",
+            latency_ms = t_total.elapsed().as_secs_f64() * 1000.0
+        );
+        let _ = reply.send(result);
+    });
+    response
         .await
-        .is_err()
-    {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return ApiError::Internal.into_response();
-    }
-    // The rename is atomic; flush the directory entry so a power cut cannot
-    // leave the bytes under the startup-swept `.part-` name.
-    if sync_dir(&state.dir).await.is_err() {
-        let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
-        return ApiError::Internal.into_response();
-    }
-    // Counters are the quota truth: reconcile after the file exists so a
-    // concurrent overshoot is corrected by deleting this file again.
-    let usage = {
-        let mut db = state.db.lock().unwrap();
-        db.add_upload(&slug, &final_name, accumulated, created)
-    };
-    match usage {
-        Ok(Some((bytes, photos))) => {
-            let over = (limits.gallery_bytes > 0 && bytes as u64 > limits.gallery_bytes)
-                || (limits.gallery_photos > 0 && photos > limits.gallery_photos);
-            if over {
-                let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
-                let mut db = state.db.lock().unwrap();
-                let _ = db.remove_upload(&slug, &final_name, accumulated);
-                return err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full");
-            }
-        }
-        Ok(None) => {
-            // Row vanished mid-upload (delete raced us): drop the orphan file.
-            let _ = tokio::fs::remove_file(state.dir.join(&final_name)).await;
-            return err(StatusCode::NOT_FOUND, "unknown gallery");
-        }
-        Err(_) => {
-            // A transient DB failure must not lose bytes the recount can
-            // recover: keep the file (and a minted gallery row) and report 500.
-            if let Some(m) = &mut mint {
-                m.keep = true;
-            }
-            return ApiError::Internal.into_response();
-        }
-    }
-    // Bytes are stored and quota-checked: this gallery now exists for real.
-    // Disarm the rollback before thumbnail work, so a client disconnect during
-    // decoding cannot delete the row (and orphan the file) behind our back.
-    if let Some(m) = &mut mint {
-        m.keep = true;
-    }
-    // Best effort, never fails the upload: the client falls back to the
-    // original when the preview is missing.
-    if thumb_supported(&ext) {
-        write_thumb(&state, &state.dir.join(&final_name), &final_name).await;
-    }
-    tracing::debug!(
-        stage = "put_total",
-        latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0)
-    );
-    state
-        .uploads_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state
-        .upload_bytes_total
-        .fetch_add(accumulated, std::sync::atomic::Ordering::Relaxed);
+        .unwrap_or_else(|_| ApiError::Internal.into_response())
+}
+
+struct Upload {
+    part: PathBuf,
+    name: String,
+    slot: String,
+    slug: String,
+    chunk: Option<UploadChunk>,
+    content_length: Option<u64>,
+}
+
+fn created_upload(upload: &Upload) -> Response {
     (
         StatusCode::CREATED,
-        Json(json!({ "name": final_name, "slug": slug })),
+        Json(json!({ "name": upload.name, "slug": upload.slug })),
     )
         .into_response()
 }
+
+fn storage_full() -> Response {
+    err(StatusCode::INSUFFICIENT_STORAGE, "storage full")
+}
+
+fn gallery_full() -> Response {
+    err(StatusCode::PAYLOAD_TOO_LARGE, "gallery storage full")
+}
+
+fn interrupted() -> Response {
+    err(StatusCode::REQUEST_TIMEOUT, "upload interrupted")
+}
+
+fn store_error(e: std::io::Error) -> Response {
+    if e.raw_os_error() == Some(libc::ENOSPC) {
+        storage_full()
+    } else {
+        ApiError::Internal.into_response()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn reserve_bytes(
+    state: &AppState,
+    budget: &mut UploadBudget,
+    upload: &Upload,
+    bytes: u64,
+    unwritten: u64,
+) -> Result<(), Response> {
+    let limits = state.limits;
+    let meta = match state.db.lock().unwrap().gallery_meta(&upload.slug) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Err(err(StatusCode::NOT_FOUND, "unknown gallery")),
+        Err(_) => return Err(ApiError::Internal.into_response()),
+    };
+    let in_gallery = |id: &str| {
+        id.split_once('_')
+            .is_some_and(|(slug, _)| slug == upload.slug)
+    };
+    if limits.gallery_bytes > 0 {
+        let used = budget
+            .active
+            .iter()
+            .filter(|(id, _)| in_gallery(id))
+            .map(|(_, reserve)| reserve.bytes)
+            .chain(
+                budget
+                    .idle
+                    .iter()
+                    .filter(|(id, _)| **id != upload.slot && in_gallery(id))
+                    .map(|(_, n)| *n),
+            )
+            .chain(
+                budget
+                    .unindexed
+                    .iter()
+                    .filter(|(name, _)| **name != upload.name && in_gallery(name))
+                    .map(|(_, n)| *n),
+            )
+            .fold(
+                (meta.bytes.max(0) as u64).saturating_add(bytes),
+                u64::saturating_add,
+            );
+        if used > limits.gallery_bytes {
+            return Err(gallery_full());
+        }
+    }
+    if limits.gallery_photos > 0 && meta.photos >= limits.gallery_photos {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached"));
+    }
+    if cfg!(unix) && limits.min_free > 0 {
+        let Some((free, unit)) = disk_space(&state.dir) else {
+            return Err(storage_full());
+        };
+        let round = |bytes: u64| bytes.div_ceil(unit).saturating_mul(unit);
+        let needed = budget
+            .active
+            .iter()
+            .fold(limits.min_free, |needed, (id, reserve)| {
+                let extra = if id == &upload.slot { unwritten } else { 0 };
+                let end = reserve
+                    .flushed
+                    .saturating_add(reserve.unwritten)
+                    .saturating_add(extra);
+                needed.saturating_add(round(end) - round(reserve.flushed))
+            });
+        if free < needed {
+            return Err(storage_full());
+        }
+    }
+    let reserve = budget
+        .active
+        .get_mut(&upload.slot)
+        .expect("registered writer");
+    reserve.bytes += bytes;
+    reserve.unwritten += unwritten;
+    Ok(())
+}
+
+async fn run_upload(
+    state: &AppState,
+    upload: &Upload,
+    ip: IpAddr,
+    ext: &str,
+    body: Body,
+    reply: &mut tokio::sync::oneshot::Sender<Response>,
+    mint: &mut Option<MintGuard<'_>>,
+) -> Response {
+    let mut budget = tokio::select! {
+        _ = reply.closed() => return interrupted(),
+        budget = state.upload_budget.lock() => budget,
+    };
+    if budget.active.contains_key(&upload.slot) {
+        return err(StatusCode::CONFLICT, "upload in progress");
+    }
+    let Ok(_permit) = state.uploads.try_acquire() else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    };
+    let Some(_ip_permit) =
+        UploadSlotGuard::try_acquire(&state.upload_ips, &ip, state.limits.upload_slots_per_ip)
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    };
+    budget
+        .active
+        .insert(upload.slot.clone(), Default::default());
+    let result = save_upload(state, upload, budget, body, reply, mint).await;
+    let mut budget = state.upload_budget.lock().await;
+    if let Ok(md) = tokio::fs::metadata(&upload.part).await {
+        budget.idle.insert(upload.slot.clone(), md.len());
+    } else {
+        budget.idle.remove(&upload.slot);
+    }
+    budget.active.remove(&upload.slot);
+    drop(budget);
+
+    match result {
+        Ok(Some(bytes)) => {
+            if thumb_supported(ext) {
+                write_thumb(state, &state.dir.join(&upload.name), &upload.name).await;
+            }
+            state
+                .uploads_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .upload_bytes_total
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            created_upload(upload)
+        }
+        Ok(None) => created_upload(upload),
+        Err(response) => response,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn save_upload(
+    state: &AppState,
+    upload: &Upload,
+    mut budget: tokio::sync::MutexGuard<'_, UploadBudget>,
+    body: Body,
+    reply: &mut tokio::sync::oneshot::Sender<Response>,
+    mint: &mut Option<MintGuard<'_>>,
+) -> Result<Option<u64>, Response> {
+    let on_disk = sweep_parts(state, &mut budget, Some(&upload.slot))
+        .await
+        .map_err(store_error)?;
+    let prefix = format!("{}_", upload.slot);
+    let indexed = {
+        let db = state.db.lock().unwrap();
+        db.upload_name(&upload.slug, &prefix)
+            .map_err(|_| ApiError::Internal.into_response())?
+    };
+    let final_path = state.dir.join(&upload.name);
+    if indexed.is_some() || on_disk.is_some() {
+        let Some(chunk) = upload.chunk else {
+            return Err(ApiError::Internal.into_response());
+        };
+        if on_disk.as_deref() != Some(&upload.name)
+            || indexed.as_ref().is_some_and(|name| name != &upload.name)
+        {
+            return Err(err(StatusCode::CONFLICT, "upload id already used"));
+        }
+        let md = tokio::fs::symlink_metadata(&final_path)
+            .await
+            .map_err(store_error)?;
+        if !md.is_file() || md.len() != chunk.total {
+            return Err(err(StatusCode::CONFLICT, "upload id already used"));
+        }
+        if indexed.is_some() {
+            let size = state
+                .db
+                .lock()
+                .unwrap()
+                .photo_size(&upload.slug, &upload.name);
+            return if size.ok().flatten().and_then(|n| u64::try_from(n).ok()) == Some(chunk.total) {
+                Ok(None)
+            } else {
+                Err(ApiError::Internal.into_response())
+            };
+        }
+        // The bytes survived an indexing error. Recover the row without replacing them.
+        budget.unindexed.insert(upload.name.clone(), chunk.total);
+        reserve_bytes(state, &mut budget, upload, chunk.total, 0)?;
+        budget.unindexed.remove(&upload.name);
+        drop(budget);
+        let created = capture_time(state, &final_path).await;
+        let mut budget = state.upload_budget.lock().await;
+        // An explicit delete may have won during EXIF extraction.
+        match tokio::fs::symlink_metadata(&final_path).await {
+            Ok(md) if md.is_file() && md.len() == chunk.total => {}
+            Ok(_) => return Err(ApiError::Internal.into_response()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(err(StatusCode::GONE, "upload expired"));
+            }
+            Err(e) => {
+                budget.unindexed.insert(upload.name.clone(), chunk.total);
+                return Err(store_error(e));
+            }
+        }
+        if let Err(response) = async {
+            sync_dir(&state.dir).await.map_err(store_error)?;
+            record_upload(state, &mut budget, upload, chunk.total, created)
+        }
+        .await
+        {
+            budget.unindexed.insert(upload.name.clone(), chunk.total);
+            budget
+                .active
+                .get_mut(&upload.slot)
+                .expect("registered writer")
+                .bytes = 0;
+            return Err(response);
+        }
+        return Ok(Some(chunk.total));
+    }
+
+    let base = budget.idle.get(&upload.slot).copied();
+    if budget.damaged.contains(&upload.slot) {
+        return Err(ApiError::Internal.into_response());
+    }
+    let base_len = base.unwrap_or(0);
+    budget
+        .active
+        .get_mut(&upload.slot)
+        .expect("registered writer")
+        .flushed = base_len;
+    if let Some(chunk) = upload.chunk {
+        if chunk.total > state.limits.max_file as u64 {
+            return Err(ApiError::TooLarge.into_response());
+        }
+        if base.is_none() && chunk.start > 0 {
+            return Err(err(StatusCode::GONE, "upload expired"));
+        }
+        if base_len > chunk.total {
+            return Err(err(StatusCode::BAD_REQUEST, "upload too large"));
+        }
+        if base_len != chunk.start {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "offset mismatch", "received": base_len })),
+            )
+                .into_response());
+        }
+        reserve_bytes(
+            state,
+            &mut budget,
+            upload,
+            chunk.total,
+            chunk.total - base_len,
+        )?;
+    } else {
+        if base.is_some() {
+            return Err(ApiError::Internal.into_response());
+        }
+        let len = upload.content_length.unwrap_or(0);
+        if len > state.limits.max_file as u64 {
+            return Err(ApiError::TooLarge.into_response());
+        }
+        reserve_bytes(state, &mut budget, upload, len, len)?;
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .append(true)
+        .create_new(base.is_none())
+        .open(&upload.part)
+        .await
+        .map_err(store_error)?;
+    budget.idle.remove(&upload.slot);
+    drop(budget);
+
+    let bytes = match stream_upload(state, upload, &mut out, body, reply, base_len).await {
+        Ok(bytes) => bytes,
+        Err(response) => {
+            // `write_all` can finish before Tokio's background write. Settle it
+            // even on error before touching the old prefix or releasing the ID.
+            let _ = out.flush().await;
+            drop(out);
+            return Err(rollback_part(state, upload, base_len, response).await);
+        }
+    };
+    drop(out);
+    if upload.chunk.is_some_and(|chunk| bytes < chunk.total) {
+        return Err((StatusCode::ACCEPTED, Json(json!({ "received": bytes }))).into_response());
+    }
+    let created = capture_time(state, &upload.part).await;
+    let mut budget = state.upload_budget.lock().await;
+    // Confirm the caps before moving bytes where recount can see them.
+    // Indexing checks the caps again in the insertion transaction.
+    let meta = state.db.lock().unwrap().gallery_meta(&upload.slug);
+    let rejected = match meta {
+        Ok(Some(meta))
+            if state.limits.gallery_photos > 0 && meta.photos >= state.limits.gallery_photos =>
+        {
+            Some(err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached"))
+        }
+        Ok(Some(meta))
+            if state.limits.gallery_bytes > 0
+                && (meta.bytes.max(0) as u64).saturating_add(bytes)
+                    > state.limits.gallery_bytes =>
+        {
+            Some(gallery_full())
+        }
+        Ok(None) => Some(err(StatusCode::NOT_FOUND, "unknown gallery")),
+        _ => None, // A DB failure must still preserve the received original for recount.
+    };
+    if let Some(deny) = rejected {
+        return Err(rollback_part_locked(&mut budget, upload, base_len, deny).await);
+    }
+    match tokio::fs::symlink_metadata(&final_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            drop(budget);
+            return Err(
+                rollback_part(state, upload, base_len, ApiError::Internal.into_response()).await,
+            );
+        }
+    }
+    if let Err(e) = tokio::fs::rename(&upload.part, &final_path).await {
+        drop(budget);
+        return Err(rollback_part(state, upload, base_len, store_error(e)).await);
+    }
+    // Flush the rename before committing the DB row.
+    let result = match sync_dir(&state.dir).await {
+        Ok(()) => record_upload(state, &mut budget, upload, bytes, created),
+        Err(e) => {
+            tracing::warn!(error = %e, "upload directory sync failed");
+            Err(ApiError::Internal.into_response())
+        }
+    };
+    if let Err(response) = result {
+        if response.status().is_server_error() {
+            // Preserve the original and its gallery after a durability/DB failure.
+            budget.unindexed.insert(upload.name.clone(), bytes);
+            budget
+                .active
+                .get_mut(&upload.slot)
+                .expect("registered writer")
+                .bytes = 0;
+            if let Some(mint) = mint {
+                mint.keep = true;
+            }
+            return Err(response);
+        }
+        tokio::fs::rename(&final_path, &upload.part)
+            .await
+            .map_err(store_error)?;
+        let response = rollback_part_locked(&mut budget, upload, base_len, response).await;
+        sync_dir(&state.dir).await.map_err(store_error)?;
+        return Err(response);
+    }
+    if let Some(mint) = mint {
+        mint.keep = true;
+    }
+    Ok(Some(bytes))
+}
+
+#[allow(clippy::result_large_err)]
+async fn stream_upload(
+    state: &AppState,
+    upload: &Upload,
+    out: &mut tokio::fs::File,
+    body: Body,
+    reply: &mut tokio::sync::oneshot::Sender<Response>,
+    base_len: u64,
+) -> Result<u64, Response> {
+    let deadline = tokio::time::Instant::now() + UPLOAD_DEADLINE;
+    let mut stream = body.into_data_stream();
+    let mut bytes = base_len;
+    let end = upload.chunk.map(|c| c.end + 1).or(upload.content_length);
+    let mut unsettled = 0;
+    while let Some(data) = tokio::select! {
+        biased;
+        _ = reply.closed() => return Err(interrupted()),
+        next = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + IDLE_TIMEOUT), stream.next()) => next.map_err(|_| interrupted())?,
+    } {
+        let data = data.map_err(|_| {
+            if upload.chunk.is_some() {
+                interrupted()
+            } else {
+                ApiError::TooLarge.into_response()
+            }
+        })?;
+        if data.is_empty() {
+            continue;
+        }
+        let len = data.len() as u64;
+        bytes = bytes.saturating_add(len);
+        if upload.chunk.is_some_and(|c| bytes > c.end + 1) {
+            return Err(err(StatusCode::BAD_REQUEST, "content-range overrun"));
+        }
+        if upload.chunk.is_none() && end.is_some_and(|end| bytes > end) {
+            return Err(err(StatusCode::BAD_REQUEST, "content-length overrun"));
+        }
+        if bytes > state.limits.max_file as u64 {
+            return Err(ApiError::TooLarge.into_response());
+        }
+        if end.is_none() {
+            reserve_bytes(
+                state,
+                &mut *state.upload_budget.lock().await,
+                upload,
+                len,
+                len,
+            )?;
+        }
+        out.write_all(&data).await.map_err(store_error)?;
+        unsettled += len;
+        // Keep unflushed disk credit conservative without waiting on every frame.
+        if state.limits.min_free > 0 && unsettled >= 64 * 1024 {
+            out.flush().await.map_err(store_error)?;
+            let mut budget = state.upload_budget.lock().await;
+            budget
+                .active
+                .get_mut(&upload.slot)
+                .expect("registered writer")
+                .flush_bytes(unsettled);
+            unsettled = 0;
+        }
+    }
+    if end.is_some_and(|end| bytes != end) {
+        return Err(interrupted());
+    }
+    if bytes == 0 {
+        return Err(err(StatusCode::BAD_REQUEST, "empty body"));
+    }
+    out.flush().await.map_err(store_error)?;
+    if state.limits.min_free > 0 && unsettled > 0 {
+        let mut budget = state.upload_budget.lock().await;
+        budget
+            .active
+            .get_mut(&upload.slot)
+            .expect("registered writer")
+            .flush_bytes(unsettled);
+    }
+    if upload.chunk.is_none_or(|c| bytes == c.total) {
+        out.sync_all().await.map_err(store_error)?;
+    }
+    Ok(bytes)
+}
+
+async fn rollback_part(
+    state: &AppState,
+    upload: &Upload,
+    base_len: u64,
+    response: Response,
+) -> Response {
+    let mut budget = state.upload_budget.lock().await;
+    rollback_part_locked(&mut budget, upload, base_len, response).await
+}
+
+async fn rollback_part_locked(
+    budget: &mut UploadBudget,
+    upload: &Upload,
+    base_len: u64,
+    response: Response,
+) -> Response {
+    let result = if base_len == 0 {
+        tokio::fs::remove_file(&upload.part).await
+    } else {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&upload.part)
+            .await
+        {
+            Ok(file) => file.set_len(base_len).await,
+            Err(e) => Err(e),
+        }
+    };
+    if let Err(e) = result
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        budget.damaged.insert(upload.slot.clone());
+        return store_error(e);
+    }
+    response
+}
+
+async fn capture_time(state: &AppState, path: &Path) -> i64 {
+    // The two-slot image semaphore bounds simultaneous EXIF reads on a small node.
+    let Ok(_permit) = state.thumbs.acquire().await else {
+        return crate::db::now_millis();
+    };
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || crate::exif_time::taken_millis(&path))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(crate::db::now_millis)
+}
+
+#[allow(clippy::result_large_err)]
+fn record_upload(
+    state: &AppState,
+    budget: &mut UploadBudget,
+    upload: &Upload,
+    bytes: u64,
+    created: i64,
+) -> Result<(), Response> {
+    let usage = state.db.lock().unwrap().add_upload_limited(
+        &upload.slug,
+        &upload.name,
+        bytes,
+        created,
+        (state.limits.gallery_bytes, state.limits.gallery_photos),
+    );
+    match usage {
+        Ok(StoreUpload::Stored(..)) => {
+            budget.unindexed.remove(&upload.name);
+            budget
+                .active
+                .get_mut(&upload.slot)
+                .expect("registered writer")
+                .bytes = 0;
+            Ok(())
+        }
+        Ok(StoreUpload::Missing) => Err(err(StatusCode::NOT_FOUND, "unknown gallery")),
+        Ok(StoreUpload::Full) => Err(gallery_full()),
+        Ok(StoreUpload::PhotoLimit) => {
+            Err(err(StatusCode::PAYLOAD_TOO_LARGE, "photo limit reached"))
+        }
+        Err(_) => Err(ApiError::Internal.into_response()),
+    }
+}
+
 // --- photo serve / delete ---
 
 pub async fn get_photo(
@@ -2181,12 +2419,16 @@ async fn serve_photo(
     if read_limited(&state, &ip) {
         return err(StatusCode::TOO_MANY_REQUESTS, "too many requests");
     }
-    let meta = {
+    let key = request_key(&headers);
+    let (access, key_ok) = {
         let db = state.db.lock().unwrap();
-        db.gallery_meta(&slug)
+        (
+            db.gallery_access(&slug),
+            key.as_ref().is_some_and(|k| db.key_owns_slug(k, &slug)),
+        )
     };
-    let meta = match meta {
-        Ok(Some(meta)) => meta,
+    let access = match access {
+        Ok(Some(access)) => access,
         Ok(None) => return err(StatusCode::NOT_FOUND, "not found"),
         Err(_) => return ApiError::Internal.into_response(),
     };
@@ -2194,73 +2436,21 @@ async fn serve_photo(
     // successful unlock sets a viewer cookie so later media needs neither.
     let query = raw.unwrap_or_default();
     let pass = request_pass(&headers, &query);
-    let key = request_key(&headers);
-    let key_ok = key
-        .as_ref()
-        .map(|k| {
-            let db = state.db.lock().unwrap();
-            db.key_owns_slug(k, &slug)
-        })
-        .unwrap_or(false);
-    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner);
-    // A supplied-but-wrong key on a private gallery is a guess: throttle it
-    // before the 404, like the private listing, so private photos cannot be
-    // probed at read-limit speed. No key (public probing) burns nothing.
-    if !meta.public && !owner && key.is_some() && pass_fail_record(&state, &ip) {
-        return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
-    }
-    // Private gallery: photos are invisible without the key or its cookie.
-    if !meta.public && !owner {
+    let owner = key_ok || media_cookie_ok(&headers, &state, &slug, MediaToken::Owner, 0);
+    if !access.public && !owner {
+        if key.is_some() && pass_fail_record(&state, &ip) {
+            return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
+        }
         return err(StatusCode::NOT_FOUND, "not found");
     }
-    // Viewer lock applies per-file too (direct /photos/ links). A live viewer
-    // cookie for THIS gallery already proves the password: no Argon2, no URL
-    // secret. A wrong key with no pass was not counted yet, so count it once
-    // on denial (check_locked already counted a non-empty wrong pass).
-    let viewer_cookie = !owner && media_cookie_ok(&headers, &state, &slug, MediaToken::Viewer);
-    let mut unlocked = false;
-    if !owner && !viewer_cookie {
-        match check_locked(&state, ip, &slug, &pass).await {
-            Locked::Open => {}
-            Locked::Unlocked => unlocked = true,
-            Locked::Denied(deny) => {
-                if key.is_some() && pass.is_empty() && pass_fail_record(&state, &ip) {
-                    return err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
-                }
-                return deny;
-            }
-        }
-    }
-    // Anything a non-owner can reach here is either private (never cache) or
-    // a public gallery's unlocked bytes. Owner requests, a locked gallery
-    // (pass_hash set), and any ?pass=/viewer-cookie request stay private.
-    let (locked, version) = {
-        let db = state.db.lock().unwrap();
-        match db.gallery_pass_hash(&slug) {
-            Ok(hash) => match db.gallery_token_version(&slug) {
-                Ok(version) => (hash.is_some(), version.unwrap_or(0)),
-                Err(_) => return ApiError::Internal.into_response(),
-            },
-            Err(_) => return ApiError::Internal.into_response(),
-        }
-    };
-    let cache_control = if meta.public && !owner && !locked && pass.is_empty() && !viewer_cookie {
-        "public, max-age=86400"
+    let unlocked = if owner {
+        false
     } else {
-        "private, no-store"
-    };
-    // A thumb with no listing row is stale (deleted original, restored backup,
-    // delete race): never serve it, even though the derived file still exists.
-    if thumb {
-        let stored = name.strip_suffix(".jpg").unwrap_or_default();
-        let exists = {
-            let db = state.db.lock().unwrap();
-            db.photo_exists(&slug, stored)
-        };
-        if !exists {
-            return err(StatusCode::NOT_FOUND, "not found");
+        match check_viewer(&state, &headers, ip, &slug, &pass, &access).await {
+            Ok(unlocked) => unlocked,
+            Err(deny) => return deny,
         }
-    }
+    };
     let t_canon = Instant::now();
     let path = if thumb {
         state.dir.join(".thumbs").join(&name)
@@ -2315,6 +2505,28 @@ async fn serve_photo(
             };
         (ext, ctype.to_string())
     };
+    let range = parse_range(&headers, len);
+    if let Some(Ok((start, _))) = range
+        && file.seek(std::io::SeekFrom::Start(start)).await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "seek failed");
+    }
+    {
+        let db = state.db.lock().unwrap();
+        if let Err(deny) = current_access(&db, &slug, &access, owner, "not found") {
+            return deny;
+        }
+        let stored = if thumb {
+            name.strip_suffix(".jpg").unwrap_or_default()
+        } else {
+            &name
+        };
+        match db.photo_size(&slug, stored) {
+            Ok(Some(_)) => {}
+            Ok(None) => return err(StatusCode::NOT_FOUND, "not found"),
+            Err(_) => return ApiError::Internal.into_response(),
+        }
+    }
     tracing::debug!(
         stage = "serve_total",
         latency_ms = format!("{:.2}", t_total.elapsed().as_secs_f64() * 1000.0)
@@ -2327,7 +2539,7 @@ async fn serve_photo(
         || ctype.starts_with("text/");
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, ctype)
-        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::ACCEPT_RANGES, "bytes")
         .header("x-content-type-options", "nosniff");
     if ext == ".svg" {
@@ -2342,10 +2554,10 @@ async fn serve_photo(
     if unlocked {
         builder = builder.header(
             header::SET_COOKIE,
-            issue_media_token(&state, &slug, MediaToken::Viewer, version),
+            issue_media_token(&state, &slug, MediaToken::Viewer, access.version),
         );
     }
-    match parse_range(&headers, len) {
+    match range {
         // Unsatisfiable: 416 with the real length, no body (RFC 9110 §15.5.17).
         Some(Err(())) => builder
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -2353,9 +2565,6 @@ async fn serve_photo(
             .body(Body::empty())
             .unwrap(),
         Some(Ok((start, end))) => {
-            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "seek failed");
-            }
             let take = file.take(end - start + 1);
             builder
                 .status(StatusCode::PARTIAL_CONTENT)
@@ -2418,6 +2627,8 @@ pub async fn delete_photo(
             return err(StatusCode::NOT_FOUND, "not found");
         }
     }
+    // Exclude concurrent finalization and leave no charge for removed orphans.
+    let mut budget = state.upload_budget.lock().await;
     let path = state.dir.join(&name);
     match path.canonicalize() {
         Ok(canon) if canon.starts_with(&state.canon_dir) => {}
@@ -2432,6 +2643,7 @@ pub async fn delete_photo(
         // Keep the gallery row: a concurrent upload landing between a file
         // count and a row delete orphaned files under a dead slug.
         Ok(()) => {
+            budget.unindexed.remove(&name);
             // Best effort: an old photo may have no thumb, and a stale one is
             // removed by admin_sweep if this races.
             let thumbs = state.dir.join(".thumbs");
@@ -2526,6 +2738,12 @@ mod tests {
             client_ip_from(&headers, peer("127.0.0.1"), &trusted),
             client
         );
+        headers.insert("x-forwarded-for", "192.0.2.5".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.7, 10.9.9.9".parse().unwrap());
+        assert_eq!(
+            client_ip_from(&headers, peer("127.0.0.1"), &trusted),
+            client
+        );
 
         // Every hop trusted: the leftmost address is the best client guess.
         headers.insert("x-forwarded-for", "10.5.5.5, 10.9.9.9".parse().unwrap());
@@ -2546,18 +2764,22 @@ mod tests {
     }
 
     #[test]
-    fn metrics_allow_only_local_or_direct_trusted_peers() {
-        let trusted = parse_trust_proxy("172.16.0.0/12");
-        let peer: IpAddr = "172.17.0.1".parse().unwrap();
-        let direct = HeaderMap::new();
-        assert!(metrics_direct_peer(peer, &direct, &trusted));
-
-        let mut forwarded = HeaderMap::new();
-        forwarded.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
-        assert!(!metrics_direct_peer(peer, &forwarded, &trusted));
-
-        let public: IpAddr = "203.0.113.9".parse().unwrap();
-        assert!(!metrics_direct_peer(public, &direct, &trusted));
+    fn metrics_requires_unproxied_loopback() {
+        let trusted = parse_trust_proxy("127.0.0.1, 172.17.0.1");
+        let loopback = "127.0.0.1".parse().unwrap();
+        let bridge = "172.17.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        assert!(metrics_direct_peer(loopback, &headers, &[]));
+        assert!(!metrics_direct_peer(loopback, &headers, &trusted));
+        assert!(!metrics_direct_peer(bridge, &headers, &trusted));
+        for value in ["bad-forwarding", "127.0.0.1"] {
+            headers.insert("x-forwarded-for", value.parse().unwrap());
+            assert!(!metrics_direct_peer(loopback, &headers, &[]));
+            assert!(!metrics_direct_peer(loopback, &headers, &trusted));
+        }
+        headers.clear();
+        headers.insert("forwarded", "for=127.0.0.1".parse().unwrap());
+        assert!(!metrics_direct_peer(loopback, &headers, &[]));
     }
 
     #[tokio::test]
