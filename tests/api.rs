@@ -1327,7 +1327,7 @@ async fn admin_unlock_lists_and_removes() {
     );
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(!state.db.lock().unwrap().gallery_exists(&slug));
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug).unwrap());
     unsafe {
         std::env::remove_var("ADMIN_PASS");
     }
@@ -1829,7 +1829,13 @@ async fn gallery_byte_quota_rejects_and_recovers() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     let files: usize = std::fs::read_dir(state.dir.clone()).unwrap().count();
     assert_eq!(files, 1, "oversize upload must not leave a file");
-    let meta = state.db.lock().unwrap().gallery_meta(&slug).unwrap();
+    let meta = state
+        .db
+        .lock()
+        .unwrap()
+        .gallery_meta(&slug)
+        .unwrap()
+        .unwrap();
     assert_eq!((meta.bytes, meta.photos), (40, 1));
     // Deleting frees the space again.
     let r = request(
@@ -2277,8 +2283,8 @@ async fn admin_remove_deletes_one_gallery_and_keeps_the_key() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["files"], serde_json::Value::from(1));
     assert!(!state.dir.join(&name_a).exists());
-    assert!(!state.db.lock().unwrap().gallery_exists(&slug_a));
-    assert!(state.db.lock().unwrap().gallery_exists(&slug_b));
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug_a).unwrap());
+    assert!(state.db.lock().unwrap().gallery_exists(&slug_b).unwrap());
     // Key still works after the remove.
     let (status, _) = put_photo(
         &state,
@@ -2321,7 +2327,7 @@ async fn delete_gallery_fails_when_photos_dir_is_unreadable() {
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
-        state.db.lock().unwrap().gallery_exists(&slug),
+        state.db.lock().unwrap().gallery_exists(&slug).unwrap(),
         "a failed sweep must leave the row intact"
     );
     std::fs::rename(&moved, &state.dir).expect("rename photos dir back");
@@ -2354,7 +2360,7 @@ async fn admin_remove_fails_when_photos_dir_is_unreadable() {
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
-        state.db.lock().unwrap().gallery_exists(&slug),
+        state.db.lock().unwrap().gallery_exists(&slug).unwrap(),
         "a failed sweep must leave the row intact"
     );
     std::fs::rename(&moved, &state.dir).expect("rename photos dir back");

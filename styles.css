@@ -72,6 +72,7 @@ button { font: inherit; }
   background: var(--bg);
   border: 1px solid var(--border);
 }
+#key-banner-hint { color: var(--muted); }
 #key-banner button {
   background: transparent;
   color: var(--fg);
@@ -94,6 +95,14 @@ button { font: inherit; }
 }
 #gallery-label { font-weight: 600; font-size: 15px; }
 #gallery-label:empty { display: none; }
+#gallery-state {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+#gallery-state[hidden] { display: none; }
 #actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
 
 input[type="password"], #key-input {
@@ -105,7 +114,7 @@ input[type="password"], #key-input {
   border-radius: 0;
 }
 
-#theme-btn, dialog button {
+#theme-btn, #copy-link-btn, dialog button {
   background: transparent;
   color: var(--fg);
   border: 1px solid var(--border);
@@ -113,7 +122,13 @@ input[type="password"], #key-input {
   border-radius: 0;
   cursor: pointer;
 }
-#theme-btn:hover, dialog button:hover { background: var(--surface); }
+#home-link {
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 7px 12px;
+  text-decoration: none;
+}
+#theme-btn:hover, #home-link:hover, #copy-link-btn:hover, dialog button:hover { background: var(--surface); }
 #theme-btn { padding: 7px 10px; }
 
 #upload-btn {
@@ -127,6 +142,7 @@ input[type="password"], #key-input {
   border-radius: 0;
   cursor: pointer;
 }
+#upload-btn:disabled { opacity: 0.4; cursor: default; }
 #main { flex: 1; padding: 16px; }
 
 #key-help { margin: 0 0 4px; }
@@ -201,6 +217,7 @@ dialog p { font-size: 13px; color: var(--muted); }
 :root[data-theme="dark"] #key-error { color: #f87171; }
 
 #key-input { width: 100%; margin: 8px 0; font-family: ui-monospace, monospace; letter-spacing: 0.02em; }
+#setpass-private { margin: 8px 0 0; }
 #key-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 
 #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }

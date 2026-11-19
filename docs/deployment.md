@@ -116,12 +116,17 @@ watch its restart count. There is no separate timer to install.
 
 The snapshot copies `photos/` first and then snapshots the database with
 `VACUUM INTO`, so a failed photo copy leaves the previous snapshot's database
-intact; prune failures fail the run. In-flight `.part-` files and thumbnail
-temp files are skipped, while the derived `.thumbs/` previews are copied so a
-restore keeps them. The destination is `0700`, the database copy `0600`, and
-it is overwritten in place: deleted top-level photos are pruned, but stale
-previews inside `.thumbs/` may remain in the snapshot and are never served. A
-destination inside the live data dir is refused.
+intact; prune failures fail the run. A photo uploaded after the first copy but
+before the database snapshot is copied in a second pass, and rows whose file
+is gone are removed before the snapshot is installed; the installed database
+is reconciled again after pruning, so it never lists a file the snapshot does
+not hold. Copied photos and the database are fsynced before their temp names
+are renamed. In-flight `.part-` files and thumbnail temp files are skipped,
+while the derived `.thumbs/` previews are copied so a restore keeps them. The
+destination is `0700`, the database copy `0600`, and it is overwritten in
+place: deleted top-level photos are pruned, but stale previews inside
+`.thumbs/` may remain in the snapshot and are never served. A destination
+inside the live data dir is refused.
 
 **Retention:** `current` is a single snapshot; the app keeps no history. Add
 retention in the off-host tool, for example `restic forget --keep-daily 7

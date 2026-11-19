@@ -150,6 +150,8 @@ Mint a gallery or verify that a key owns a slug. Body is optional JSON, up to
 
 The header key wins if both are present. With no slug, every call mints a fresh
 gallery (same key, new gallery); `X-Invite-Code` is checked when configured.
+There is deliberately no lookup by key alone: one key can own several
+galleries, and only a slug plus key identifies one.
 With a slug, it answers `200 {"slug":...}` only when the key owns that gallery;
 otherwise `403 forbidden` (or `429` once the failure bucket is full). A
 malformed slug is `400 bad slug`. Missing key is `401 gallery key required`.
@@ -253,10 +255,11 @@ contiguous: the existing temp length must equal `start`.
 On an interrupted or rejected chunk the server keeps the previously committed
 prefix (and truncates the failed request's bytes), so the client can resume
 from `received`. The final chunk is made durable (file sync, rename, directory
-sync) before the DB row is added. A DB error after the rename returns `500`
-and keeps the file; the next startup recount adopts it. Abandoned `.part-*`
-files count toward the gallery byte quota while live and are swept after one
-hour.
+sync) before the DB row is added, and SQLite runs with `synchronous=FULL`, so
+the row commit is durable before the `201` response. A DB error after the
+rename returns `500` and keeps the file; the next startup recount adopts it.
+Abandoned `.part-*` files count toward the gallery byte quota while live and
+are swept after one hour.
 
 Limits: `GALLY_MAX_BYTES` (10 GiB), `GALLY_GALLERY_MAX_BYTES` (5 GiB),
 `GALLY_GALLERY_MAX_PHOTOS` (5000), `GALLY_MIN_FREE_BYTES` (2 GiB),
@@ -433,6 +436,10 @@ curl -fsS -b admin.jar http://127.0.0.1:8000/api/admin/galleries
   that file from zero.
 - A final upload is synced and renamed before the DB row is added. A DB error
   keeps the file, returns `500`, and the next recount adopts it.
+- A database read error is a `500`, never a missing gallery, a missing
+  password, or an orphaned file: the admin sweep aborts without deleting.
+- SQLite runs with WAL and `synchronous=FULL`: an acknowledged upload row,
+  visibility change, or viewer-password change survives a power cut.
 - A photo delete removes and syncs the file before updating counters; a DB
   error returns `500` and a later recount removes the stale row.
 - A gallery delete refuses to touch the row if `photos/` cannot be read; a

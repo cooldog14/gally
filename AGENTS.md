@@ -5,15 +5,20 @@ this file first (with the reason), then the code.
 
 ## North star
 
-Gally is a small, self-hosted gallery for sharing photos. The gallery key is
-the identity: there are no accounts, email, or recovery.
+Gally is a small, self-hosted gallery for sharing photos. The gallery URL is
+the identity; the owner key proves ownership of that URL. A key can be reused,
+but it never selects a gallery by itself: there are no accounts, email, or
+recovery.
 
 ## Product philosophy
 
-- A key owns a gallery. Anyone with the key can upload, edit, publish,
-  protect, or delete that gallery.
+- A key proves ownership of the gallery at its URL. Anyone with the key and
+  that URL can upload, edit, publish, protect, or delete that gallery.
+- A key may be reused, but every home upload mints a new slug. A key alone
+  never opens or lists a gallery.
 - New galleries are private by default. Public is an opt-in action by the
-  owner; a viewer password is a second, separate gate.
+  owner; a viewer password is a second, separate gate, and only gates a public
+  gallery.
 - The admin can list, delete, and sweep galleries. The admin cannot recover a
   key or password and cannot read a private gallery's photos.
 - Losing the owner key means the gallery can no longer be edited or deleted by
@@ -89,6 +94,9 @@ Don't: `serde_json::from_slice(...).unwrap()` in a handler.
   `key_hash`, verify viewer passwords with Argon2id, compare invite/admin
   secrets in constant time, and verify signed tokens by their HMAC. Never add
   a direct `==` on a secret.
+- **MUST NOT** resolve a gallery from a key without a slug. No slug means
+  mint a new gallery; reusing a key must never return, open, or list an
+  existing gallery.
 - **MUST** keep keys, passwords, and cookies out of logs.
 - **MUST** keep admin actions and `/metrics` off public surfaces.
 - **MUST** use `textContent` for user-controlled text in the client; never

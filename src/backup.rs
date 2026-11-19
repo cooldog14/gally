@@ -25,20 +25,124 @@ fn copy_tree(from: &Path, to: &Path, files: &mut usize) -> anyhow::Result<()> {
                 std::fs::create_dir_all(&d)?;
                 stack.push((s, d));
             } else if md.is_file() {
-                // Temp name + rename: a killed backup leaves the previous
-                // complete photo in place, never a truncated one under the
-                // final name.
-                let tmp = dst.join(format!(".tmp-{name}"));
-                std::fs::copy(&s, &tmp).with_context(|| format!("copy {}", s.display()))?;
-                if let Err(e) = std::fs::rename(&tmp, &d) {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(e).with_context(|| format!("install {}", d.display()));
-                }
+                copy_file(&s, &d)?;
                 *files += 1;
             }
         }
+        // Persist the directory entries before moving on to the next dir.
+        sync_dir(&dst)?;
     }
     Ok(())
+}
+
+/// Copy one file to a temp name, fsync it, then rename it into place.
+fn copy_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dst.with_file_name(format!(".tmp-{name}"));
+    let out = (|| -> anyhow::Result<()> {
+        std::fs::copy(src, &tmp).with_context(|| format!("copy {}", src.display()))?;
+        sync_file(&tmp)?;
+        std::fs::rename(&tmp, dst).with_context(|| format!("install {}", dst.display()))?;
+        Ok(())
+    })();
+    if out.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    out
+}
+
+/// Force one file's data to disk.
+fn sync_file(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("open {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", path.display()))
+}
+
+/// Force a directory's entries to disk. Some filesystems reject this.
+fn sync_dir(dir: &Path) -> anyhow::Result<()> {
+    match std::fs::File::open(dir).and_then(|f| f.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("sync {}", dir.display())),
+    }
+}
+
+/// Make the snapshot's `photos` table agree with the backup folder.
+/// Missing files are copied from `source` when present; rows whose file is
+/// gone are removed. A backup must never list a photo it does not hold.
+fn reconcile_photo_rows(
+    db_path: &Path,
+    source: Option<&Path>,
+    photos_dir: &Path,
+) -> anyhow::Result<(usize, usize)> {
+    let mut db = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    let rows: Vec<(String, String, i64)> = {
+        let mut stmt = db.prepare("SELECT slug, name, size FROM photos")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut copied = 0;
+    let mut missing: Vec<(String, String, i64)> = Vec::new();
+    for (slug, name, size) in rows {
+        let dst = photos_dir.join(&name);
+        let dst_len = std::fs::metadata(&dst)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        if let Some(dst_len) = dst_len {
+            // A truncated copy is repaired from the live source when possible.
+            if let Some(src_dir) = source {
+                let src = src_dir.join(&name);
+                if let Ok(md) = std::fs::metadata(&src)
+                    && md.is_file()
+                    && md.len() != dst_len
+                {
+                    copy_file(&src, &dst)?;
+                    copied += 1;
+                }
+            }
+            continue;
+        }
+        if let Some(src_dir) = source {
+            let src = src_dir.join(&name);
+            if std::fs::metadata(&src).is_ok_and(|m| m.is_file()) {
+                copy_file(&src, &dst)?;
+                copied += 1;
+                continue;
+            }
+        }
+        missing.push((slug, name, size));
+    }
+    if copied > 0 {
+        sync_dir(photos_dir)?;
+    }
+    if !missing.is_empty() {
+        let tx = db.transaction()?;
+        for (slug, name, size) in &missing {
+            tx.execute(
+                "DELETE FROM photos WHERE slug = ?1 AND name = ?2",
+                rusqlite::params![slug, name],
+            )?;
+            tx.execute(
+                "UPDATE galleries SET bytes = MAX(bytes - ?1, 0), photos = MAX(photos - 1, 0) WHERE slug = ?2",
+                rusqlite::params![size, slug],
+            )?;
+        }
+        tx.commit()?;
+    }
+    // The snapshot must be a single self-contained file before it is renamed.
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(db);
+    sync_file(db_path)?;
+    Ok((copied, missing.len()))
 }
 
 /// Refuses a destination inside the live data dir.
@@ -107,10 +211,11 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
             .context("chmod backup dir")?;
     }
     // Photos first, additively: if the copy fails the previous DB snapshot is
-    // still the last good one, never a DB pointing at missing bytes.
+    // still the last good one.
     let mut files = 0;
+    let source_photos = root.join("photos");
     let photos = dest.join("photos");
-    copy_tree(&root.join("photos"), &photos, &mut files)?;
+    copy_tree(&source_photos, &photos, &mut files)?;
     // Only after the photos are in place: replace the DB snapshot.
     let db = dest.join("galleries.db");
     let tmp = dest.join("galleries.db.tmp");
@@ -121,10 +226,23 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
             return Err(e).context("snapshot database");
         }
     }
+    // A photo uploaded after the first copy but before this snapshot is in
+    // the DB but not yet in the backup folder. Copy it now, and drop rows
+    // whose file is gone, so the installed DB never lists a missing photo.
+    let (copied, dropped) = match reconcile_photo_rows(&tmp, Some(&source_photos), &photos) {
+        Ok(counts) => counts,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    files += copied;
+    let mut dropped_rows = dropped;
     if let Err(e) = std::fs::rename(&tmp, &db) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).context("install database snapshot");
     }
+    sync_dir(dest).context("sync backup dir")?;
     // VACUUM INTO writes 0644: the snapshot holds password hashes.
     #[cfg(unix)]
     {
@@ -134,10 +252,8 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
     }
     // Deleted source photos must not linger in an overwritten backup. A dir
     // read error is fatal: we cannot prove the backup matches the source.
-    // Prune after installing the DB: a crash can then leave stray extra
-    // photos, never an installed DB that lists files prune already removed.
     let mut src = std::collections::HashSet::new();
-    for ent in std::fs::read_dir(root.join("photos")).context("read source photos")? {
+    for ent in std::fs::read_dir(&source_photos).context("read source photos")? {
         src.insert(ent.context("read source photo entry")?.file_name());
     }
     let mut pruned = 0;
@@ -157,6 +273,12 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
             prune_failed += 1;
         }
     }
+    // Pruning can remove a photo deleted from the source after the snapshot.
+    // Reconcile again so the installed DB does not list a pruned file.
+    let (copied, dropped) = reconcile_photo_rows(&db, Some(&source_photos), &photos)?;
+    files += copied;
+    dropped_rows += dropped;
+    sync_dir(&photos).context("sync backup photos")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -170,7 +292,7 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
         );
     }
     println!(
-        "backup: {files} photos + galleries.db -> {} ({pruned} pruned)",
+        "backup: {files} photos + galleries.db -> {} ({pruned} pruned, {dropped_rows} missing rows removed)",
         dest.display()
     );
     Ok(())
@@ -179,6 +301,66 @@ pub fn run(root: &Path, dest: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_reconciles_snapshot_rows_with_photos() {
+        use crate::db::{GalleryDb, open};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let source_photos = root.join("photos");
+        let backup_photos = tmp.path().join("dest").join("photos");
+        std::fs::create_dir_all(&source_photos).unwrap();
+        std::fs::create_dir_all(&backup_photos).unwrap();
+
+        let db_path = root.join("galleries.db");
+        let mut db = open(&db_path).unwrap();
+        let slug = db.get_or_create_gallery("reconcile-key-0001").unwrap();
+        let hex = "e".repeat(32);
+        let copied = format!("{slug}_{hex}_copied.jpg");
+        let dropped = format!("{slug}_{hex}_dropped.jpg");
+        let kept = format!("{slug}_{hex}_kept.jpg");
+        let repaired = format!("{slug}_{hex}_repaired.jpg");
+
+        // A photo uploaded after the first copy: source exists, backup does not.
+        std::fs::write(source_photos.join(&copied), vec![1u8; 10]).unwrap();
+        db.add_upload(&slug, &copied, 10, 1).unwrap().unwrap();
+        // A row whose file is gone everywhere.
+        db.add_upload(&slug, &dropped, 20, 2).unwrap().unwrap();
+        // Already in the backup; its source has since been deleted.
+        std::fs::write(backup_photos.join(&kept), vec![3u8; 30]).unwrap();
+        db.add_upload(&slug, &kept, 30, 3).unwrap().unwrap();
+        // A truncated backup copy: re-copy it from the source.
+        std::fs::write(source_photos.join(&repaired), vec![4u8; 15]).unwrap();
+        std::fs::write(backup_photos.join(&repaired), vec![0u8; 1]).unwrap();
+        db.add_upload(&slug, &repaired, 15, 4).unwrap().unwrap();
+
+        let snap = tmp.path().join("snapshot.db");
+        db.execute("VACUUM INTO ?1", [snap.to_string_lossy().as_ref()])
+            .unwrap();
+        drop(db);
+
+        let (copied_count, dropped_count) =
+            reconcile_photo_rows(&snap, Some(&source_photos), &backup_photos).unwrap();
+        assert_eq!((copied_count, dropped_count), (2, 1));
+        assert_eq!(
+            std::fs::read(backup_photos.join(&copied)).unwrap(),
+            vec![1u8; 10]
+        );
+        assert_eq!(
+            std::fs::read(backup_photos.join(&repaired)).unwrap(),
+            vec![4u8; 15],
+            "a truncated copy is repaired from the source"
+        );
+        assert!(backup_photos.join(&kept).exists());
+
+        let snap_db = open(&snap).unwrap();
+        assert!(snap_db.photo_exists(&slug, &copied));
+        assert!(!snap_db.photo_exists(&slug, &dropped));
+        assert!(snap_db.photo_exists(&slug, &kept));
+        assert!(snap_db.photo_exists(&slug, &repaired));
+        let meta = snap_db.gallery_meta(&slug).unwrap().unwrap();
+        assert_eq!((meta.bytes, meta.photos), (55, 3));
+    }
 
     #[test]
     fn backup_copies_db_and_photos_without_temps() {
@@ -287,8 +469,11 @@ mod tests {
         copy_dir(&dest.join("photos"), &restored.join("photos"));
         let mut rdb = crate::db::open(&restored.join("galleries.db")).unwrap();
         crate::db::recount(&mut rdb, &restored.join("photos")).unwrap();
-        assert!(rdb.gallery_exists(&slug));
-        let meta = rdb.gallery_meta(&slug).expect("gallery meta");
+        assert!(rdb.gallery_exists(&slug).expect("exists"));
+        let meta = rdb
+            .gallery_meta(&slug)
+            .expect("query")
+            .expect("gallery meta");
         assert_eq!((meta.bytes, meta.photos), (bytes.len() as i64, 1));
         let page = rdb.photos_page(&slug, None, 10).unwrap();
         assert!(page.iter().any(|(_, n)| n == &name), "{page:?}");
@@ -319,6 +504,7 @@ mod tests {
         crate::db::recount(&mut rdb2, &restored2.join("photos")).unwrap();
         let meta = rdb2
             .gallery_meta(&slug)
+            .expect("query")
             .expect("gallery row survives empty");
         assert_eq!((meta.bytes, meta.photos), (0, 0));
         assert!(rdb2.photos_page(&slug, None, 10).unwrap().is_empty());

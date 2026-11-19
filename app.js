@@ -10,15 +10,21 @@ const nextBtn = document.getElementById("next");
 const closeBtn = document.getElementById("close");
 const fileInput = document.getElementById("file-input");
 const galleryLabel = document.getElementById("gallery-label");
+const galleryState = document.getElementById("gallery-state");
+const homeLink = document.getElementById("home-link");
+const copyLinkBtn = document.getElementById("copy-link-btn");
 const keyDialog = document.getElementById("key-dialog");
 const keyForm = document.getElementById("key-form");
 const keyInput = document.getElementById("key-input");
 const keyError = document.getElementById("key-error");
 const keyHelp = document.getElementById("key-help");
+const keyConfirm = document.getElementById("key-confirm");
 const publicCheck = document.getElementById("public-check");
 const editStatus = document.getElementById("edit-status");
 const keyBanner = document.getElementById("key-banner");
 const keyBannerKey = document.getElementById("key-banner-key");
+const keyBannerHint = document.getElementById("key-banner-hint");
+const keyBannerCopy = document.getElementById("key-banner-copy");
 const loadMoreBtn = document.getElementById("load-more");
 
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
@@ -55,6 +61,7 @@ let galleryLocked = false;
 // Gallery key: kept in memory + sessionStorage (per-tab). Never in the URL.
 let galleryKey = sessionStorage.getItem("gallery-key") || "";
 let keyResolver = null;
+let keyValidator = null;
 // Viewer password for locked galleries: "<slug>:<password>" per tab.
 function storedPass(slug) {
   try { return sessionStorage.getItem("gallery-pass:" + slug) || ""; }
@@ -63,6 +70,8 @@ function storedPass(slug) {
 // Edit mode: tap tiles to select, Delete acts on the selection.
 let editing = false;
 const selected = new Set();
+// One upload batch at a time; Upload stays disabled until it settles.
+let uploading = false;
 const selCount = document.getElementById("sel-count");
 const uploadBtn = document.getElementById("upload-btn");
 const uploadStatus = document.getElementById("upload-status");
@@ -71,6 +80,7 @@ const editBtn = document.getElementById("edit-btn");
 const editBar = document.getElementById("editbar");
 const deleteBtn = document.getElementById("delete-btn");
 const lockBtn = document.getElementById("lock-btn");
+const showKeyBtn = document.getElementById("show-key-btn");
 const doneBtn = document.getElementById("done-btn");
 const confirmDialog = document.getElementById("confirm-dialog");
 const confirmText = document.getElementById("confirm-text");
@@ -80,6 +90,21 @@ document.getElementById("key-banner-close").addEventListener("click", () => {
   keyBanner.hidden = true;
 });
 
+function keyBannerHintText() {
+  if (galleryPublic) {
+    return galleryLocked
+      ? "Anyone with the link needs the viewer password."
+      : "Anyone with the link can view this gallery.";
+  }
+  return "This gallery is private. Tick Public in Edit to share it.";
+}
+
+function showKeyBanner(key) {
+  keyBannerKey.textContent = key;
+  keyBannerHint.textContent = keyBannerHintText();
+  keyBanner.hidden = false;
+}
+
 /** One-shot "this is your key" strip: shown once, right after a mint. */
 function showKeyBannerOnce(slug) {
   let key = "";
@@ -87,14 +112,92 @@ function showKeyBannerOnce(slug) {
     key = sessionStorage.getItem("show-key:" + slug) || "";
     if (key) sessionStorage.removeItem("show-key:" + slug);
   } catch (_) { return; }
-  if (!key) return;
-  keyBannerKey.textContent = key;
-  keyBanner.hidden = false;
+  if (key) showKeyBanner(key);
 }
+
+/** Copy without assuming a secure context: LAN HTTP has no Clipboard API. */
+async function copyText(text) {
+  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) { /* fall through to the textarea path */ }
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  let ok = false;
+  try {
+    area.select();
+    ok = document.execCommand("copy");
+  } catch (_) {}
+  area.remove();
+  return ok;
+}
+
+keyBannerCopy.addEventListener("click", async () => {
+  const ok = await copyText(keyBannerKey.textContent);
+  keyBannerCopy.textContent = ok ? "Copied" : "Copy failed";
+  setTimeout(() => { keyBannerCopy.textContent = "Copy key"; }, 1500);
+});
+
+copyLinkBtn.addEventListener("click", async () => {
+  const url = (location.href || location.pathname || "").split("#")[0];
+  const ok = await copyText(url);
+  copyLinkBtn.textContent = ok ? "Copied" : "Copy failed";
+  setTimeout(() => { copyLinkBtn.textContent = "Copy link"; }, 1500);
+});
+
+showKeyBtn.addEventListener("click", () => {
+  if (!galleryKey) return;
+  showKeyBanner(galleryKey);
+  if (keyBanner.scrollIntoView) keyBanner.scrollIntoView({ block: "nearest" });
+});
 
 function slugFromPath() {
   const seg = location.pathname.split("/").filter(Boolean)[0] || "";
   return SLUG_RE.test(seg) ? seg : "";
+}
+
+function updateGalleryState() {
+  const slug = slugFromPath();
+  galleryState.hidden = !slug;
+  homeLink.hidden = !slug;
+  copyLinkBtn.hidden = !slug;
+  if (!slug) return;
+  galleryState.textContent = (galleryPublic ? "Public" : "Private") + (galleryLocked ? " · Protected" : "");
+  galleryState.title = keyBannerHintText();
+  if (!keyBanner.hidden) keyBannerHint.textContent = keyBannerHintText();
+}
+
+function showLanding() {
+  galleryLabel.textContent = "";
+  galleryState.hidden = true;
+  homeLink.hidden = true;
+  copyLinkBtn.hidden = true;
+  editBtn.hidden = true;
+  setEditing(false);
+  photos = [];
+  nextCursor = null;
+  publicCheck.checked = true;
+  galleryLocked = false;
+  renderGrid();
+  empty.textContent = "Upload photos to start a new private gallery. To open an existing gallery, use its link; a private gallery also needs its key.";
+}
+
+function showUnavailable(message) {
+  setEditing(false);
+  galleryState.hidden = true;
+  copyLinkBtn.hidden = true;
+  editBtn.hidden = true;
+  homeLink.hidden = false;
+  photos = [];
+  nextCursor = null;
+  renderGrid();
+  empty.textContent = message;
 }
 
 const PAGE_SIZE = 200;
@@ -118,34 +221,38 @@ function listingUrl(slug, before) {
 async function loadPhotos(retry = false) {
   const slug = slugFromPath();
   if (!slug) {
-    // Landing page: no gallery yet. Upload prompts for a key.
-    galleryLabel.textContent = "";
-    editBtn.hidden = true;
-    setEditing(false);
-    photos = [];
-    nextCursor = null;
-    publicCheck.checked = true;
-    galleryLocked = false;
-    renderGrid();
+    showLanding();
     return;
   }
   galleryLabel.textContent = slug;
   editBtn.hidden = false;
-  showKeyBannerOnce(slug);
+  homeLink.hidden = false;
+  copyLinkBtn.hidden = false;
+  galleryState.hidden = true;
   try {
     // The listing's Set-Cookie authorises every media tag.
     const res = await fetch(listingUrl(slug), { headers: listingHeaders(slug) });
     if (res.status === 404) {
-      // Private (or deleted): a key is the only door. Ask once, then leave.
+      // Private (or deleted): ask for the owner key and verify it before it
+      // is stored. A wrong key stays in the dialog with an error.
       if (!retry) {
-        const key = await needKey(true, "enter");
+        const key = await needKey(true, "enter", {
+          title: "Gallery unavailable",
+          help: "This gallery is private or does not exist. Enter the owner key if the owner gave it to you; otherwise ask the owner for a link to a public gallery.",
+          validate: async (v) => (await verifyGalleryKey(slug, v)).error || "",
+        });
         if (key) return loadPhotos(true);
       }
-      location.assign("/");
+      showUnavailable("This gallery is private or does not exist. Ask the owner for a public link, or for the owner key.");
       return;
     }
     if (res.status === 401) {
       // Locked: prompt for the viewer password (owner key also accepted).
+      // Only a public gallery reaches here, so its state is known.
+      galleryPublic = true;
+      galleryLocked = true;
+      updateGalleryState();
+      showKeyBannerOnce(slug);
       const ok = await needPass(slug);
       if (ok) return loadPhotos();
       photos = [];
@@ -160,6 +267,8 @@ async function loadPhotos(retry = false) {
     galleryPublic = data.public !== false;
     galleryLocked = data.locked === true;
     publicCheck.checked = galleryPublic;
+    updateGalleryState();
+    showKeyBannerOnce(slug);
     photos = data.photos || [];
     nextCursor = data.next || null;
     // Drop selection for photos that no longer exist.
@@ -171,8 +280,9 @@ async function loadPhotos(retry = false) {
   } catch (_) {
     nextCursor = null;
     updateLoadMore();
+    galleryState.hidden = true;
     empty.hidden = false;
-    empty.textContent = "Could not load photos";
+    empty.textContent = "Could not load photos. Reload to try again.";
   }
 }
 
@@ -204,32 +314,41 @@ editBtn.addEventListener("click", async () => {
     setEditing(false);
     return;
   }
-  const key = await needKey(false, "enter");
+  const slug = slugFromPath();
+  if (!slug) return;
+  const key = await askKeyForGallery(slug, "Enter the owner key to edit this gallery.");
   if (!key) return;
   setEditing(true);
 });
 
 doneBtn.addEventListener("click", () => setEditing(false));
 
-// Publish/unpublish the whole gallery. Reverts the tick if the server refuses.
-publicCheck.addEventListener("change", async () => {
+/** Publish/unpublish the gallery; throws the server message on failure. */
+async function setGalleryPublic(want) {
   const slug = slugFromPath();
   if (!slug) return;
+  const res = await fetch("/api/galleries/" + slug + "/visibility", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Gallery-Key": galleryKey },
+    body: JSON.stringify({ public: want }),
+  });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  galleryPublic = want;
+  publicCheck.checked = want;
+  updateGalleryState();
+}
+
+// Publish/unpublish the whole gallery. Reverts the tick if the server refuses.
+publicCheck.addEventListener("change", async () => {
   const want = publicCheck.checked;
   publicCheck.disabled = true;
   editStatus.textContent = "";
   try {
-    const res = await fetch("/api/galleries/" + slug + "/visibility", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Gallery-Key": galleryKey },
-      body: JSON.stringify({ public: want }),
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
-      throw new Error(msg);
-    }
-    galleryPublic = want;
+    await setGalleryPublic(want);
     editStatus.textContent = want ? "Gallery is public" : "Gallery is private";
   } catch (e) {
     publicCheck.checked = galleryPublic;
@@ -248,14 +367,40 @@ lockBtn.addEventListener("click", async () => {
   const errEl = document.getElementById("setpass-error");
   const help = document.getElementById("setpass-help");
   const removeBtn = document.getElementById("setpass-remove");
+  const privateRow = document.getElementById("setpass-private");
   errEl.textContent = "";
   input.value = "";
   removeBtn.hidden = !galleryLocked;
-  help.textContent = galleryLocked
-    ? "This gallery is protected. Enter a new password to change it, or remove protection below."
-    : "Viewers will need this password to open the gallery.";
+  privateRow.hidden = galleryPublic;
+  if (galleryPublic) {
+    help.textContent = galleryLocked
+      ? "This gallery is protected. Enter a new password to change it, or remove protection below."
+      : "Viewers will need this password to open the gallery.";
+  } else {
+    help.textContent =
+      (galleryLocked
+        ? "This gallery is protected, but it is private, so only you can open it. "
+        : "This gallery is private, so only you can open it. ") +
+      "Make it public to share it; the password then gates viewers.";
+  }
   document.getElementById("setpass-dialog").showModal();
   input.focus();
+});
+
+document.getElementById("setpass-public").addEventListener("click", async () => {
+  const errEl = document.getElementById("setpass-error");
+  const help = document.getElementById("setpass-help");
+  errEl.textContent = "";
+  try {
+    await setGalleryPublic(true);
+    editStatus.textContent = "Gallery is public";
+    document.getElementById("setpass-private").hidden = true;
+    help.textContent = galleryLocked
+      ? "This gallery is public. Viewers will need the password to open it."
+      : "This gallery is public. Enter a password below to protect it.";
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
 });
 
 document.getElementById("setpass-form").addEventListener("submit", async (e) => {
@@ -280,11 +425,13 @@ document.getElementById("setpass-form").addEventListener("submit", async (e) => 
       return;
     }
     const data = await res.json().catch(() => null);
+    galleryLocked = data && data.locked === true;
+    updateGalleryState();
     try {
       if (clicked === "remove") sessionStorage.removeItem("gallery-pass:" + slug);
       else sessionStorage.setItem("gallery-pass:" + slug, input.value);
     } catch (_) {}
-    uploadStatus.textContent = data && data.locked ? "Gallery protected." : "Protection removed.";
+    uploadStatus.textContent = galleryLocked ? "Gallery protected." : "Protection removed.";
     await loadPhotos();
   } catch (_) {
     errEl.textContent = "Request failed";
@@ -787,20 +934,64 @@ function newKeyProblem(v) {
   return "";
 }
 
+/** Resolves {ok:true} or {ok:false,status,error}. status 0 = network. */
+async function verifyGalleryKey(slug, key) {
+  let res;
+  try {
+    res = await fetch("/api/galleries/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
+      body: JSON.stringify({ slug }),
+    });
+  } catch (_) {
+    return { ok: false, status: 0, error: "Could not check the key. Check your connection and try again." };
+  }
+  if (res.ok) return { ok: true };
+  if (res.status === 403) return { ok: false, status: 403, error: "That key does not open this gallery." };
+  if (res.status === 429) return { ok: false, status: 429, error: "Too many attempts. Wait a minute and try again." };
+  let msg = res.statusText;
+  try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
+  return { ok: false, status: res.status, error: "Could not check the key: " + msg };
+}
+
+/** Return a key the server accepts for `slug`; prompt and verify when needed. */
+async function askKeyForGallery(slug, help) {
+  let promptHelp = help;
+  if (galleryKey) {
+    const check = await verifyGalleryKey(slug, galleryKey);
+    if (check.ok) return galleryKey;
+    if (check.status === 429) {
+      uploadStatus.textContent = check.error;
+      return "";
+    }
+    // A failed network check keeps the cached key: the action itself will
+    // report the real error rather than throwing the key away.
+    if (check.status !== 403) return galleryKey;
+    // The key may own another gallery; keep it until this prompt accepts one.
+    promptHelp = "The saved key does not open this gallery. " + help;
+  }
+  return needKey(true, "enter", {
+    help: promptHelp,
+    validate: async (key) => (await verifyGalleryKey(slug, key)).error || "",
+  });
+}
+
 /** Resolve the gallery key: memory/session, else prompt once.
     Landing page (no slug) always prompts: returning here means a new gallery. */
 let keyMode = "enter";
-function needKey(forcePrompt, mode = "enter") {
+function needKey(forcePrompt, mode = "enter", opts = {}) {
   if (!forcePrompt && galleryKey && galleryKey.length >= 6) {
     return Promise.resolve(galleryKey);
   }
   resetKeyDialog();
   keyMode = mode;
+  keyValidator = opts.validate || null;
   const create = mode === "create";
-  document.getElementById("key-title").textContent = create ? "New gallery key" : "Gallery key";
-  keyHelp.textContent = create
-    ? "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery."
-    : "Enter the key for this gallery.";
+  document.getElementById("key-title").textContent =
+    opts.title || (create ? "New gallery key" : "Gallery key");
+  keyHelp.textContent = opts.help || (create
+    ? "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery. Using the same key on the home page starts a new gallery, never an existing one."
+    : "Enter the owner key for this gallery.");
   keyInput.value = "";
   keyError.textContent = "";
   keyDialog.showModal();
@@ -810,6 +1001,7 @@ function needKey(forcePrompt, mode = "enter") {
 
 function resetKeyDialog() {
   invitePrompt = false;
+  keyValidator = null;
 }
 
 let passResolver = null;
@@ -878,36 +1070,60 @@ function needInvite() {
   return new Promise((resolve) => { keyResolver = resolve; });
 }
 
-keyForm.addEventListener("submit", (e) => {
+keyForm.addEventListener("submit", async (e) => {
+  // The dialog closes only on success, so a failed owner-key check can show
+  // its error in place.
+  e.preventDefault();
+  keyError.textContent = "";
   const v = keyInput.value.trim();
   if (invitePrompt) {
     if (!/^[\x21-\x7e]{1,128}$/.test(v)) {
-      e.preventDefault();
       keyError.textContent = !v ? "Invite code required" : "Invite code must be ASCII (no spaces/accents)";
       keyInput.focus();
       return;
     }
     inviteCode = v;
     resetKeyDialog();
-    if (keyResolver) keyResolver(v);
+    const resolve = keyResolver;
     keyResolver = null;
+    keyDialog.close();
+    if (resolve) resolve(v);
     return;
   }
   // Strong rules only for keys we create; an existing key just has to be one.
   const problem = keyMode === "create" ? newKeyProblem(v) : (!/^[\x21-\x7e]{6,128}$/.test(v) ? "Key must be 6-128 ASCII characters (no spaces/accents)" : "");
   if (problem) {
-    e.preventDefault(); // keep the dialog open (Esc still cancels)
     keyError.textContent = problem;
     keyInput.focus();
     return;
   }
+  if (keyValidator) {
+    keyConfirm.disabled = true;
+    let check = "";
+    try {
+      check = await keyValidator(v);
+    } catch (_) {
+      check = "Could not check the key. Try again.";
+    } finally {
+      keyConfirm.disabled = false;
+    }
+    if (!keyDialog.open) return; // cancelled while the check ran
+    if (check) {
+      keyError.textContent = check;
+      keyInput.focus();
+      return;
+    }
+  }
   galleryKey = v;
   try { sessionStorage.setItem("gallery-key", v); } catch (_) { /* private mode */ }
   resetKeyDialog();
-  if (keyResolver) keyResolver(v);
+  const resolve = keyResolver;
   keyResolver = null;
+  keyDialog.close();
+  if (resolve) resolve(v);
 });
-// Dialog closed via Esc: treat as cancel.
+document.getElementById("key-cancel").addEventListener("click", () => keyDialog.close());
+// Dialog closed via Esc or Cancel: treat as cancel.
 keyDialog.addEventListener("close", () => {
   if (keyResolver) keyResolver("");
   keyResolver = null;
@@ -941,6 +1157,10 @@ fileInput.addEventListener("change", async () => {
   const files = Array.from(fileInput.files);
   fileInput.value = "";
   if (!files.length) return;
+  if (uploading) {
+    uploadStatus.textContent = "Upload already in progress.";
+    return;
+  }
   const failures = [];
   // Reject before minting: a batch that stores nothing must not leave an
   // empty gallery behind.
@@ -960,7 +1180,9 @@ fileInput.addEventListener("change", async () => {
     uploadStatus.textContent = failures.join("; ");
     return;
   }
-  const key = await needKey(!pageSlug, pageSlug ? "enter" : "create");
+  const key = pageSlug
+    ? await askKeyForGallery(pageSlug, "Enter the owner key for this gallery to upload.")
+    : await needKey(true, "create");
   if (!key) return;
   // One gallery per batch, picked before the first byte: if one upload's
   // reply is lost, the next file must not mint a second gallery that the
@@ -971,6 +1193,8 @@ fileInput.addEventListener("change", async () => {
     return;
   }
   let stored = 0;
+  let started = 0;
+  const total = accepted.length;
   const headersBase = { "X-Gallery-Key": key, "X-Gallery-Slug": target };
   /**
    * One sequential chunk loop per file, keyed by a stable upload id: a lost
@@ -1031,6 +1255,8 @@ fileInput.addEventListener("change", async () => {
     for (;;) {
       const file = accepted.shift();
       if (!file) return;
+      started += 1;
+      uploadStatus.textContent = "Uploading " + started + " of " + total + " — " + file.name;
       const res = await putFile(file, headersBase);
       if (!res) {
         failures.push(file.name + ": upload failed");
@@ -1050,22 +1276,32 @@ fileInput.addEventListener("change", async () => {
   }
   // The server allows 4 concurrent uploads per IP; 3 leaves room for the
   // listing request that follows the batch.
-  await Promise.all(Array.from({ length: Math.min(3, accepted.length) }, uploadWorker));
-  if (pageSlug) {
-    // Gallery page: show the new tiles without a manual reload.
-    await loadPhotos(true);
-    uploadStatus.textContent = failures.length ? failures.join("; ") : "";
-    return;
+  uploading = true;
+  uploadBtn.disabled = true;
+  uploadStatus.textContent = "Uploading 0 of " + total + "…";
+  try {
+    await Promise.all(Array.from({ length: Math.min(3, accepted.length) }, uploadWorker));
+    if (pageSlug) {
+      // Gallery page: show the new tiles without a manual reload.
+      await loadPhotos(true);
+      uploadStatus.textContent = failures.length
+        ? (stored ? "Uploaded " + stored + " of " + total + ". " : "") + failures.join("; ")
+        : "Uploaded " + stored + (stored === 1 ? " photo." : " photos.");
+      return;
+    }
+    if (!stored) {
+      // Nothing landed: stay put so the errors stay visible.
+      uploadStatus.textContent = failures.join("; ") || "Upload failed.";
+      return;
+    }
+    // Carry the key to the next page so the banner can show it once (the field
+    // itself is never prefilled again).
+    try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
+    location.assign("/" + target);
+  } finally {
+    uploading = false;
+    uploadBtn.disabled = false;
   }
-  if (!stored) {
-    // Nothing landed: stay put so the errors stay visible.
-    uploadStatus.textContent = failures.join("; ") || "upload failed";
-    return;
-  }
-  // Carry the key to the next page so the banner can show it once (the field
-  // itself is never prefilled again).
-  try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
-  location.assign("/" + target);
 });
 
 themeBtn.addEventListener("click", () => {

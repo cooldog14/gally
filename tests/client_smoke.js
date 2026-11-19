@@ -19,13 +19,17 @@ const PNG = Buffer.from(
 );
 
 const START_HIDDEN = new Set([
+  "copy-link-btn",
   "edit-btn",
   "editbar",
   "empty",
   "file-input",
+  "gallery-state",
+  "home-link",
   "key-banner",
   "lightbox",
   "load-more",
+  "setpass-private",
   "setpass-remove",
 ]);
 
@@ -70,6 +74,7 @@ class El {
     this.listeners = new Map();
     this.classList = new ClassList();
     this.dataset = {};
+    this.style = {};
     this.attributes = {};
     this.text = "";
     this.hidden = false;
@@ -175,16 +180,18 @@ class El {
     this.dispatch("close", { type: "close" });
   }
   focus() {}
+  select() { this.selected = true; }
 }
 
-function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null } = {}) {
+function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, clipboardApi = true } = {}) {
   const els = new Map();
   const calls = [];
   const docListeners = new Map();
   const session = store || new Map();
   let randomCalls = 0;
   const local = new Map();
-  const page = { calls, els, session, local, location: null, document: null };
+  const clipboard = [];
+  const page = { calls, els, session, local, clipboard, location: null, document: null };
 
   const location = {
     pathname,
@@ -248,6 +255,9 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
   const context = {
     document,
     window: { innerHeight: 600, addEventListener() {} },
+    navigator: clipboardApi
+      ? { clipboard: { writeText: async (text) => { clipboard.push(String(text)); } } }
+      : {},
     sessionStorage: storage(session),
     localStorage: storage(local),
     location,
@@ -284,6 +294,18 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
   }
 
   page.fire = fire;
+  // For a handler that opens a dialog and waits for the user: start it and
+  // let the test drive the dialog. Awaiting would deadlock.
+  page.start = (id, event = {}) => {
+    const target = els.get(id);
+    assert(target, "no element #" + id);
+    const type = event.type || "click";
+    assert((target.listeners.get(type) || []).length > 0, "no handler registered for #" + id);
+    target.dispatch(type, event).catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+  };
   page.fireEl = (target, type = "click", event = {}) => target.dispatch(type, event);
   page.fireDocument = async (type, event) => {
     const e = { type, preventDefault() {}, ...event };
@@ -404,6 +426,10 @@ async function workflowUpload() {
   await waitFor(() => gallery.els.get("grid").children.length === 2, "2 tiles after navigation");
   assert.strictEqual(gallery.els.get("key-banner").hidden, false);
   assert.strictEqual(gallery.els.get("key-banner-key").textContent, key);
+  assert.strictEqual(gallery.els.get("gallery-state").textContent, "Private", "private state is visible");
+  assert.match(gallery.els.get("key-banner-hint").textContent, /private/);
+  await gallery.fire("key-banner-copy");
+  assert.deepStrictEqual(gallery.clipboard, [key], "Copy key copies the key");
   await gallery.fire("key-banner-close");
   assert.strictEqual(gallery.els.get("key-banner").hidden, true, "banner dismisses");
   assert.strictEqual(gallery.els.get("gallery-label").textContent, slug);
@@ -428,6 +454,7 @@ async function workflowEdit() {
 
   const page = makePage({ pathname: "/" + slug, key });
   await waitFor(() => page.els.get("grid").children.length === 3, "3 tiles");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private gallery state");
   const tiles = () => page.els.get("grid").children;
   const sel = () => page.els.get("sel-count").textContent;
 
@@ -435,6 +462,10 @@ async function workflowEdit() {
   assert.strictEqual(page.els.get("editbar").hidden, false, "edit bar opens");
   assert.strictEqual(page.els.get("upload-btn").hidden, true, "upload hidden while editing");
   assert.strictEqual(page.els.get("edit-btn").textContent, "Editing…");
+  await page.fire("show-key-btn");
+  assert.strictEqual(page.els.get("key-banner").hidden, false, "Show key reveals the banner");
+  assert.strictEqual(page.els.get("key-banner-key").textContent, key);
+  await page.fire("key-banner-close");
 
   await page.fireEl(tiles()[0]);
   assert.strictEqual(sel(), "1 selected");
@@ -448,11 +479,13 @@ async function workflowEdit() {
   page.els.get("public-check").checked = true;
   await page.fire("public-check", { type: "change" });
   assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is public");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Public", "public state updates");
   assert.strictEqual(await galleryStatus(slug), 200, "public gallery lists anonymously");
 
   page.els.get("public-check").checked = false;
   await page.fire("public-check", { type: "change" });
   assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is private");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private state updates");
   assert.strictEqual(await galleryStatus(slug), 404, "private gallery hides");
 
   page.els.get("public-check").checked = true;
@@ -464,12 +497,14 @@ async function workflowEdit() {
   page.els.get("setpass-input").value = "Viewer-Pass-9";
   await page.fire("setpass-form", { type: "submit", submitter: { value: "default" } });
   assert.strictEqual(page.els.get("upload-status").textContent, "Gallery protected.");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Public · Protected", "protected state");
   assert.strictEqual(await galleryStatus(slug), 401, "protected gallery asks for the password");
 
   await page.fire("lock-btn");
   assert.strictEqual(page.els.get("setpass-remove").hidden, false, "locked gallery offers Remove");
   await page.fire("setpass-form", { type: "submit", submitter: { value: "remove" } });
   assert.strictEqual(page.els.get("upload-status").textContent, "Protection removed.");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Public", "state after unlock");
   assert.strictEqual(await galleryStatus(slug), 200);
 
   await page.fire("lock-btn");
@@ -560,17 +595,17 @@ async function workflowView() {
   assert.strictEqual(page.document.documentElement.dataset.theme, "light");
 
   // Edit without a stored key: the key dialog prompts, Esc cancels.
-  await page.fire("edit-btn");
+  page.start("edit-btn");
   await waitFor(() => page.els.get("key-dialog").open, "key prompt for editing");
   assert.match(page.els.get("key-title").textContent, /Gallery key/);
   page.els.get("key-dialog").close();
   await tick();
   assert.strictEqual(page.els.get("editbar").hidden, true, "cancelled edit stays closed");
 
-  await page.fire("edit-btn");
+  page.start("edit-btn");
   await waitFor(() => page.els.get("key-dialog").open, "key prompt for editing");
   await submitKey(page, key);
-  assert.strictEqual(page.els.get("editbar").hidden, false, "owner key opens edit mode");
+  await waitFor(() => page.els.get("editbar").hidden === false, "owner key opens edit mode");
   await page.fire("done-btn");
 
   // Locked gallery: pass dialog cancel, then unlock with the password.
@@ -582,6 +617,7 @@ async function workflowView() {
     () => locked.els.get("empty").textContent === "This gallery is locked.",
     "locked gallery message"
   );
+  assert.strictEqual(locked.els.get("gallery-state").textContent, "Public · Protected", "locked state");
   assert.strictEqual(locked.els.get("grid").children.length, 0);
 
   const unlocking = makePage({ pathname: "/" + slug });
@@ -590,12 +626,18 @@ async function workflowView() {
   await unlocking.fire("pass-form", { type: "submit", submitter: { value: "unlock" } });
   await waitFor(() => unlocking.els.get("grid").children.length === 200, "unlocked listing");
 
-  // Private gallery without a key: prompt, then cancel back home.
+  // Private gallery without a key: prompt, cancel, stay on an explained page.
   await publish(slug, key, false);
   const hidden = makePage({ pathname: "/" + slug });
   await waitFor(() => hidden.els.get("key-dialog").open, "key prompt on a private gallery");
-  hidden.els.get("key-dialog").close();
-  await waitFor(() => hidden.location.assigned === "/", "cancel returns home");
+  await hidden.fire("key-cancel");
+  await waitFor(
+    () => /private or does not exist/.test(hidden.els.get("empty").textContent),
+    "unavailable message"
+  );
+  assert.strictEqual(hidden.location.assigned, "", "cancel does not redirect");
+  assert.strictEqual(hidden.els.get("edit-btn").hidden, true, "edit hidden when unavailable");
+  assert.strictEqual(hidden.els.get("home-link").hidden, false, "home link remains");
 }
 
 // --- legacy stub-DOM checks ---
@@ -936,11 +978,130 @@ async function testUploadResumesFromServerOffset() {
   assert.strictEqual(page.location.assigned, "/" + SLUG);
 }
 
+async function testLandingExplainsKeys() {
+  const page = makePage({ pathname: "/" });
+  await tick();
+  assert.match(
+    page.els.get("empty").textContent,
+    /Upload photos to start a new private gallery/,
+    "landing explains what to do"
+  );
+  assert.strictEqual(page.els.get("gallery-state").hidden, true, "no state on the landing");
+  assert.strictEqual(page.els.get("copy-link-btn").hidden, true, "no link to copy on the landing");
+}
+
+async function testPrivateProtectWarns() {
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    listing: { slug: SLUG, public: false, locked: false, photos: [] },
+    handler: (url) => {
+      if (url.endsWith("/visibility")) {
+        return {
+          status: 200,
+          ok: true,
+          statusText: "status 200",
+          json: async () => ({ slug: SLUG, public: true }),
+        };
+      }
+      throw new Error("unexpected request " + url);
+    },
+  });
+  await tick();
+  await page.fire("lock-btn");
+  assert.strictEqual(page.els.get("setpass-dialog").open, true);
+  assert.match(page.els.get("setpass-help").textContent, /private/, "warns that a private lock is unreachable");
+  assert.strictEqual(page.els.get("setpass-private").hidden, false, "offers Make public");
+
+  await page.fire("setpass-public");
+  assert.strictEqual(page.els.get("setpass-private").hidden, true, "Make public hides its own row");
+  assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is public");
+  assert.strictEqual(page.els.get("public-check").checked, true, "checkbox follows the publish");
+  assert.match(
+    page.els.get("setpass-help").textContent,
+    /Enter a password below/,
+    "no password is claimed before one is set"
+  );
+}
+
+async function testWrongCachedKeyReprompts() {
+  const wrong = "Wrong-Key-123";
+  const right = "Right-Key-789";
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: wrong,
+    listing: { slug: SLUG, public: true, locked: false, photos: [] },
+    handler: (url, opts) => {
+      if (url === "/api/galleries/resolve") {
+        if (opts.headers["X-Gallery-Key"] === right) {
+          return { status: 200, ok: true, statusText: "status 200", json: async () => ({ slug: SLUG }) };
+        }
+        return {
+          status: 403,
+          ok: false,
+          statusText: "status 403",
+          json: async () => ({ error: "forbidden" }),
+        };
+      }
+      throw new Error("unexpected request " + url);
+    },
+  });
+  await tick();
+  page.start("edit-btn");
+  await waitFor(() => page.els.get("key-dialog").open, "wrong cached key prompts");
+  assert.match(page.els.get("key-help").textContent, /saved key does not open/);
+  assert.strictEqual(page.session.get("gallery-key"), wrong, "cached key survives until replaced");
+  await submitKey(page, right);
+  await waitFor(() => page.els.get("editbar").hidden === false, "correct key opens edit");
+  assert.strictEqual(page.session.get("gallery-key"), right);
+}
+
+async function testCopyFallbackWithoutClipboard() {
+  const page = makePage({ clipboardApi: false });
+  await tick();
+  let copied = "";
+  page.document.execCommand = (cmd) => {
+    const area = page.document.body.children[page.document.body.children.length - 1];
+    copied = cmd === "copy" && area ? area.value : "";
+    return cmd === "copy";
+  };
+  page.els.get("key-banner").hidden = false;
+  page.els.get("key-banner-key").textContent = "Sunset-Beach-42";
+  await page.fire("key-banner-copy");
+  assert.strictEqual(copied, "Sunset-Beach-42", "fallback copies the key");
+  assert.strictEqual(page.els.get("key-banner-copy").textContent, "Copied");
+  assert.deepStrictEqual(page.clipboard, [], "clipboard API not used");
+
+  page.location.href = "https://gal.example/velvet-lagoon-quiet-river-1a2b";
+  page.els.get("copy-link-btn").hidden = false;
+  await page.fire("copy-link-btn");
+  assert.strictEqual(copied, page.location.href, "copy link uses the same fallback");
+  assert.strictEqual(page.els.get("copy-link-btn").textContent, "Copied");
+}
+
+async function testPrivateGalleryKeyOpens() {
+  const key = "Sunset-Beach-42";
+  const slug = await mint(key);
+  await upload(slug, key, "hidden.png", PNG, "image/png");
+  await publish(slug, key, false);
+  const page = makePage({ pathname: "/" + slug });
+  await waitFor(() => page.els.get("key-dialog").open, "key prompt on a private gallery");
+  await submitKey(page, key);
+  await waitFor(() => page.els.get("grid").children.length === 1, "private gallery lists with the key");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private state after the key");
+  assert.strictEqual(page.els.get("empty").hidden, true, "photos replace the unavailable message");
+  assert.strictEqual(page.session.get("gallery-key"), key, "accepted key is stored");
+}
+
 (async () => {
   await testButtonsWithStoredKey();
   await testProtectReflectsLock();
   await testNoHeicNeverLoadsDecoder();
   await testHeicFetchesOnlyWhenVisible();
+  await testLandingExplainsKeys();
+  await testPrivateProtectWarns();
+  await testWrongCachedKeyReprompts();
+  await testCopyFallbackWithoutClipboard();
   await testHomeUploadUsesOneSlug();
   await testLostReplyDoesNotMintAgain();
   await testUploadRetriesLostChunk();
@@ -952,6 +1113,7 @@ async function testUploadResumesFromServerOffset() {
     await workflowUpload();
     await workflowEdit();
     await workflowView();
+    await testPrivateGalleryKeyOpens();
   } else {
     console.log("client smoke: live workflows skipped (GALLY_BASE_URL unset)");
   }

@@ -1,10 +1,12 @@
 # Gally
 
-Small, self-hosted gallery for sharing photos. A gallery is identified by a key
-you choose, not an account: anyone with the key can upload, edit, publish,
-protect, or delete that gallery. The URL carries a generated public slug; the
-key is the secret you type. New galleries are **private by default**. There are
-no accounts, email, tracking, or key/password recovery.
+Small, self-hosted gallery for sharing photos. A gallery is identified by its
+URL; the owner key proves ownership of that gallery. Anyone with the key and
+the URL can upload, edit, publish, protect, or delete it. The URL carries a
+generated public slug; the key is the secret you type. Using the same key
+again starts a new gallery, never opens an existing one. New galleries are
+**private by default**. There are no accounts, email, tracking, or key/password
+recovery.
 
 - `cargo run --release` gives you a local demo.
 - The supported deployment is `compose.yaml`: one non-root image plus a daily
@@ -17,18 +19,22 @@ no accounts, email, tracking, or key/password recovery.
 cargo run --release
 ```
 
-Open <http://127.0.0.1:8000> and enter a key:
+Open <http://127.0.0.1:8000> and click **Upload**. The first upload asks for a
+new gallery key: at least 12 characters, with a capital letter and a symbol
+(for example `Sunset-Beach-42`). Save it; it is the only way to edit that
+gallery.
 
-- Existing key: 6–128 ASCII characters, no spaces or accents.
-- New key: at least 12 characters, with a capital letter and a symbol (for
-  example `Sunset-Beach-42`).
-
-The four-word string in the URL after the first upload (for example
+A key is not a gallery name. Every upload from the home page starts a **new**
+gallery with a new URL, even when you reuse the same key; a key alone never
+opens another gallery. To open an existing gallery, use its link; enter its
+key (6–128 ASCII characters, no spaces or accents) when prompted. The
+four-word string in the URL after the first upload (for example
 `/brave-vole-juniper-badger-88e9`) is the generated gallery slug, not the key.
-The key banner shows what you typed; save it, because it is the only way to
-edit that gallery. New galleries stay private until the owner ticks **Public**
-in edit mode. `ADMIN_PASS` and `GALLY_INVITE_CODE` are unset by default, so
-admin and the invite gate are off.
+The key banner has **Copy key**; edit mode has **Show key** if you dismissed
+it. New galleries stay private until the owner ticks **Public** in edit mode;
+a viewer password only gates a public gallery. `ADMIN_PASS` and
+`GALLY_INVITE_CODE` are unset by default, so admin and the invite gate are
+off.
 
 The app writes `galleries.db` and `photos/` under the working directory; set
 `GALLY_ROOT=/path` to move them. The local run is plain HTTP with secure
