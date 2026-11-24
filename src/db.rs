@@ -158,6 +158,8 @@ pub enum StoreUpload {
 /// Recount `galleries.bytes`/`.photos` from the files on disk. Runs at
 /// startup: repairs counters after a crash. A directory we cannot read aborts
 /// the rebuild before the transaction, leaving the previous listing intact.
+/// A directory that contains none of the indexed files also aborts: that is a
+/// missing mount or wrong restore, not a normal one-file delete.
 pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::collections::HashMap;
@@ -176,11 +178,17 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
     // The listing table is a projection of the directory: rebuild it, not
     // just the counters, so a crashed install gets its rows back.
     let mut files: Vec<(String, String, i64, i64)> = Vec::new();
+    let mut found_existing = 0usize;
     let rd = std::fs::read_dir(photos_dir)
         .with_context(|| format!("read photos dir {}", photos_dir.display()))?;
     for ent in rd {
         let ent = ent.with_context(|| format!("read photos dir {}", photos_dir.display()))?;
         let name = ent.file_name().to_string_lossy().into_owned();
+        // Count by name before the photo-name validator: an old or unusual
+        // name still proves the directory is not empty or wrongly mounted.
+        if existing.contains_key(&name) {
+            found_existing += 1;
+        }
         let Some(slug) = crate::validate::photo_slug(&name) else {
             continue;
         };
@@ -206,6 +214,13 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
         let e = counts.entry(slug).or_default();
         e.0 += md.len() as i64;
         e.1 += 1;
+    }
+    if !existing.is_empty() && found_existing == 0 {
+        anyhow::bail!(
+            "photos directory {} contains none of the {} photos in the index; refusing to rebuild an empty index (restore the files, or move galleries.db and photos/ aside to reset)",
+            photos_dir.display(),
+            existing.len()
+        );
     }
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM photos", [])?;
@@ -264,15 +279,17 @@ pub fn backfill_exif(conn: &mut Connection, photos_dir: &Path) -> rusqlite::Resu
 
 pub trait GalleryDb {
     /// Scoped auth: does this key own this slug? Same key may own many slugs.
-    fn key_owns_slug(&self, key: &str, slug: &str) -> bool;
+    /// Errors are DB failures, not a denial.
+    fn key_owns_slug(&self, key: &str, slug: &str) -> rusqlite::Result<bool>;
     /// Home upload: always mint a fresh gallery. `None` on DB failure.
     fn get_or_create_gallery(&mut self, key: &str) -> Option<String>;
     /// Does this gallery exist? DB failures are errors, not "missing".
     fn gallery_exists(&self, slug: &str) -> rusqlite::Result<bool>;
     /// Visibility + usage counters; `Ok(None)` when the slug is unknown.
     fn gallery_meta(&self, slug: &str) -> rusqlite::Result<Option<GalleryMeta>>;
-    /// Publish (true) or hide (false) the whole gallery. False when unknown.
-    fn set_public(&mut self, slug: &str, public: bool) -> bool;
+    /// Publish (true) or hide (false) the whole gallery. `Ok(false)` when
+    /// unknown; errors are DB failures.
+    fn set_public(&mut self, slug: &str, public: bool) -> rusqlite::Result<bool>;
     /// Record one stored file in the listing table and the counters, one
     /// transaction: `(bytes, photos)` after. `Ok(None)` when the gallery
     /// vanished; errors are DB failures, not a missing gallery.
@@ -301,8 +318,8 @@ pub trait GalleryDb {
         bytes: u64,
     ) -> rusqlite::Result<Option<(i64, i64)>>;
     /// Delete the gallery row and every `photos` row for it, one transaction.
-    /// The key keeps working.
-    fn remove_gallery(&mut self, slug: &str) -> bool;
+    /// `Ok(false)` when unknown; errors are DB failures. The key keeps working.
+    fn remove_gallery(&mut self, slug: &str) -> rusqlite::Result<bool>;
     /// One page, newest first. `before` is the `(created, name)` cursor.
     /// Returns `(created, name)` pairs.
     fn photos_page(
@@ -317,20 +334,22 @@ pub trait GalleryDb {
     fn upload_name(&self, slug: &str, prefix: &str) -> rusqlite::Result<Option<String>>;
     /// Visibility, password hash, and viewer-cookie generation from one row.
     fn gallery_access(&self, slug: &str) -> rusqlite::Result<Option<GalleryAccess>>;
-    /// Set (Some) or clear (None) the gallery password. False when unknown.
-    /// Also bumps `token_version`, revoking old viewer cookies.
-    fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> bool;
+    /// Set (Some) or clear (None) the gallery password. `Ok(false)` when
+    /// unknown; errors are DB failures. Also bumps `token_version`, revoking
+    /// old viewer cookies.
+    fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> rusqlite::Result<bool>;
 }
 
 impl GalleryDb for Connection {
-    fn key_owns_slug(&self, key: &str, slug: &str) -> bool {
+    fn key_owns_slug(&self, key: &str, slug: &str) -> rusqlite::Result<bool> {
         let d = key_hash(key);
         self.query_row(
             "SELECT 1 FROM galleries WHERE slug = ?1 AND key_hash = ?2",
             rusqlite::params![slug, d],
             |_| Ok(()),
         )
-        .is_ok()
+        .optional()
+        .map(|row| row.is_some())
     }
 
     /// Home upload: always mint a fresh gallery, never reuse.
@@ -377,13 +396,12 @@ impl GalleryDb for Connection {
         .optional()
     }
 
-    fn set_public(&mut self, slug: &str, public: bool) -> bool {
+    fn set_public(&mut self, slug: &str, public: bool) -> rusqlite::Result<bool> {
         self.execute(
             "UPDATE galleries SET public = ?1 WHERE slug = ?2",
             rusqlite::params![public as i64, slug],
         )
         .map(|n| n > 0)
-        .unwrap_or(false)
     }
 
     fn add_upload(
@@ -469,15 +487,12 @@ impl GalleryDb for Connection {
         Ok(out)
     }
 
-    fn remove_gallery(&mut self, slug: &str) -> bool {
-        let Ok(tx) = self.transaction() else {
-            return false;
-        };
-        let _ = tx.execute("DELETE FROM photos WHERE slug = ?1", [slug]);
-        let n = tx
-            .execute("DELETE FROM galleries WHERE slug = ?1", [slug])
-            .unwrap_or(0);
-        tx.commit().map(|_| n > 0).unwrap_or(false)
+    fn remove_gallery(&mut self, slug: &str) -> rusqlite::Result<bool> {
+        let tx = self.transaction()?;
+        tx.execute("DELETE FROM photos WHERE slug = ?1", [slug])?;
+        let n = tx.execute("DELETE FROM galleries WHERE slug = ?1", [slug])?;
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     fn photos_page(
@@ -543,13 +558,12 @@ impl GalleryDb for Connection {
         .optional()
     }
 
-    fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> bool {
+    fn set_gallery_pass(&mut self, slug: &str, hash: Option<&[u8]>) -> rusqlite::Result<bool> {
         self.execute(
             "UPDATE galleries SET pass_hash = ?1, token_version = token_version + 1 WHERE slug = ?2",
             rusqlite::params![hash, slug],
         )
         .map(|n| n > 0)
-        .unwrap_or(false)
     }
 }
 
@@ -571,13 +585,19 @@ mod tests {
             .get_or_create_gallery("test-gallery-key-01")
             .expect("create");
         assert!(db.gallery_exists(&slug).expect("exists"));
-        assert!(db.key_owns_slug("test-gallery-key-01", &slug));
+        assert!(
+            db.key_owns_slug("test-gallery-key-01", &slug)
+                .expect("owns")
+        );
         // Fresh mint each call: same key → new slug (home always creates).
         let slug2 = db
             .get_or_create_gallery("test-gallery-key-01")
             .expect("create");
         assert_ne!(slug, slug2);
-        assert!(db.key_owns_slug("test-gallery-key-01", &slug2));
+        assert!(
+            db.key_owns_slug("test-gallery-key-01", &slug2)
+                .expect("owns")
+        );
     }
 
     #[test]
@@ -588,6 +608,10 @@ mod tests {
         assert!(db.gallery_exists("quiet-river-calm-pond-1a2b").is_err());
         assert!(db.gallery_meta("quiet-river-calm-pond-1a2b").is_err());
         assert!(db.gallery_access("quiet-river-calm-pond-1a2b").is_err());
+        assert!(
+            db.key_owns_slug("quiet-river-calm-pond-1a2b", "quiet-river-calm-pond-1a2b")
+                .is_err()
+        );
     }
 
     #[test]
@@ -639,7 +663,7 @@ mod tests {
         }
         let mut db = open(&path).expect("open migrates pre-scoped-auth db");
         recount(&mut db, &dir).expect("recount after migration");
-        assert!(db.key_owns_slug(key, slug));
+        assert!(db.key_owns_slug(key, slug).expect("owns"));
         assert!(db.gallery_meta(slug).expect("query").expect("meta").public);
         assert!(
             db.get_or_create_gallery(key).is_some(),
@@ -662,7 +686,10 @@ mod tests {
         }
         let mut db = open(&path).expect("open migrates pre-token_version db");
         assert_eq!(db.gallery_access(slug).expect("access").unwrap().version, 0);
-        assert!(db.set_gallery_pass(slug, Some(&hash_password("Viewer-Pass-9"))));
+        assert!(
+            db.set_gallery_pass(slug, Some(&hash_password("Viewer-Pass-9")))
+                .expect("set pass")
+        );
         assert_eq!(
             db.gallery_access(slug).expect("access").unwrap().version,
             1,
@@ -699,15 +726,18 @@ mod tests {
     fn set_public_and_remove_gallery() {
         let mut db = mem();
         let slug = db.get_or_create_gallery("public-key-0001").expect("create");
-        assert!(db.set_public(&slug, true));
+        assert!(db.set_public(&slug, true).expect("set public"));
         assert!(db.gallery_meta(&slug).expect("query").expect("meta").public);
-        assert!(db.set_public(&slug, false));
+        assert!(db.set_public(&slug, false).expect("set private"));
         assert!(!db.gallery_meta(&slug).expect("query").expect("meta").public);
-        assert!(!db.set_public("no-such-gallery-aaaa", true));
+        assert!(
+            !db.set_public("no-such-gallery-aaaa", true)
+                .expect("unknown")
+        );
         // Removing one row leaves the key usable for a new gallery.
-        assert!(db.remove_gallery(&slug));
+        assert!(db.remove_gallery(&slug).expect("remove"));
         assert!(!db.gallery_exists(&slug).expect("exists"));
-        assert!(!db.remove_gallery(&slug));
+        assert!(!db.remove_gallery(&slug).expect("already gone"));
         assert!(db.get_or_create_gallery("public-key-0001").is_some());
     }
 
@@ -728,6 +758,38 @@ mod tests {
         assert!(format!("{err:#}").contains("read photos dir"), "{err:#}");
         // Nothing was deleted: the listing and counters are unchanged.
         assert!(db.photo_exists(&slug, "kept.jpg"));
+        assert_eq!(
+            db.gallery_meta(&slug).expect("query").expect("meta"),
+            GalleryMeta {
+                public: false,
+                bytes: 5,
+                photos: 1,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recount_refuses_to_wipe_the_index_when_photos_are_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("gally-db-recount-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        let mut db = open(&dir.join("g.db")).expect("open");
+        let slug = db
+            .get_or_create_gallery("recount-empty-key")
+            .expect("create");
+        let name = format!("{slug}_{}_missing.jpg", "a".repeat(32));
+        assert_eq!(db.add_upload(&slug, &name, 5, 500), Ok(Some((5, 1))));
+        // An empty photos dir with a non-empty index is a mount/restore error,
+        // not a normal delete: abort before the transaction wipes the rows.
+        let err = recount(&mut db, &photos).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("contains none of the 1 photos"),
+            "{err:#}"
+        );
+        assert!(db.photo_exists(&slug, &name), "the stale row is kept");
         assert_eq!(
             db.gallery_meta(&slug).expect("query").expect("meta"),
             GalleryMeta {

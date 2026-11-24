@@ -218,6 +218,7 @@ fn build_snapshot(
         [],
     )?;
     let mut copied = 0;
+    let mut indexed = 0;
     let mut missing = Vec::new();
     {
         let mut stmt = tx.prepare("SELECT slug, name, size FROM photos")?;
@@ -230,6 +231,7 @@ fn build_snapshot(
                 !name.contains(['/', '\\']) && crate::validate::photo_slug(name) == Some(slug),
                 "invalid photo name in snapshot"
             );
+            indexed += 1;
             if !copy_live_file(
                 &source_photos.join(name),
                 &photos.join(name),
@@ -244,6 +246,15 @@ fn build_snapshot(
                 copy_live_file(&live_thumbs.join(&name), &thumbs.join(&name), None)?;
             }
         }
+    }
+    // One deleted original is normal during a live delete. None of the
+    // indexed originals is a missing mount or wrong restore; do not overwrite
+    // the previous snapshot with an empty one.
+    if indexed > 0 && copied == 0 {
+        anyhow::bail!(
+            "none of the {indexed} indexed photos are present in {}; refusing to publish an empty snapshot",
+            source_photos.display()
+        );
     }
     for (slug, name, size) in &missing {
         tx.execute(
@@ -848,6 +859,45 @@ mod tests {
         fs::rename(&photos, tmp.path().join("photos-old")).unwrap();
         fs::create_dir(&photos).unwrap();
         assert!(!same_directory(&photos, &opened).unwrap());
+    }
+
+    #[test]
+    fn backup_refuses_to_publish_when_all_photos_are_missing() {
+        use crate::db::GalleryDb;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let photos = root.join("photos");
+        fs::create_dir_all(&photos).unwrap();
+        let mut db = crate::db::open(&root.join("galleries.db")).unwrap();
+        let slug = db.get_or_create_gallery("missing-backup-key").unwrap();
+        let name = format!("{slug}_{}_missing.jpg", "a".repeat(32));
+        fs::write(photos.join(&name), b"photo").unwrap();
+        db.add_upload(&slug, &name, 5, 1_000).unwrap();
+        crate::db::backfill_exif(&mut db, &photos).unwrap();
+        drop(db);
+
+        let dest = tmp.path().join("dest");
+        run(&root, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("photos").join(&name)).unwrap(), b"photo");
+
+        // The live index still names the photo, but the file is gone. A second
+        // run must fail and leave the first snapshot untouched.
+        fs::remove_file(photos.join(&name)).unwrap();
+        let err = run(&root, &dest).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("none of the 1 indexed photos"),
+            "{err:#}"
+        );
+        let snapshot = crate::db::open(&dest.join("galleries.db")).unwrap();
+        assert!(snapshot.photo_exists(&slug, &name));
+        assert_eq!(fs::read(dest.join("photos").join(&name)).unwrap(), b"photo");
+        assert!(
+            !fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(".gally-stage-")),
+            "failed stage must be cleaned"
+        );
     }
 
     #[test]

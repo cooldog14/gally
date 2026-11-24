@@ -414,6 +414,68 @@ async fn resolve_needs_invite_for_new_gallery() {
 }
 
 #[tokio::test]
+async fn invite_guesses_share_the_failure_bucket() {
+    let (state, _tmp) = test_state().await;
+    state
+        .invite
+        .lock()
+        .unwrap()
+        .replace("amber-fox-glade-ridge".to_string());
+
+    for _ in 0..10 {
+        let (status, _) = resolve(&state, KEY_B).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _) = resolve(&state, KEY_B).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The correct invite is checked before the bucket, so it still mints.
+    let r = post_json(
+        "/api/galleries/resolve",
+        &[invite_header("amber-fox-glade-ridge")],
+        &format!(r#"{{"key":{KEY_B:?}}}"#),
+    );
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn invite_guesses_share_the_bucket_on_home_uploads() {
+    let (state, _tmp) = test_state().await;
+    state
+        .invite
+        .lock()
+        .unwrap()
+        .replace("amber-fox-glade-ridge".to_string());
+    let put = |code: &str| {
+        request(
+            "PUT",
+            "/api/photos/gated.jpg",
+            &[
+                ("content-type", "image/jpeg"),
+                key_header(KEY_A),
+                invite_header(code),
+            ],
+            Body::from(jpeg()),
+        )
+    };
+
+    for _ in 0..10 {
+        let resp = router(state.clone()).oneshot(put("nope")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    let resp = router(state.clone()).oneshot(put("nope")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // The correct invite is checked before the bucket, so it still mints.
+    let resp = router(state)
+        .oneshot(put("amber-fox-glade-ridge"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn gallery_listing_empty_then_contains_upload() {
     let (state, _tmp) = test_state().await;
     let (_, v) = resolve(&state, KEY_A).await;
@@ -593,6 +655,29 @@ async fn put_any_extension_accepted() {
 }
 
 #[tokio::test]
+async fn full_body_stream_error_is_timeout_not_too_large() {
+    let (state, _tmp) = test_state().await;
+    // A full-body PUT has no Content-Range; a transport error is not a size
+    // error. The old code answered 413, which makes clients give up.
+    let body = Body::from_stream(futures::stream::once(async {
+        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ))
+    }));
+    let req = request("PUT", "/api/photos/x.jpg", &[key_header(KEY_A)], body);
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let galleries: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(galleries, 0, "the failed mint is rolled back");
+}
+
+#[tokio::test]
 async fn put_oversize_body_is_413() {
     // Limits are per-state now: no process-wide env to race with.
     let (state, _tmp) = test_state_with(Limits {
@@ -631,6 +716,66 @@ async fn delete_by_owner_succeeds() {
     let uri = format!("/photos/{name}");
     let resp = router(state).oneshot(get(&uri, &[])).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_photo_after_index_error_can_clear_stale_row() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let name = v["name"].as_str().unwrap().to_string();
+    let slug = v["slug"].as_str().unwrap().to_string();
+    // Make the file removal succeed and the index update fail.
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_photo_delete BEFORE DELETE ON photos
+             BEGIN SELECT RAISE(ABORT, 'test photo delete error'); END;",
+        )
+        .unwrap();
+    let delete = || {
+        request(
+            "DELETE",
+            &format!("/api/photos/{name}"),
+            &[key_header(KEY_A)],
+            Body::empty(),
+        )
+    };
+    let resp = router(state.clone()).oneshot(delete()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !state.dir.join(&name).exists(),
+        "the original was already removed"
+    );
+    assert!(
+        state.db.lock().unwrap().photo_exists(&slug, &name),
+        "the row survived the failed index update"
+    );
+
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_photo_delete")
+        .unwrap();
+    let resp = router(state.clone()).oneshot(delete()).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a retry clears the stale row"
+    );
+    let rows: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE name = ?1",
+            [&name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]
@@ -688,15 +833,18 @@ async fn lock_unlock_cycle() {
     );
     // Wrong password still 401.
     let resp = router(state.clone())
-        .oneshot(get(&format!("/api/galleries/{slug}/photos?pass=nope"), &[]))
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "nope")],
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    // Right password via query: 200.
+    // Right password via the header: 200.
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=s3cret-pass"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "s3cret-pass")],
         ))
         .await
         .unwrap();
@@ -716,6 +864,54 @@ async fn lock_unlock_cycle() {
     assert_eq!(resp.status(), StatusCode::OK);
     let resp = router(state)
         .oneshot(get(&format!("/api/galleries/{slug}/photos"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn query_pass_no_longer_unlocks_but_header_does() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "pic.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+    assert_eq!(publish(&state, &slug, true).await, StatusCode::OK);
+    let r = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"s3cret-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(r).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // The legacy query parameter is ignored: it is not a credential carrier.
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos?pass=s3cret-pass"),
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The header still unlocks.
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "s3cret-pass")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Same contract on the photo endpoint.
+    let photo = format!("/photos/{name}");
+    let resp = router(state.clone())
+        .oneshot(get(&format!("{photo}?pass=s3cret-pass"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = router(state)
+        .oneshot(get(&photo, &[("x-gallery-pass", "s3cret-pass")]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -805,8 +1001,8 @@ async fn unlock_sets_viewer_cookie_that_serves_media() {
     // Unlock through the listing: the 200 carries the viewer cookie.
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=s3cret-pass"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "s3cret-pass")],
         ))
         .await
         .unwrap();
@@ -873,8 +1069,8 @@ async fn viewer_cookie_is_bound_to_its_gallery() {
     }
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug_a}/photos?pass=only-a"),
-            &[],
+            &format!("/api/galleries/{slug_a}/photos"),
+            &[("x-gallery-pass", "only-a")],
         ))
         .await
         .unwrap();
@@ -921,8 +1117,8 @@ async fn viewer_cookie_is_revoked_when_password_changes() {
     // Unlock through the listing to mint a viewer cookie for the old password.
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=old-pass"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "old-pass")],
         ))
         .await
         .unwrap();
@@ -964,8 +1160,8 @@ async fn viewer_cookie_is_revoked_when_password_changes() {
     // The new password still unlocks.
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=new-pass"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "new-pass")],
         ))
         .await
         .unwrap();
@@ -1590,19 +1786,22 @@ async fn viewer_password_lockout_after_ten_failures() {
         router(state.clone()).oneshot(r).await.unwrap().status(),
         StatusCode::OK
     );
-    let uri = format!("/api/galleries/{slug}/photos?pass=nope");
+    let uri = format!("/api/galleries/{slug}/photos");
     for _ in 0..10 {
-        let resp = router(state.clone()).oneshot(get(&uri, &[])).await.unwrap();
+        let resp = router(state.clone())
+            .oneshot(get(&uri, &[("x-gallery-pass", "nope")]))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-    let resp = router(state.clone()).oneshot(get(&uri, &[])).await.unwrap();
+    let resp = router(state.clone())
+        .oneshot(get(&uri, &[("x-gallery-pass", "nope")]))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     // A correct password is not hashed (nor accepted) once the bucket is full.
     let resp = router(state.clone())
-        .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=s3cret-pass"),
-            &[],
-        ))
+        .oneshot(get(&uri, &[("x-gallery-pass", "s3cret-pass")]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1976,10 +2175,9 @@ async fn non_ascii_viewer_password_works() {
         router(state.clone()).oneshot(r).await.unwrap().status(),
         StatusCode::OK
     );
-    // Percent-encoded UTF-8 in query or header, and a raw UTF-8 header: all
-    // accepted (app.js sends the header percent-encoded).
+    // Percent-encoded UTF-8 and a raw UTF-8 header: both accepted (app.js
+    // sends the header percent-encoded).
     for req in [
-        get(&format!("/api/galleries/{slug}/photos?pass=p%C3%A4ss"), &[]),
         get(
             &format!("/api/galleries/{slug}/photos"),
             &[("x-gallery-pass", "p%C3%A4ss")],
@@ -1988,16 +2186,19 @@ async fn non_ascii_viewer_password_works() {
             &format!("/api/galleries/{slug}/photos"),
             &[("x-gallery-pass", "päss")],
         ),
-        get(&format!("/photos/{name}?pass=p%C3%A4ss"), &[]),
+        get(
+            &format!("/photos/{name}"),
+            &[("x-gallery-pass", "p%C3%A4ss")],
+        ),
     ] {
         let resp = router(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    // Invalid UTF-8 in the query cannot match.
+    // Percent-encoded invalid UTF-8 cannot match.
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=%FF%FE"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "%FF%FE")],
         ))
         .await
         .unwrap();
@@ -2553,6 +2754,63 @@ async fn resolve_with_header_key_and_body_slug_resolves() {
 }
 
 #[tokio::test]
+async fn resolve_requires_json_content_type_when_body_present() {
+    let (state, _tmp) = test_state().await;
+    let body = format!(r#"{{"key":{KEY_A:?}}}"#);
+    let len = body.len().to_string();
+    let r = request(
+        "POST",
+        "/api/galleries/resolve",
+        &[
+            ("content-type", "text/plain"),
+            ("content-length", len.as_str()),
+            key_header(KEY_A),
+        ],
+        Body::from(body),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let galleries: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(galleries, 0, "415 must not mint a gallery");
+
+    // Media type is case-insensitive and parameters are ignored.
+    let body = format!(r#"{{"key":{KEY_A:?}}}"#);
+    let len = body.len().to_string();
+    let r = request(
+        "POST",
+        "/api/galleries/resolve",
+        &[
+            ("content-type", "Application/JSON; charset=utf-8"),
+            ("content-length", len.as_str()),
+            key_header(KEY_A),
+        ],
+        Body::from(body),
+    );
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn bodyless_resolve_with_key_header_still_mints() {
+    let (state, _tmp) = test_state().await;
+    let r = request(
+        "POST",
+        "/api/galleries/resolve",
+        &[key_header(KEY_A)],
+        Body::empty(),
+    );
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body["slug"].as_str().is_some_and(is_slug));
+}
+
+#[tokio::test]
 async fn invalid_slug_header_is_400_not_mint() {
     let (state, _tmp) = test_state().await;
     let (status, _) = put_photo(&state, "x.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
@@ -2791,7 +3049,7 @@ async fn public_listing_with_incidental_key_burns_nothing() {
         StatusCode::OK
     );
     let resp = router(state.clone())
-        .oneshot(get(&format!("{uri}?pass=nope"), &[]))
+        .oneshot(get(&uri, &[("x-gallery-pass", "nope")]))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2820,6 +3078,199 @@ async fn healthz_503_when_min_free_unmet() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let v = body_json(resp).await;
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
+}
+
+#[tokio::test]
+async fn healthz_fails_closed_when_schema_is_broken() {
+    let (state, _tmp) = test_state_with(Limits {
+        min_free: 0,
+        ..Limits::defaults()
+    })
+    .await;
+    let resp = router(state.clone())
+        .oneshot(get("/healthz", &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TABLE photos; DROP TABLE galleries;")
+        .unwrap();
+    let resp = router(state).oneshot(get("/healthz", &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(resp).await["ok"], serde_json::Value::Bool(false));
+}
+
+#[tokio::test]
+async fn healthz_fails_closed_when_photos_table_is_missing() {
+    let (state, _tmp) = test_state_with(Limits {
+        min_free: 0,
+        ..Limits::defaults()
+    })
+    .await;
+    let resp = router(state.clone())
+        .oneshot(get("/healthz", &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TABLE photos;")
+        .unwrap();
+    let resp = router(state).oneshot(get("/healthz", &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(resp).await["ok"], serde_json::Value::Bool(false));
+}
+
+#[tokio::test]
+async fn malformed_resolve_body_is_400_and_mints_nothing() {
+    let (state, _tmp) = test_state().await;
+    for body in [
+        "{bad",
+        "null",
+        "[]",
+        "42",
+        r#"{"slug":5}"#,
+        r#"{"slug":null}"#,
+        r#"{"slug":""}"#,
+        r#"{"slug":"   "}"#,
+        r#"{"key":5}"#,
+        r#"{"key":null}"#,
+    ] {
+        let r = request(
+            "POST",
+            "/api/galleries/resolve",
+            &[("content-type", "application/json"), key_header(KEY_A)],
+            Body::from(body),
+        );
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let count: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM galleries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "a malformed resolve never mints");
+    // A whitespace-only body is the bodyless form and may mint.
+    let r = request(
+        "POST",
+        "/api/galleries/resolve",
+        &[("content-type", "application/json"), key_header(KEY_A)],
+        Body::from("   "),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // An empty body is still the documented bodyless form and may mint.
+    let r = request(
+        "POST",
+        "/api/galleries/resolve",
+        &[key_header(KEY_A)],
+        Body::empty(),
+    );
+    let resp = router(state).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn db_failures_on_auth_and_writes_are_500() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = put_photo(&state, "a.jpg", Some(KEY_A), None, "image/jpeg", jpeg()).await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    let name = v["name"].as_str().unwrap().to_string();
+
+    // A failed key lookup is a server error, not a denial or a missing gallery.
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE galleries RENAME COLUMN key_hash TO key_hash_off")
+        .unwrap();
+    let resp = router(state.clone())
+        .oneshot(get(
+            &format!("/api/galleries/{slug}/photos"),
+            &[key_header(KEY_A)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE galleries RENAME COLUMN key_hash_off TO key_hash")
+        .unwrap();
+
+    // A write failure is a server error, not "unknown gallery".
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_update BEFORE UPDATE ON galleries
+             BEGIN SELECT RAISE(ABORT, 'test update error'); END;",
+        )
+        .unwrap();
+    let visibility = post_json(
+        &format!("/api/galleries/{slug}/visibility"),
+        &[key_header(KEY_A)],
+        r#"{"public":true}"#,
+    );
+    assert_eq!(
+        router(state.clone())
+            .oneshot(visibility)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let lock = post_json(
+        &format!("/api/galleries/{slug}/lock"),
+        &[key_header(KEY_A)],
+        r#"{"password":"viewer-pass"}"#,
+    );
+    assert_eq!(
+        router(state.clone()).oneshot(lock).await.unwrap().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_update")
+        .unwrap();
+
+    // A failed row delete keeps the row and its file, and reports 500.
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON galleries
+             BEGIN SELECT RAISE(ABORT, 'test delete error'); END;",
+        )
+        .unwrap();
+    let delete = request(
+        "DELETE",
+        &format!("/api/galleries/{slug}"),
+        &[key_header(KEY_A)],
+        Body::empty(),
+    );
+    assert_eq!(
+        router(state.clone())
+            .oneshot(delete)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(state.db.lock().unwrap().gallery_exists(&slug).unwrap());
+    assert!(state.dir.join(&name).exists(), "file kept on DB failure");
 }
 
 #[tokio::test]
@@ -2970,6 +3421,28 @@ async fn media_secret_file_is_private_and_stable() {
         .await
         .expect("second state");
     assert_eq!(second.media_secret, secret, "secret must survive restarts");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_restricts_data_files_but_not_operator_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A pre-existing secret with a lax mode must be tightened, not replaced.
+    let secret_path = root.join(".gally-media-secret");
+    std::fs::write(&secret_path, "ab".repeat(32)).unwrap();
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let state = AppState::new_with(root, Limits::defaults())
+        .await
+        .expect("state");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(root), 0o755, "operator root mode is untouched");
+    assert_eq!(mode(&state.dir), 0o700, "photos dir is owner-only");
+    assert_eq!(mode(&root.join("galleries.db")), 0o600, "db is owner-only");
+    assert_eq!(mode(&secret_path), 0o600, "secret file is tightened");
 }
 
 // --- phase 2: DB listing, pagination, thumbnails ---
@@ -3249,8 +3722,8 @@ async fn thumb_accepts_viewer_cookie() {
     );
     let resp = router(state.clone())
         .oneshot(get(
-            &format!("/api/galleries/{slug}/photos?pass=thumb-pass"),
-            &[],
+            &format!("/api/galleries/{slug}/photos"),
+            &[("x-gallery-pass", "thumb-pass")],
         ))
         .await
         .unwrap();
@@ -3490,6 +3963,15 @@ async fn abandoned_part_files_count_toward_quota_until_expired() {
     .unwrap();
     drop(file);
 
+    // Chunk requests no longer pay for a sweep: the cached healthz pass does.
+    *state.last_sweep.lock().unwrap() =
+        std::time::Instant::now() - std::time::Duration::from_secs(61);
+    let resp = router(state.clone())
+        .oneshot(get("/healthz", &[]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
     let (status, _) = put_chunk(
         &state,
         "photo.jpg",
@@ -3503,7 +3985,7 @@ async fn abandoned_part_files_count_toward_quota_until_expired() {
     assert_eq!(
         status,
         StatusCode::CREATED,
-        "expired temp is swept and the new chunk fits"
+        "healthz reclaimed the expired temp and the new chunk fits"
     );
     assert!(!part1.exists(), "expired temp file was reclaimed");
 }
@@ -3553,9 +4035,10 @@ async fn chunked_upload_reports_offset_mismatch() {
 }
 
 #[tokio::test]
-async fn chunked_upload_skips_rate_limit_after_first_chunk() {
+async fn chunk_requests_use_a_separate_rate_bucket() {
     let (state, _tmp) = test_state_with(Limits {
         rate_max: 1,
+        chunk_max: 2,
         ..Limits::defaults()
     })
     .await;
@@ -3567,7 +4050,8 @@ async fn chunked_upload_skips_rate_limit_after_first_chunk() {
         .expect("gallery");
     let id = "c".repeat(32);
 
-    // Three chunks of one file, but the rate limit only allows one hit.
+    // The first chunk spends the upload bucket's only hit, then two chunks
+    // fit the chunk bucket; the third later chunk is refused.
     for (range, bytes) in [
         ("bytes 0-1/6", b"ab".as_slice()),
         ("bytes 2-3/6", b"cd".as_slice()),
@@ -3576,7 +4060,125 @@ async fn chunked_upload_skips_rate_limit_after_first_chunk() {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
     let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 4-5/6", b"ef").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn fresh_mid_file_chunk_without_part_is_410() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "d".repeat(32);
+    // No first chunk was ever accepted: there is nothing to resume.
+    let (status, body) =
+        put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 2-3/6", b"cd").await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["error"], "upload expired");
+}
+
+#[tokio::test]
+async fn unindexed_final_chunk_retry_recovers_the_row() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "e".repeat(32);
+    let name = format!("{slug}_{id}_photo.jpg");
+    // A crash after the rename but before the row insert leaves this behind.
+    std::fs::write(state.dir.join(&name), b"abcd").unwrap();
+    let (status, body) = put_chunk(
+        &state,
+        "photo.jpg",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 0-3/4",
+        b"abcd",
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["name"], name.as_str());
+    let page = state
+        .db
+        .lock()
+        .unwrap()
+        .photos_page(&slug, None, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].1, name);
+}
+
+#[tokio::test]
+async fn indexed_slot_under_another_name_conflicts() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let id = "1".repeat(32);
+    let name = format!("{slug}_{id}_original.txt");
+    std::fs::write(state.dir.join(&name), b"abcd").unwrap();
+    {
+        let mut db = state.db.lock().unwrap();
+        db.add_upload(&slug, &name, 4, 0).unwrap().expect("indexed");
+    }
+    let (status, body) = put_chunk(
+        &state,
+        "renamed.txt",
+        KEY_A,
+        &slug,
+        &id,
+        "bytes 0-3/4",
+        b"abcd",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "upload id already used");
+}
+
+#[tokio::test]
+async fn chunk_upload_leaves_unrelated_parts_for_healthz_sweep() {
+    let (state, _tmp) = test_state().await;
+    let slug = state
+        .db
+        .lock()
+        .unwrap()
+        .get_or_create_gallery(KEY_A)
+        .expect("gallery");
+    let stale = state.dir.join(".part-other");
+    std::fs::write(&stale, b"stale").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)),
+        )
+        .unwrap();
+
+    let id = "f".repeat(32);
+    let (status, _) = put_chunk(&state, "photo.jpg", KEY_A, &slug, &id, "bytes 0-1/4", b"ab").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(
+        stale.exists(),
+        "a chunk request must not pay for a full directory sweep"
+    );
+
+    *state.last_sweep.lock().unwrap() =
+        std::time::Instant::now() - std::time::Duration::from_secs(61);
+    let resp = router(state).oneshot(get("/healthz", &[])).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!stale.exists(), "healthz reaps expired parts");
 }
 
 #[tokio::test]
@@ -3853,7 +4455,14 @@ async fn password_rotation_denies_inflight_listing_and_media() {
         format!("/api/galleries/{slug}/photos"),
         format!("/photos/{name}"),
     ] {
-        assert!(state.db.lock().unwrap().set_gallery_pass(slug, Some(&old)));
+        assert!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .set_gallery_pass(slug, Some(&old))
+                .expect("set old pass")
+        );
         state.pass_ok.lock().unwrap().clear();
         let permits = state
             .argon2
@@ -3865,7 +4474,14 @@ async fn password_rotation_denies_inflight_listing_and_media() {
         let mut request = std::pin::pin!(request);
         // Before password verification the handler has no other await point.
         assert!(futures::poll!(&mut request).is_pending());
-        assert!(state.db.lock().unwrap().set_gallery_pass(slug, Some(&new)));
+        assert!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .set_gallery_pass(slug, Some(&new))
+                .expect("set new pass")
+        );
         drop(permits);
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -3904,6 +4520,91 @@ fn gated_body(
         Ok(axum::body::Bytes::new())
     }));
     (Body::from_stream(body), polled, release)
+}
+
+#[tokio::test]
+async fn complete_declared_chunk_ends_upload_without_body_end() {
+    let (state, _tmp) = test_state_with(Limits {
+        upload_slots: 1,
+        upload_slots_per_ip: 1,
+        ..Limits::defaults()
+    })
+    .await;
+    let (status, resolved) = resolve(&state, KEY_A).await;
+    assert_eq!(status, StatusCode::OK);
+    let slug = resolved["slug"].as_str().unwrap();
+    // One byte completes `0-0/1`; the body then never ends or terminates.
+    let (body, _polled, release) = gated_body(b"a");
+    let req = request(
+        "PUT",
+        "/api/photos/early.txt",
+        &[
+            key_header(KEY_A),
+            ("x-gallery-slug", slug),
+            ("x-upload-id", "0123456789abcdef0123456789abcdef"),
+            ("content-range", "bytes 0-0/1"),
+        ],
+        body,
+    );
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router(state.clone()).oneshot(req),
+    )
+    .await
+    .expect("must not wait for the body to end after the declared range")
+    .unwrap()
+    .status();
+    assert_eq!(status, StatusCode::CREATED);
+    drop(release);
+}
+
+#[tokio::test]
+async fn complete_content_length_ends_upload_without_body_end() {
+    let (state, _tmp) = test_state().await;
+    let (status, resolved) = resolve(&state, KEY_A).await;
+    assert_eq!(status, StatusCode::OK);
+    let slug = resolved["slug"].as_str().unwrap();
+    // Exactly Content-Length bytes; the body then never ends or terminates.
+    let (body, _polled, release) = gated_body(b"abcdef");
+    let req = request(
+        "PUT",
+        "/api/photos/full.txt",
+        &[
+            key_header(KEY_A),
+            ("x-gallery-slug", slug),
+            ("content-length", "6"),
+        ],
+        body,
+    );
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router(state.clone()).oneshot(req),
+    )
+    .await
+    .expect("must not wait for the body to end after Content-Length bytes")
+    .unwrap()
+    .status();
+    assert_eq!(status, StatusCode::CREATED);
+    drop(release);
+}
+
+#[tokio::test]
+async fn single_frame_chunk_overrun_is_rejected() {
+    let (state, _tmp) = test_state().await;
+    let (_, resolved) = resolve(&state, KEY_A).await;
+    let slug = resolved["slug"].as_str().unwrap();
+    let (status, body) = put_chunk(
+        &state,
+        "over.txt",
+        KEY_A,
+        slug,
+        "0123456789abcdef0123456789abcdef",
+        "bytes 0-0/1",
+        b"ab",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "content-range overrun");
 }
 
 #[tokio::test]
@@ -4053,7 +4754,15 @@ async fn live_uploads_reserve_free_space_across_galleries() {
     let (slug_a, slug_b) = (a["slug"].as_str().unwrap(), b["slug"].as_str().unwrap());
     let id = "aabbccddeeff00112233445566778899";
     let range = "bytes 0-0/201326592"; // 192 MiB promised, one byte written.
-    let (body, polled, release) = gated_body(b"a");
+    // Deliver the single byte only after inspecting the live reservation:
+    // the request now closes as soon as that frame completes.
+    let (started, polled) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(futures::stream::once(async move {
+        started.send(()).unwrap();
+        gate.await.unwrap();
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"a"))
+    }));
     let req = request(
         "PUT",
         "/api/photos/a.txt",
@@ -4200,20 +4909,8 @@ async fn failed_upload_index_preserves_unserved_file_for_recovery_or_deletion() 
             .0,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    assert_eq!(
-        put_chunk(
-            &state,
-            "renamed.txt",
-            KEY_A,
-            slug,
-            &a,
-            "bytes 0-3/4",
-            b"eeee"
-        )
-        .await
-        .0,
-        StatusCode::CONFLICT
-    );
+    // An unindexed final under another name is no longer detectable without a
+    // full sweep (see the save_upload shortcut); indexed finals still conflict.
     assert_eq!(
         put_chunk(&state, "a.txt", KEY_A, slug, &a, "bytes 0-3/4", b"eeee")
             .await

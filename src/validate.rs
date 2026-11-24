@@ -91,28 +91,44 @@ pub static NOUN: &[&str] = &[
     "wren",
 ];
 
+/// Gallery slug. Current form: `adj-noun-adj-noun-<4 hex>`
+/// (`velvet-lagoon-quiet-river-1a2b`). Legacy pre-2026-10-30 form:
+/// `adj-noun-<1-3 digits>` (`happy-otter-7`, fallback `oddball-slug-42`);
+/// leading zeros are accepted for compatibility with the old permissive
+/// photo-name pattern (`happy-otter-007`).
+/// Generated fallback: `oddball-slug-extra-<8 hex>`.
 pub fn is_slug(s: &str) -> bool {
-    // ^[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4}$ (odd fallback: oddball-slug-extra-[0-9a-f]{8})
     if let Some(hex) = s.strip_prefix("oddball-slug-extra-") {
         return hex.len() == 8 && hex.bytes().all(|v| v.is_ascii_hexdigit());
     }
-    let mut parts = s.split('-');
-    let a = parts.next().unwrap_or("");
-    let b = parts.next().unwrap_or("");
-    let c = parts.next().unwrap_or("");
-    let d = parts.next().unwrap_or("");
-    let e = parts.next().unwrap_or("");
-    if parts.next().is_some() {
-        return false;
-    }
     let alpha = |x: &str| !x.is_empty() && x.bytes().all(|v| v.is_ascii_lowercase());
-    if !alpha(a) || !alpha(b) || !alpha(c) || !alpha(d) {
-        return false;
+    // Parse the parts once; a sixth part is never valid.
+    let mut parts = [""; 5];
+    let mut n = 0;
+    for p in s.split('-') {
+        if n == parts.len() {
+            return false;
+        }
+        parts[n] = p;
+        n += 1;
     }
-    if e.len() != 4 {
-        return false;
+    match n {
+        3 => {
+            alpha(parts[0])
+                && alpha(parts[1])
+                && (1..=3).contains(&parts[2].len())
+                && parts[2].bytes().all(|v| v.is_ascii_digit())
+        }
+        5 => {
+            alpha(parts[0])
+                && alpha(parts[1])
+                && alpha(parts[2])
+                && alpha(parts[3])
+                && parts[4].len() == 4
+                && parts[4].bytes().all(|v| v.is_ascii_hexdigit())
+        }
+        _ => false,
     }
-    e.bytes().all(|v| v.is_ascii_hexdigit())
 }
 
 pub fn photo_slug(name: &str) -> Option<&str> {
@@ -257,19 +273,26 @@ mod tests {
         assert!(is_slug("blue-heron-granite-pond-00ff"));
         assert!(is_slug("a-b-c-d-1234"));
         assert!(is_slug("oddball-slug-extra-89abcdef"));
+        // Legacy pre-2026-10 galleries, incl. Python-era leading zeros.
+        assert!(is_slug("happy-otter-7"));
+        assert!(is_slug("happy-otter-007"));
+        assert!(is_slug("oddball-slug-42"));
     }
 
     #[test]
     fn slug_rejects() {
         assert!(!is_slug("Happy-otter-calm-pond-1a2b")); // uppercase
-        assert!(!is_slug("happy-otter-007")); // old short format
-        assert!(!is_slug("happy-otter-calm-1a2b")); // old 3-word format
+        assert!(!is_slug("Happy-otter-7")); // uppercase legacy word
+        assert!(!is_slug("happy-otter-calm-1a2b")); // 3 words + hex tail
         assert!(!is_slug("happy-otter-calm-pond-12345")); // 5-hex
         assert!(!is_slug("happy-otter-calm-pond-123")); // 3-hex
         assert!(!is_slug("happy-otter-calm-pond-XYZ1")); // non-hex
         assert!(!is_slug("happy-otter-calm-pond")); // missing tail
         assert!(!is_slug("happy-otter-calm-pond-1a2b-x")); // extra part
         assert!(!is_slug("happy-ott3r-calm-pond-1a2b")); // digit in word
+        assert!(!is_slug("happy-otter-1234")); // legacy tail too long
+        assert!(!is_slug("happy-otter-7x")); // legacy tail not digits
+        assert!(!is_slug("happy-otter-7-")); // trailing part
         assert!(!is_slug("")); // empty
     }
 
@@ -321,6 +344,19 @@ mod tests {
         let h = "a".repeat(32);
         let name = format!("velvet-lagoon-quiet-river-1a2b_{}_photo.jpg", h);
         assert_eq!(photo_slug(&name), Some("velvet-lagoon-quiet-river-1a2b"));
+        // Legacy galleries: two words + 1-3 digits before the file hash.
+        assert_eq!(
+            photo_slug(&format!("happy-otter-7_{h}_old.jpg")),
+            Some("happy-otter-7")
+        );
+        assert_eq!(
+            photo_slug(&format!("happy-otter-007_{h}_x.jpg")),
+            Some("happy-otter-007")
+        );
+        assert_eq!(
+            photo_slug(&format!("oddball-slug-42_{h}_x.jpg")),
+            Some("oddball-slug-42")
+        );
     }
 
     #[test]
@@ -339,12 +375,13 @@ mod tests {
             photo_slug("Happy-otter-calm-pond-1a2b_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg")
                 .is_none()
         );
-        // Old short galleries no longer resolve.
-        assert!(photo_slug("happy-otter-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
+        // Five parts with a 3-digit tail is not a legacy gallery name.
         assert!(
             photo_slug("happy-otter-calm-pond-123_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg")
                 .is_none()
         );
+        // Legacy words still cannot carry digits.
+        assert!(photo_slug("happy-ott3r-7_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_x.jpg").is_none());
     }
 
     #[test]

@@ -19,6 +19,9 @@ GALLY_MEDIA_SECRET=...
 GALLY_SECURE_COOKIES=1
 ```
 
+`GALLY_MEDIA_SECRET` must be at least 32 bytes; shorter values fail startup.
+Rotating it invalidates all media cookies.
+
 ```sh
 docker compose pull
 docker compose up -d --no-build
@@ -81,7 +84,11 @@ that file from zero. `docker compose down` does the same.
 The named volumes (`gally-data`, `gally-backups`) inherit the image's
 ownership. A host bind mount does not: `chown -R 10001:10001 ./data` (and
 `./backups`) first, or the app cannot create its lock, secret, and database.
-Keep `.env` `0600`; it holds secrets.
+The app leaves the root's own mode as-is; `photos/` is `0700`, and
+`galleries.db` (with `-wal`/`-shm`) and `.gally-media-secret` are `0600`. It
+warns if the root is group/other-accessible or not owned by the app user. Use
+a dedicated directory — never `/tmp`, `/`, or a shared web root. Keep `.env`
+`0600`; it holds secrets.
 
 Server-side previews are generated at upload time for new
 JPG/PNG/GIF/WebP/BMP/ICO photos. Photos uploaded before this version have no
@@ -106,13 +113,18 @@ rate-limited and locks out after repeated failures. Use **Log out** on a shared
 machine.
 
 `GALLY_INVITE_CODE` is separate: it gates creation of new galleries, not admin
-access. Existing galleries never need the invite.
+access. Existing galleries never need the invite. Wrong codes count toward
+the 10/min/IP failure bucket; the first attempts are `403`, and further
+attempts are `429` once the bucket is full. A correct code still works.
 
 ## Health and metrics
 
-- `GET /healthz` returns 200 when SQLite answers, the photos directory is
-  readable, and free space is at least `GALLY_MIN_FREE_BYTES`; otherwise 503
-  with `{"ok":false,...}`. Use it for proxy and container checks.
+- `GET /healthz` returns 200 when the `galleries` and `photos` tables are
+  readable, the photos directory is readable, and free space is at least
+  `GALLY_MIN_FREE_BYTES`; otherwise 503 with `{"ok":false,...}`. Use it for
+  proxy and container checks. Expired upload temps are reaped by a background
+  sweep every ten minutes (and opportunistically by `/healthz`), so upload
+  cleanup does not depend on an external probe.
 - `GET /metrics` exposes Prometheus text only to an actual loopback socket
   peer that is not a trusted proxy, without `X-Forwarded-For`. A forwarded
   address does not make a scrape local. On Docker, scrape from the app's
@@ -135,8 +147,16 @@ The sidecar takes a SQLite `VACUUM INTO` snapshot, then copies its indexed
 originals and their available `.thumbs/` previews into a private sibling
 directory (`0700`, database `0600`). Unindexed files and upload/thumbnail
 temps are not copied. An original already gone when copied is dropped from
-the snapshot's index and counts; other I/O errors fail the run. Changes to
-the live gallery after the DB snapshot are not guaranteed to be included.
+the snapshot's index and counts; other I/O errors fail the run. If the live
+index has photo rows but none of their files are present, the run fails and
+leaves the previous snapshot in place rather than publishing an empty one.
+Changes to the live gallery after the DB snapshot are not guaranteed to be
+included.
+
+The same rule protects startup: if the database has photo rows but `photos/`
+contains none of them, the server refuses to rebuild an empty index and
+exits. Restore the files, or move both `galleries.db` and `photos/` aside to
+start a fresh library.
 
 After syncing the files and directories, the sidecar publishes the complete
 directory as `current` with an atomic rename. Replacing an existing snapshot
@@ -256,9 +276,11 @@ former volume. Do not use `down -v` or delete either volume during the drill
 or cutover.
 
 Setting `GALLY_MEDIA_SECRET` in `.env` keeps media-cookie signing stable
-across restores; the generated `<GALLY_ROOT>/.gally-media-secret` is not in
-the snapshot. Startup recounts photo counts and byte totals, rebuilds the
-listing from the restored photos directory, and sweeps upload/thumbnail temps.
+across restores; it must be at least 32 bytes, and rotating it invalidates all
+media cookies. The generated `<GALLY_ROOT>/.gally-media-secret` is 32 random
+bytes (`0600`) and is not in the snapshot. Startup recounts photo counts and
+byte totals, rebuilds the listing from the restored photos directory, and
+sweeps upload/thumbnail temps.
 
 ## Monitoring
 

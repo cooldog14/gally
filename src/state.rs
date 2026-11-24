@@ -33,6 +33,9 @@ pub struct Limits {
     pub min_free: u64,
     /// Uploads per IP per window (`GALLY_RATE_MAX`); 0 = off.
     pub rate_max: usize,
+    /// Resumable-chunk requests per IP per window (`GALLY_CHUNK_RATE_MAX`);
+    /// 0 = off. Separate bucket: one file is many requests.
+    pub chunk_max: usize,
     /// Listing + photo reads per IP per window (`GALLY_READ_RATE_MAX`);
     /// 0 = off. Keep it above `gallery_photos`: one gallery view costs one
     /// listing plus one request per photo, all from the same bucket.
@@ -57,6 +60,7 @@ impl Limits {
             gallery_photos: 5000,
             min_free: 2 * 1024 * 1024 * 1024,
             rate_max: 60,
+            chunk_max: 600,
             read_max: 12_000,
             upload_slots: 32,
             upload_slots_per_ip: 4,
@@ -88,6 +92,7 @@ impl Limits {
                 as i64,
             min_free: num("GALLY_MIN_FREE_BYTES").unwrap_or(d.min_free),
             rate_max: num("GALLY_RATE_MAX").unwrap_or(d.rate_max as u64) as usize,
+            chunk_max: num("GALLY_CHUNK_RATE_MAX").unwrap_or(d.chunk_max as u64) as usize,
             read_max: num("GALLY_READ_RATE_MAX").unwrap_or(d.read_max as u64) as usize,
             upload_slots: (num("GALLY_UPLOAD_SLOTS").unwrap_or(d.upload_slots as u64) as usize)
                 .max(1),
@@ -107,12 +112,12 @@ pub struct AppState {
     pub canon_dir: PathBuf,
     pub db: Mutex<rusqlite::Connection>,
     pub admin_tokens: Mutex<HashMap<String, Instant>>,
-    pub rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    pub rate: Mutex<HashMap<IpAddr, WindowRing>>,
     /// Verified (stored hash, supplied password) digests: a locked gallery
     /// costs one Argon2 run, not one per image.
     pub pass_ok: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Failed password/key attempts per IP (sliding window).
-    pub pass_fail: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    pub pass_fail: Mutex<HashMap<IpAddr, WindowRing>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str, String)>,
     /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
     /// startup; `None` = open creation). Contributing to an existing
@@ -133,7 +138,11 @@ pub struct AppState {
     /// need the full source bitmap in RAM, so this bounds peak decode memory.
     pub thumbs: tokio::sync::Semaphore,
     /// Read requests per IP (listing + photo), separate from uploads.
-    pub read: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    pub read: Mutex<HashMap<IpAddr, WindowRing>>,
+    /// Resumable-chunk requests per IP, separate from the upload bucket.
+    pub chunks: Mutex<HashMap<IpAddr, WindowRing>>,
+    /// Last full `.part-` sweep; healthz runs one at most once a minute.
+    pub last_sweep: Mutex<Instant>,
     /// Exclusive data-dir lock: a second server must never sweep the first
     /// instance's `.part-` uploads. Held until the state is dropped.
     pub _instance_lock: Option<std::fs::File>,
@@ -187,13 +196,71 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// chmod `path`; errors carry the path. Non-unix is a no-op.
+fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// `GALLY_MEDIA_SECRET` must be at least 32 bytes of key material.
+fn env_media_secret(raw: &str) -> anyhow::Result<Vec<u8>> {
+    if raw.len() < 32 {
+        anyhow::bail!(
+            "GALLY_MEDIA_SECRET must be at least 32 bytes (got {})",
+            raw.len()
+        );
+    }
+    Ok(raw.as_bytes().to_vec())
+}
+
+/// Warn once when the operator's root is readable by others or owned by a
+/// different uid. Never refuse: bind mounts and legacy dirs must still run.
+#[cfg(unix)]
+fn warn_root_permissions(root: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(md) = std::fs::metadata(root) else {
+        return;
+    };
+    let mode = md.permissions().mode() & 0o777;
+    // SAFETY: `geteuid` has no preconditions and touches no memory.
+    let foreign_owner = md.uid() != unsafe { libc::geteuid() };
+    if mode & 0o077 != 0 || foreign_owner {
+        tracing::warn!(
+            path = %root.display(),
+            mode = format!("{mode:o}"),
+            uid = md.uid(),
+            "GALLY_ROOT is accessible by other users or owned by another uid"
+        );
+    }
+}
+
+/// Owner-only on the SQLite file and its WAL sidecars; NotFound is fine.
+fn restrict_db_files(db_path: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut raw = db_path.as_os_str().to_os_string();
+        raw.push(suffix);
+        let path = PathBuf::from(raw);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => set_mode(&path, 0o600)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::anyhow!("stat {}: {e}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 /// HMAC key for media cookies: `GALLY_MEDIA_SECRET`, else a 32-byte secret
 /// generated once into `<root>/.gally-media-secret` (0600) and reused.
 fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
-    if let Ok(s) = std::env::var("GALLY_MEDIA_SECRET")
-        && !s.is_empty()
-    {
-        return Ok(s.into_bytes());
+    if let Ok(s) = std::env::var("GALLY_MEDIA_SECRET") {
+        return env_media_secret(&s);
     }
     let path = root.join(".gally-media-secret");
     match std::fs::read(&path) {
@@ -202,6 +269,8 @@ fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
             if let Some(bytes) = from_hex(text.trim())
                 && bytes.len() == 32
             {
+                // A lax umask or a copied file may have left it 0644.
+                set_mode(&path, 0o600)?;
                 return Ok(bytes);
             }
             // A crash or full disk can leave an empty/partial file here.
@@ -235,7 +304,8 @@ fn media_secret(root: &Path) -> anyhow::Result<Vec<u8>> {
     {
         use std::os::unix::fs::PermissionsExt;
         // `mode` above only applies to a new file; a rewritten one may be 0644.
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", path.display()))?;
     }
     file.write_all(to_hex(&bytes).as_bytes())?;
     file.sync_all()?;
@@ -270,16 +340,11 @@ impl AppState {
         let media_secret = media_secret(root)?;
         let dir = root.join("photos");
         tokio::fs::create_dir_all(&dir).await?;
-        // Data dir holds every uploaded file and the SQLite file: owner-only.
-        // A host bind mount must already be owned by the container uid (10001);
-        // the shipped compose file uses a named volume to inherit that.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [root, dir.as_path()] {
-                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
-            }
-        }
+        warn_root_permissions(root);
+        // Photos hold every uploaded file: owner-only. The operator chose the
+        // root's own mode, so leave that untouched.
+        set_mode(&dir, 0o700)?;
         // An upload that died mid-stream leaves a `.part-` temp behind; they
         // are never listed, so drop them here rather than let them pile up.
         if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
@@ -303,6 +368,8 @@ impl AppState {
         let scan_dir = dir.clone();
         let conn = tokio::task::spawn_blocking(move || {
             let mut conn = db::open(&db_path)?;
+            // WAL sidecars exist once open ran; keep the whole DB owner-only.
+            restrict_db_files(&db_path)?;
             db::recount(&mut conn, &scan_dir)?;
             let backfilled = db::backfill_exif(&mut conn, &scan_dir)?;
             if backfilled > 0 {
@@ -387,6 +454,8 @@ impl AppState {
             argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
             thumbs: tokio::sync::Semaphore::new(2),
             read: Mutex::new(HashMap::new()),
+            chunks: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(Instant::now()),
             _instance_lock,
             started: Instant::now(),
             requests_total: AtomicU64::new(0),
@@ -463,36 +532,138 @@ impl UploadReservation {
     }
 }
 
+/// Monotonic whole seconds since the process started; shared by every ring so
+/// their `last_sec` values are comparable for oldest-entry eviction.
+fn window_sec() -> u64 {
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_secs()
+}
+
+/// One-second-bucketed sliding window. 60 `u32` buckets (~240 bytes) replace a
+/// vector that kept every timestamp for the window's duration.
+/// shortcut: one-second granularity makes the effective window up to 1 s short
+/// (a hit can expire early, never late), and the 10k-IP cap still evicts the
+/// least recently used entry, not a true LRU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowRing {
+    buckets: [u32; RATE_WINDOW_SECS as usize],
+    /// Process second of the newest bucket.
+    last_sec: u64,
+}
+
+impl Default for WindowRing {
+    fn default() -> Self {
+        Self {
+            buckets: [0; RATE_WINDOW_SECS as usize],
+            last_sec: 0,
+        }
+    }
+}
+
+impl WindowRing {
+    /// Drop buckets that left the ring. Denied hits never record, so expiring
+    /// here cannot extend a window.
+    fn expire(&mut self, now_sec: u64) {
+        if now_sec <= self.last_sec {
+            return;
+        }
+        if now_sec - self.last_sec >= RATE_WINDOW_SECS {
+            self.buckets = [0; RATE_WINDOW_SECS as usize];
+        } else {
+            for sec in self.last_sec + 1..=now_sec {
+                self.buckets[(sec % RATE_WINDOW_SECS) as usize] = 0;
+            }
+        }
+        self.last_sec = now_sec;
+    }
+
+    /// Hits with `age < window_secs` (one-second granularity).
+    fn recent(&self, window_secs: u64) -> u64 {
+        debug_assert!(
+            window_secs <= RATE_WINDOW_SECS,
+            "ring only covers {RATE_WINDOW_SECS} seconds"
+        );
+        let window = window_secs.min(RATE_WINDOW_SECS);
+        let mut total = 0;
+        for age in 0..window {
+            if age > self.last_sec {
+                break;
+            }
+            total += u64::from(self.buckets[((self.last_sec - age) % RATE_WINDOW_SECS) as usize]);
+        }
+        total
+    }
+
+    /// Record one hit, or return how long until a slot opens.
+    fn hit(&mut self, now_sec: u64, max: usize, window_secs: u64) -> Option<Duration> {
+        debug_assert!(
+            window_secs <= RATE_WINDOW_SECS,
+            "ring only covers {RATE_WINDOW_SECS} seconds"
+        );
+        if max == 0 {
+            return None;
+        }
+        self.expire(now_sec);
+        let max = max as u64;
+        let recent = self.recent(window_secs);
+        if recent < max {
+            let bucket = (now_sec % RATE_WINDOW_SECS) as usize;
+            self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+            return None;
+        }
+        // Refuse without recording. The slot opens when the max-th newest hit
+        // leaves the window.
+        let window = window_secs.min(RATE_WINDOW_SECS);
+        let mut seen = 0;
+        for age in 0..window {
+            if age > self.last_sec {
+                break;
+            }
+            seen += u64::from(self.buckets[((self.last_sec - age) % RATE_WINDOW_SECS) as usize]);
+            if seen >= max {
+                return Some(Duration::from_secs(window.saturating_sub(age).max(1)));
+            }
+        }
+        Some(Duration::from_secs(1))
+    }
+}
+
 /// Sliding-window rate limit. A refused hit returns the time until a slot opens.
-/// shortcut: hard cap at 10k IPs, evicts oldest — switch to LRU when NAT-heavy.
+/// shortcut: 60 one-second buckets per IP, so memory is fixed at ~240 bytes;
+/// the 10k-IP map evicts its oldest entry rather than adding a real LRU.
 pub fn window_hit(
-    map: &Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    map: &Mutex<HashMap<IpAddr, WindowRing>>,
     ip: &IpAddr,
     max: usize,
     window_secs: u64,
 ) -> Option<Duration> {
+    window_hit_at(map, ip, max, window_secs, window_sec())
+}
+
+/// `window_hit` with an explicit clock, so tests can age a window without
+/// sleeping 60 seconds.
+fn window_hit_at(
+    map: &Mutex<HashMap<IpAddr, WindowRing>>,
+    ip: &IpAddr,
+    max: usize,
+    window_secs: u64,
+    now_sec: u64,
+) -> Option<Duration> {
     if max == 0 {
         return None;
     }
-    let mut hits_map = map.lock().unwrap();
-    let now = Instant::now();
+    let mut rings = map.lock().unwrap();
     // Bound memory: drop the oldest entry when full (dead IPs never return).
-    if !hits_map.contains_key(ip)
-        && hits_map.len() >= 10_000
-        && let Some(oldest) = hits_map
+    if !rings.contains_key(ip)
+        && rings.len() >= 10_000
+        && let Some(oldest) = rings
             .iter()
-            .min_by_key(|(_, v)| v.first().copied())
+            .min_by_key(|(_, ring)| ring.last_sec)
             .map(|(k, _)| *k)
     {
-        hits_map.remove(&oldest);
+        rings.remove(&oldest);
     }
-    let hits = hits_map.entry(*ip).or_default();
-    hits.retain(|t| now.duration_since(*t).as_secs() < window_secs);
-    if hits.len() >= max {
-        return Some(Duration::from_secs(window_secs) - now.duration_since(hits[hits.len() - max]));
-    }
-    hits.push(now);
-    None
+    rings.entry(*ip).or_default().hit(now_sec, max, window_secs)
 }
 
 /// Upload throttle (per IP).
@@ -505,16 +676,21 @@ pub fn read_limited(state: &AppState, ip: &IpAddr) -> bool {
     window_hit(&state.read, ip, state.limits.read_max, RATE_WINDOW_SECS).is_some()
 }
 
+/// Resumable-chunk throttle (per IP); every chunk costs one hit.
+pub fn chunk_limited(state: &AppState, ip: &IpAddr) -> Option<Duration> {
+    window_hit(&state.chunks, ip, state.limits.chunk_max, RATE_WINDOW_SECS)
+}
+
 /// True when `ip` already burned `PASS_FAIL_MAX` attempts in the window.
 /// Read-only: never records a failure (the caller still refuses outright).
 pub fn pass_fail_exceeded(state: &AppState, ip: &IpAddr) -> bool {
-    let now = Instant::now();
+    let now_sec = window_sec();
     let mut fail = state.pass_fail.lock().unwrap();
-    let Some(hits) = fail.get_mut(ip) else {
+    let Some(ring) = fail.get_mut(ip) else {
         return false;
     };
-    hits.retain(|t| now.duration_since(*t).as_secs() < PASS_FAIL_WINDOW_SECS);
-    hits.len() >= PASS_FAIL_MAX
+    ring.expire(now_sec);
+    ring.recent(PASS_FAIL_WINDOW_SECS) >= PASS_FAIL_MAX as u64
 }
 
 /// Record one failed password/key attempt. Returns true once over the limit.
@@ -623,17 +799,72 @@ mod tests {
             .await
             .unwrap();
         let ip = IpAddr::from([127, 0, 0, 1]);
+        // Drive the same map `pass_fail_record` uses, with an explicit clock so
+        // the window can age without sleeping.
         for _ in 0..PASS_FAIL_MAX {
-            assert!(!pass_fail_record(&state, &ip));
+            assert!(
+                window_hit_at(
+                    &state.pass_fail,
+                    &ip,
+                    PASS_FAIL_MAX,
+                    PASS_FAIL_WINDOW_SECS,
+                    0
+                )
+                .is_none()
+            );
         }
-        let timestamps = state.pass_fail.lock().unwrap()[&ip].clone();
+        let recorded = state.pass_fail.lock().unwrap()[&ip].clone();
         for _ in 0..100 {
-            assert!(pass_fail_record(&state, &ip));
+            assert!(
+                window_hit_at(
+                    &state.pass_fail,
+                    &ip,
+                    PASS_FAIL_MAX,
+                    PASS_FAIL_WINDOW_SECS,
+                    0
+                )
+                .is_some()
+            );
         }
-        assert_eq!(state.pass_fail.lock().unwrap()[&ip], timestamps);
-        state.pass_fail.lock().unwrap().get_mut(&ip).unwrap()[0] -=
-            Duration::from_secs(PASS_FAIL_WINDOW_SECS + 1);
-        assert!(!pass_fail_record(&state, &ip));
+        assert_eq!(state.pass_fail.lock().unwrap()[&ip], recorded);
+        // Past the window the hits are gone, so a new attempt is allowed.
+        assert!(
+            window_hit_at(
+                &state.pass_fail,
+                &ip,
+                PASS_FAIL_MAX,
+                PASS_FAIL_WINDOW_SECS,
+                PASS_FAIL_WINDOW_SECS + 1
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn window_ring_expires_after_sixty_seconds_and_refuses_when_full() {
+        let mut ring = WindowRing::default();
+        assert!(ring.hit(0, 1, RATE_WINDOW_SECS).is_none());
+        // Over the cap: refused, and the refused hit is not recorded.
+        assert!(ring.hit(1, 1, RATE_WINDOW_SECS).is_some());
+        assert_eq!(ring.recent(RATE_WINDOW_SECS), 1);
+        // Exactly 60 seconds after the recorded hit the window is empty again.
+        assert!(ring.hit(60, 1, RATE_WINDOW_SECS).is_none());
+        assert!(ring.hit(60, 1, RATE_WINDOW_SECS).is_some());
+    }
+
+    #[test]
+    fn window_map_cap_evicts_one_entry() {
+        let map = Mutex::new(HashMap::new());
+        for i in 0..10_000u32 {
+            let ip = IpAddr::from(i.to_be_bytes());
+            assert!(window_hit_at(&map, &ip, 1, RATE_WINDOW_SECS, 0).is_none());
+        }
+        assert_eq!(map.lock().unwrap().len(), 10_000);
+        let fresh = IpAddr::from([255, 255, 255, 255]);
+        assert!(window_hit_at(&map, &fresh, 1, RATE_WINDOW_SECS, 1).is_none());
+        let rings = map.lock().unwrap();
+        assert_eq!(rings.len(), 10_000, "one entry evicted, cap held");
+        assert!(rings.contains_key(&fresh));
     }
 
     /// One gallery view (listing + one request per photo) comes out of the
@@ -664,6 +895,14 @@ mod tests {
         assert!(UploadSlotGuard::try_acquire(&ips, &b, 4).is_some());
         drop(held.pop());
         assert!(UploadSlotGuard::try_acquire(&ips, &a, 4).is_some());
+    }
+
+    #[test]
+    fn env_media_secret_requires_32_bytes() {
+        let err = env_media_secret(&"a".repeat(31)).expect_err("31 bytes must fail");
+        assert!(err.to_string().contains("at least 32 bytes"), "{err}");
+        let ok = env_media_secret(&"b".repeat(32)).expect("32 bytes is valid");
+        assert_eq!(ok, vec![b'b'; 32]);
     }
 
     #[test]

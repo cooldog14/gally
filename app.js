@@ -72,7 +72,7 @@ async function resolveForUpload(url, options) {
   }
 }
 
-const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4})$/;
+const SLUG_RE = /^(?:oddball-slug-extra-[0-9a-f]{8}|[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4}|[a-z]+-[a-z]+-[0-9]{1,3})$/;
 
 let photos = [];
 let index = 0;
@@ -85,7 +85,9 @@ let galleryPublic = true;
 // 404 on a private gallery, so it cannot tell whether a lock exists.
 let galleryLocked = false;
 // Gallery key: kept in memory + sessionStorage (per-tab). Never in the URL.
-let galleryKey = sessionStorage.getItem("gallery-key") || "";
+// Storage can throw when site data is blocked; the page must still load.
+let galleryKey = "";
+try { galleryKey = sessionStorage.getItem("gallery-key") || ""; } catch (_) {}
 let keyResolver = null;
 let keyValidator = null;
 // Viewer password for locked galleries: "<slug>:<password>" per tab.
@@ -305,6 +307,16 @@ async function loadPhotos(retry = false) {
     }
     renderGrid();
     updateEditUI();
+    // A home batch that partially failed leaves this one-shot note for the
+    // gallery page it navigates to.
+    let uploadFailures = "";
+    try {
+      uploadFailures = sessionStorage.getItem("upload-failed:" + slug) || "";
+      if (uploadFailures) sessionStorage.removeItem("upload-failed:" + slug);
+    } catch (_) { /* private mode */ }
+    if (uploadFailures) {
+      uploadStatus.textContent = "Some files were not uploaded: " + uploadFailures;
+    }
   } catch (_) {
     nextCursor = null;
     updateLoadMore();
@@ -1362,9 +1374,12 @@ async function uploadBatch(pageSlug, accepted, failures) {
     uploadStatus.textContent = failures.join("; ") || "Upload failed.";
     return;
   }
-  // Carry the key to the next page so the banner can show it once (the field
-  // itself is never prefilled again).
+  // Carry the key and any failure report to the next page. The key banner
+  // shows the key once; the gallery page shows the failures once.
   try { sessionStorage.setItem("show-key:" + target, key); } catch (_) {}
+  if (failures.length) {
+    try { sessionStorage.setItem("upload-failed:" + target, failures.join("; ")); } catch (_) {}
+  }
   location.assign("/" + target);
 }
 

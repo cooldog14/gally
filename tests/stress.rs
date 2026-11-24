@@ -471,11 +471,7 @@ async fn edge_cases() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
-    let r = client
-        .get(srv.url("/no-such-gallery-calm-1a2b"))
-        .send()
-        .await
-        .unwrap();
+    let r = client.get(srv.url("/not-a-slug")).send().await.unwrap();
     assert_eq!(r.url().path(), "/");
     // delete nonexistent
     let r = client
@@ -545,4 +541,56 @@ async fn large_directory_degradation() {
     );
     println!("2000-file listing in {dt:.1?} (total setup+up {t0:?})");
     assert!(dt < Duration::from_secs(2), "listing too slow: {dt:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_directory_second_chunk_is_fast() {
+    // Regression: a resumable chunk must not scan the whole photos directory.
+    // With 20k files the old full sweep cost ~45ms per chunk; the targeted
+    // stat is ~1ms. The threshold is deliberately loose to sparing CI noise
+    // but far below the old cost.
+    let srv = Server::boot_with_env(None, &[("GALLY_RATE_MAX", "0")]);
+    let client = client();
+    let dir = srv._tmp.path().join("photos");
+    for i in 0..20_000 {
+        tokio::fs::write(dir.join(format!("seed_{i:05}.jpg")), b"")
+            .await
+            .unwrap();
+    }
+    // Mint a gallery with a legacy full-body PUT, then stream two tiny chunks.
+    let t_mint = Instant::now();
+    let r = put(&client, &srv, "bigdir-000002", "one.jpg", &[2u8; 1000]).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let mint_dt = t_mint.elapsed();
+    let slug: String = r.json::<serde_json::Value>().await.unwrap()["slug"]
+        .as_str()
+        .unwrap()
+        .into();
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+    let chunk = |range: &'static str, byte: u8| {
+        let req = client
+            .put(srv.url("/api/photos/chunk.jpg"))
+            .header("X-Gallery-Key", "bigdir-000002")
+            .header("X-Gallery-Slug", slug.clone())
+            .header("X-Upload-Id", ID)
+            .header("Content-Range", range)
+            .header("Content-Type", "image/jpeg")
+            .body(vec![byte]);
+        async move { req.send().await.unwrap() }
+    };
+    let t_first = Instant::now();
+    let r = chunk("bytes 0-0/1000000", 3).await;
+    let first_dt = t_first.elapsed();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let t_second = Instant::now();
+    let r = chunk("bytes 1-1/1000000", 4).await;
+    let second_dt = t_second.elapsed();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    println!(
+        "20k files: mint {mint_dt:.1?}, first chunk {first_dt:.1?}, second chunk {second_dt:.1?}"
+    );
+    assert!(
+        second_dt < Duration::from_millis(20),
+        "second 1-byte chunk scanned the directory? took {second_dt:?} (mint {mint_dt:?}, first chunk {first_dt:?})"
+    );
 }

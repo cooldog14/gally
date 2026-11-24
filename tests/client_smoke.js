@@ -187,7 +187,7 @@ class El {
   select() { this.selected = true; }
 }
 
-function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, clipboardApi = true, clock = null, script = APP } = {}) {
+function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, storageThrows = false, clipboardApi = true, clock = null, script = APP } = {}) {
   const els = new Map();
   const calls = [];
   const docListeners = new Map();
@@ -231,11 +231,17 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
 
   if (key) session.set("gallery-key", key);
 
-  const storage = (map) => ({
-    getItem: (k) => (map.has(k) ? map.get(k) : null),
-    setItem: (k, v) => map.set(k, String(v)),
-    removeItem: (k) => map.delete(k),
-  });
+  const storage = (map) => {
+    if (storageThrows) {
+      const denied = () => { throw new Error("storage blocked"); };
+      return { getItem: denied, setItem: denied, removeItem: denied };
+    }
+    return {
+      getItem: (k) => (map.has(k) ? map.get(k) : null),
+      setItem: (k, v) => map.set(k, String(v)),
+      removeItem: (k) => map.delete(k),
+    };
+  };
 
   const response = (status, body) => ({
     status,
@@ -710,6 +716,17 @@ function galleryPage(locked) {
   });
 }
 
+async function testBlockedStorageStillLoads() {
+  // A browser that blocks site data throws from sessionStorage. The page must
+  // still render and keep its controls working.
+  const page = makePage({ pathname: "/", storageThrows: true });
+  await tick();
+  assert.strictEqual(page.els.get("empty").hidden, false);
+  assert.match(page.els.get("empty").textContent, /Upload photos to start/);
+  assert.strictEqual(page.els.get("upload-btn").hidden, false);
+  assert.strictEqual(page.els.get("key-dialog").open, false);
+}
+
 async function testButtonsWithStoredKey() {
   // Regression: KEY_MIN_LEN was undefined, so every one of these threw.
   const page = galleryPage(false);
@@ -850,6 +867,43 @@ async function testHomeUploadUsesOneSlug() {
   assert.strictEqual(puts.length, 2, "both files uploaded");
   for (const p of puts) assert.strictEqual(p.headers["X-Gallery-Slug"], SLUG, "batch targets the minted slug");
   assert.strictEqual(page.location.assigned, "/" + SLUG, "navigates to the batch gallery");
+}
+
+async function testHomeUploadReportsPartialFailure() {
+  const session = new Map();
+  const page = makePage({
+    pathname: "/",
+    session,
+    handler: (url, opts) => {
+      if (url === "/api/galleries/resolve") {
+        return { status: 200, ok: true, json: async () => ({ slug: SLUG }) };
+      }
+      if (opts.method === "PUT" && url.endsWith("/good.jpg")) {
+        return { status: 201, ok: true, json: async () => ({ name: "x", slug: SLUG }) };
+      }
+      if (opts.method === "PUT") {
+        return {
+          status: 413,
+          ok: false,
+          statusText: "status 413",
+          json: async () => ({ error: "file too large" }),
+        };
+      }
+      throw new Error("unexpected " + url);
+    },
+  });
+  await startBatch(page, [filed("good.jpg"), filed("bad.jpg")]);
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+  assert.match(session.get("upload-failed:" + SLUG), /bad\.jpg: file too large/);
+
+  const gallery = makePage({
+    pathname: "/" + SLUG,
+    session,
+    listing: { slug: SLUG, public: false, locked: false, photos: [{ name: "x" }] },
+  });
+  await tick();
+  assert.match(gallery.els.get("upload-status").textContent, /bad\.jpg: file too large/);
+  assert.strictEqual(session.has("upload-failed:" + SLUG), false, "failure note is one-shot");
 }
 
 async function testLostReplyDoesNotMintAgain() {
@@ -1318,6 +1372,22 @@ async function testCopyFallbackWithoutClipboard() {
   assert.strictEqual(page.els.get("copy-link-btn").textContent, "Copied");
 }
 
+async function testLegacySlugURLs() {
+  for (const slug of ["happy-otter-7", "oddball-slug-42"]) {
+    const page = makePage({
+      pathname: "/" + slug,
+      listing: { slug, public: true, locked: false, photos: [] },
+    });
+    await tick();
+    assert.strictEqual(page.els.get("gallery-state").hidden, false, slug + " opens the gallery");
+    assert.strictEqual(page.els.get("gallery-label").textContent, slug);
+    assert.ok(
+      page.calls.some((c) => c.url.startsWith("/api/galleries/" + slug + "/photos")),
+      slug + " is fetched like a gallery"
+    );
+  }
+}
+
 async function testPrivateGalleryKeyOpens() {
   const key = "Sunset-Beach-42";
   const slug = await mint(key);
@@ -1333,6 +1403,7 @@ async function testPrivateGalleryKeyOpens() {
 }
 
 (async () => {
+  await testBlockedStorageStillLoads();
   await testButtonsWithStoredKey();
   await testProtectReflectsLock();
   await testNoHeicNeverLoadsDecoder();
@@ -1341,7 +1412,9 @@ async function testPrivateGalleryKeyOpens() {
   await testPrivateProtectWarns();
   await testWrongCachedKeyReprompts();
   await testCopyFallbackWithoutClipboard();
+  await testLegacySlugURLs();
   await testHomeUploadUsesOneSlug();
+  await testHomeUploadReportsPartialFailure();
   await testLostReplyDoesNotMintAgain();
   await testUploadRetriesLostChunk();
   await testUploadResumesFromServerOffset();

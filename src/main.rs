@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gally_uring::{backup, router, state::AppState};
+use gally_uring::{backup, router, routes, state::AppState};
 
 /// Same resolution as the server: `GALLY_ROOT`, else the working directory.
 /// Not the compile-time crate dir: a copied binary must not look for its data
@@ -30,7 +30,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let state: Arc<AppState> = AppState::new(&root()).await?;
-    let app = router(state);
+    let app = router(state.clone());
+    tokio::spawn(routes::part_sweeper(state, routes::PART_SWEEP_PERIOD));
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())

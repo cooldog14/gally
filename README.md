@@ -30,6 +30,9 @@ opens another gallery. To open an existing gallery, use its link; enter its
 key (6–128 ASCII characters, no spaces or accents) when prompted. The
 four-word string in the URL after the first upload (for example
 `/brave-vole-juniper-badger-88e9`) is the generated gallery slug, not the key.
+Galleries created before 2026-10-30 have shorter `adj-noun-N` slugs (for
+example `/happy-otter-7`); those old links and files keep working, while new
+galleries get the four-word form.
 The key banner has **Copy key**; edit mode has **Show key** if you dismissed
 it. New galleries stay private until the owner ticks **Public** in edit mode;
 a viewer password only gates a public gallery. `ADMIN_PASS` and
