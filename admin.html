@@ -21,7 +21,7 @@ li button { margin-left: 8px; }
 <body>
 <h1>Admin</h1>
 <div id="login">
-  <input type="password" id="password" placeholder="Admin password" autocomplete="off">
+  <input type="password" id="password" placeholder="Admin password" aria-label="Admin password" autocomplete="off">
   <button id="unlock" type="button">Unlock</button>
   <p id="error" role="alert"></p>
 </div>
@@ -33,6 +33,7 @@ li button { margin-left: 8px; }
   </div>
   <h2>Galleries</h2>
   <ul id="galleries"></ul>
+  <button id="load-more-galleries" type="button" hidden>Load more</button>
   <p id="panel-error" role="alert"></p>
 </div>
 <script>
@@ -43,7 +44,9 @@ const errorEl = document.getElementById("error");
 const panel = document.getElementById("panel");
 const panelError = document.getElementById("panel-error");
 const list = document.getElementById("galleries");
+const moreBtn = document.getElementById("load-more-galleries");
 const sweepStatus = document.getElementById("sweep-status");
+let nextCursor = null;
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -68,10 +71,14 @@ function post(path) {
   return api(path, { method: "POST" });
 }
 
-async function load() {
-  panelError.textContent = "";
-  const data = await api("/api/admin/galleries");
-  list.textContent = "";
+async function load(reset = true) {
+  if (reset) {
+    panelError.textContent = "";
+    list.textContent = "";
+    nextCursor = null;
+  }
+  const url = "/api/admin/galleries?limit=200" + (nextCursor ? "&before=" + encodeURIComponent(nextCursor) : "");
+  const data = await api(url);
   for (const g of data.galleries || []) {
     const li = document.createElement("li");
     const a = document.createElement("a");
@@ -95,14 +102,26 @@ async function load() {
     li.append(a, meta, remove);
     list.appendChild(li);
   }
-  if (!(data.galleries || []).length) {
+  if (reset && !(data.galleries || []).length) {
     const li = document.createElement("li");
     li.className = "meta";
     li.textContent = "No galleries.";
     list.appendChild(li);
   }
-
+  nextCursor = data.next || null;
+  moreBtn.hidden = !nextCursor;
+  moreBtn.disabled = false;
 }
+
+moreBtn.addEventListener("click", async () => {
+  moreBtn.disabled = true;
+  try {
+    await load(false);
+  } catch (e) {
+    moreBtn.disabled = false;
+    panelError.textContent = e.message;
+  }
+});
 
 unlockBtn.addEventListener("click", async () => {
   errorEl.textContent = "";
@@ -112,16 +131,29 @@ unlockBtn.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: password.value }),
     });
-    document.getElementById("login").hidden = true;
-    panel.hidden = false;
+  } catch (e) {
+    errorEl.textContent = e.message;
+    return;
+  }
+  document.getElementById("login").hidden = true;
+  panel.hidden = false;
+  try {
     await load();
-  } catch (e) { errorEl.textContent = e.message; }
+  } catch (e) {
+    panelError.textContent = e.message;
+  }
 });
 
 document.getElementById("sweep").addEventListener("click", async () => {
   try {
     const r = await post("/api/admin/sweep");
-    sweepStatus.textContent = "Removed " + r.deleted + " orphaned file(s)" + (r.failed ? ", " + r.failed + " failed" : "");
+    sweepStatus.textContent =
+      "Removed " + r.deleted + " orphaned file(s)" +
+      (r.failed ? ", " + r.failed + " failed" : "") +
+      (r.galleries
+        ? " and " + r.galleries + " empty " + (r.galleries === 1 ? "gallery" : "galleries")
+        : "");
+    await load();
   } catch (e) { panelError.textContent = e.message; }
 });
 

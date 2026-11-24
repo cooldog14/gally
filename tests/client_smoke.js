@@ -88,6 +88,7 @@ class El {
     this.clientWidth = 800;
     this.complete = true;
     this.naturalWidth = 8;
+    this.paused = false;
   }
 
   get className() {
@@ -183,7 +184,8 @@ class El {
     this.open = false;
     this.dispatch("close", { type: "close" });
   }
-  focus() {}
+  focus() { this.page.document.activeElement = this; }
+  pause() { this.paused = true; }
   select() { this.selected = true; }
 }
 
@@ -227,6 +229,7 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
     },
   };
   document.documentElement.dataset.theme = "light";
+  document.activeElement = document.body;
   page.document = document;
 
   if (key) session.set("gallery-key", key);
@@ -593,7 +596,7 @@ async function workflowView() {
   assert(imageAt >= 0, "an image tile exists");
   const counter = page.els.get("counter");
   await page.fireEl(tiles()[imageAt]);
-  assert.strictEqual(page.els.get("lightbox").hidden, false);
+  assert.strictEqual(page.els.get("lightbox").open, true);
   assert.strictEqual(counter.textContent, `${imageAt + 1} / 203`);
   const shown = page.els.get("viewport").querySelector("img");
   assert(shown && shown.src.includes("/photos/") && shown.src.endsWith(".png"), "lightbox shows the original");
@@ -604,7 +607,7 @@ async function workflowView() {
   assert.strictEqual(counter.textContent, `${imageAt + 1} / 203`);
 
   await page.fire("close");
-  assert.strictEqual(page.els.get("lightbox").hidden, true);
+  assert.strictEqual(page.els.get("lightbox").open, false);
 
   await page.fireEl(tiles()[0]);
   await page.fire("prev");
@@ -612,7 +615,7 @@ async function workflowView() {
   await page.fireDocument("keydown", { key: "ArrowRight" });
   assert.strictEqual(counter.textContent, "1 / 203");
   await page.fireDocument("keydown", { key: "Escape" });
-  assert.strictEqual(page.els.get("lightbox").hidden, true, "Escape closes the viewer");
+  assert.strictEqual(page.els.get("lightbox").open, false, "Escape closes the viewer");
 
   await page.fire("theme-btn");
   assert.strictEqual(page.document.documentElement.dataset.theme, "dark");
@@ -725,6 +728,62 @@ async function testBlockedStorageStillLoads() {
   assert.match(page.els.get("empty").textContent, /Upload photos to start/);
   assert.strictEqual(page.els.get("upload-btn").hidden, false);
   assert.strictEqual(page.els.get("key-dialog").open, false);
+}
+
+async function testLightboxFocusAndLinkCleanup() {
+  const page = makePage({
+    pathname: "/" + SLUG,
+    listing: {
+      slug: SLUG,
+      public: true,
+      locked: false,
+      photos: [{ name: SLUG + "_" + "a".repeat(32) + "_file.pdf" }],
+    },
+  });
+  await tick();
+  const tile = page.els.get("grid").children[0];
+  assert(tile, "generic file tile");
+  tile.focus();
+  await page.fireEl(tile);
+  assert.strictEqual(page.els.get("lightbox").open, true);
+  assert.strictEqual(page.document.activeElement.id, "close", "close button gets focus");
+  const generic = page.els.get("viewport").querySelector(".file-generic");
+  assert(generic && generic.querySelector("a"), "generic file offers download");
+  await page.fire("close");
+  assert.strictEqual(page.els.get("lightbox").open, false);
+  assert.strictEqual(page.document.activeElement, tile, "focus returns to the tile");
+  assert.strictEqual(tile.querySelector("a"), null, "download link stays out of the tile");
+}
+
+async function testLightboxPausesAudio() {
+  const page = makePage({
+    pathname: "/" + SLUG,
+    listing: {
+      slug: SLUG,
+      public: true,
+      locked: false,
+      photos: [{ name: SLUG + "_" + "b".repeat(32) + "_sound.mp3" }],
+    },
+  });
+  await tick();
+  const tile = page.els.get("grid").children[0];
+  await page.fireEl(tile);
+  const audio = page.els.get("viewport").querySelector("audio");
+  assert(audio, "audio player");
+  assert.strictEqual(audio.paused, false);
+  await page.fire("close");
+  assert.strictEqual(audio.paused, true, "audio pauses on close");
+}
+
+function testAccessibleMarkup() {
+  const index = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+  assert.match(index, /id="key-input"[^>]*aria-label=/);
+  assert.match(index, /id="key-input"[^>]*aria-describedby="key-help"/);
+  assert.match(index, /id="setpass-input"[^>]*aria-label=/);
+  assert.match(index, /<dialog id="lightbox"/);
+  const admin = fs.readFileSync(path.join(__dirname, "..", "admin.html"), "utf8");
+  assert.match(admin, /id="password"[^>]*aria-label=/);
+  assert.match(admin, /id="load-more-galleries"/);
 }
 
 async function testButtonsWithStoredKey() {
@@ -1074,6 +1133,25 @@ async function testPasswordCheckErrorsAndCancel() {
   assert.strictEqual(page.els.get("grid").children.length, 0);
 }
 
+async function testAdminLoadErrorIsVisible() {
+  const html = fs.readFileSync(path.join(__dirname, "..", "admin.html"), "utf8");
+  const page = makePage({
+    script: html.match(/<script>([\s\S]*?)<\/script>/)[1],
+    handler: (url) => {
+      if (url.endsWith("/unlock")) return Response.json({ ok: true });
+      if (url.includes("/api/admin/galleries")) {
+        return Response.json({ error: "database unavailable" }, { status: 500 });
+      }
+      throw new Error("unexpected " + url);
+    },
+  });
+  page.els.get("password").value = "admin-password";
+  await page.fire("unlock");
+  assert.strictEqual(page.els.get("login").hidden, true);
+  assert.strictEqual(page.els.get("panel").hidden, false);
+  assert.match(page.els.get("panel-error").textContent, /database unavailable/);
+}
+
 async function testAdminLogout() {
   const html = fs.readFileSync(path.join(__dirname, "..", "admin.html"), "utf8");
   let logout;
@@ -1081,7 +1159,9 @@ async function testAdminLogout() {
     script: html.match(/<script>([\s\S]*?)<\/script>/)[1],
     handler: (url) => {
       if (url.endsWith("/unlock")) return Response.json({ ok: true });
-      if (url.endsWith("/galleries")) return Response.json({ galleries: [{ slug: SLUG, photos: 1 }] });
+      if (url.includes("/api/admin/galleries")) {
+        return Response.json({ galleries: [{ slug: SLUG, photos: 1 }], next: null });
+      }
       assert(url.endsWith("/logout"));
       return logout();
     },
@@ -1404,6 +1484,9 @@ async function testPrivateGalleryKeyOpens() {
 
 (async () => {
   await testBlockedStorageStillLoads();
+  await testLightboxFocusAndLinkCleanup();
+  await testLightboxPausesAudio();
+  testAccessibleMarkup();
   await testButtonsWithStoredKey();
   await testProtectReflectsLock();
   await testNoHeicNeverLoadsDecoder();
@@ -1424,6 +1507,7 @@ async function testPrivateGalleryKeyOpens() {
   await testWrongInviteCodeIsAskedAgain();
   await testEmptyPasswordKeepsDialogOpen();
   await testPasswordCheckErrorsAndCancel();
+  await testAdminLoadErrorIsVisible();
   await testAdminLogout();
   await testRejectedFilesDoNotMintGallery();
   if (BASE) {

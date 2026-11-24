@@ -53,7 +53,7 @@ try {
 <dialog id="key-dialog" aria-labelledby="key-title">
   <form method="dialog" id="key-form">
     <h2 id="key-title">Gallery key</h2>
-    <input type="text" id="key-input" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="128">
+    <input type="text" id="key-input" aria-label="Gallery key" aria-describedby="key-help" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="128">
     <p id="key-help">6-128 ASCII characters, no spaces or accents. For a new key use at least 12, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery.</p>
     <p id="key-error" role="alert"></p>
     <div id="key-actions">
@@ -65,8 +65,8 @@ try {
 <dialog id="pass-dialog" aria-labelledby="pass-title">
   <form method="dialog" id="pass-form">
     <h2 id="pass-title">Locked gallery</h2>
-    <p>This gallery is password-protected. Enter the gallery password to view it. The owner key always works too.</p>
-    <input type="password" id="pass-input" aria-label="Gallery password" placeholder="Gallery password" autocomplete="off">
+    <p id="pass-help">This gallery is password-protected. Enter the gallery password to view it. The owner key always works too.</p>
+    <input type="password" id="pass-input" aria-label="Gallery password" aria-describedby="pass-help" placeholder="Gallery password" autocomplete="off">
     <p id="pass-error" role="alert"></p>
     <div id="key-actions">
       <button id="pass-cancel" value="cancel" type="button">Cancel</button>
@@ -79,7 +79,7 @@ try {
     <h2 id="setpass-title">Protect gallery</h2>
     <p id="setpass-help">Viewers will need this password to open the gallery.</p>
     <p id="setpass-private" hidden><button id="setpass-public" type="button">Make public</button></p>
-    <input type="password" id="setpass-input" placeholder="New password" autocomplete="new-password">
+    <input type="password" id="setpass-input" aria-label="New gallery password" aria-describedby="setpass-help" placeholder="New password" autocomplete="new-password">
     <p id="setpass-error" role="alert"></p>
     <div id="key-actions">
       <button id="setpass-cancel" value="cancel" type="button">Cancel</button>
@@ -98,13 +98,13 @@ try {
     </div>
   </form>
 </dialog>
-<div id="lightbox" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>
+<dialog id="lightbox" aria-label="Photo viewer">
   <button id="close" aria-label="Close">&times;</button>
   <button id="prev" aria-label="Previous">&lsaquo;</button>
   <div id="viewport"></div>
   <button id="next" aria-label="Next">&rsaquo;</button>
   <div id="counter"></div>
-</div>
+</dialog>
 <script src="./app.js"></script>
 </body>
 </html>

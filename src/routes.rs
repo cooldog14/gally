@@ -33,6 +33,8 @@ const UPLOAD_FLOOR_WINDOW: Duration = Duration::from_secs(60);
 /// Abandoned resumable-upload temps count against the gallery quota until
 /// this age, then a sweep reclaims them.
 const PART_TTL: Duration = Duration::from_secs(3600);
+/// A gallery that never received a photo is reaped after this grace period.
+const EMPTY_GALLERY_TTL: Duration = Duration::from_secs(3600);
 /// Background reaping of expired upload temps. Health checks also run a
 /// sweep, but the cleanup must not depend on an external probe.
 pub const PART_SWEEP_PERIOD: Duration = Duration::from_secs(600);
@@ -636,7 +638,8 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Listing cursor: `<created_ms>:<name>` (split at the first colon).
+/// Opaque cursor: `<created>:<key>` (split at the first colon). The unit of
+/// `created` depends on the caller (photo ms vs admin gallery seconds).
 fn parse_cursor(s: &str) -> Option<(i64, String)> {
     let (created, name) = s.split_once(':')?;
     let created = created.parse::<i64>().ok()?;
@@ -967,22 +970,45 @@ pub async fn set_visibility(
 
 // --- admin ---
 
-pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn admin_galleries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Response {
     if !is_admin(&headers, &state) {
         return err(StatusCode::FORBIDDEN, "forbidden");
     }
+    let query = raw_query.unwrap_or_default();
+    let limit = query_param(&query, "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 1000);
+    let before = match query_param(&query, "before") {
+        None => None,
+        Some(cursor) => match parse_cursor(&cursor) {
+            Some(before) => Some(before),
+            None => return err(StatusCode::BAD_REQUEST, "bad cursor"),
+        },
+    };
     // Counters come from the DB: a directory scan costs O(files).
     let rows: Vec<(String, i64, i64, i64, i64)> = {
         let db = state.db.lock().unwrap();
         let mut stmt = match db.prepare(
-            "SELECT slug, created, photos, bytes, public FROM galleries ORDER BY created DESC",
+            "SELECT slug, created, photos, bytes, public FROM galleries
+             WHERE ?1 IS NULL OR created < ?1 OR (created = ?1 AND slug < ?2)
+             ORDER BY created DESC, slug DESC LIMIT ?3",
         ) {
             Ok(stmt) => stmt,
             Err(_) => return ApiError::Internal.into_response(),
         };
-        let rows = match stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        }) {
+        let (before_created, before_slug) = match &before {
+            Some((created, slug)) => (Some(*created), Some(slug.as_str())),
+            None => (None, None),
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![before_created, before_slug, limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ) {
             Ok(rows) => rows,
             Err(_) => return ApiError::Internal.into_response(),
         };
@@ -990,6 +1016,12 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
             Ok(rows) => rows,
             Err(_) => return ApiError::Internal.into_response(),
         }
+    };
+    let next = if rows.len() == limit {
+        rows.last()
+            .map(|(slug, created, ..)| format!("{created}:{slug}"))
+    } else {
+        None
     };
     let galleries: Vec<serde_json::Value> = rows
         .into_iter()
@@ -1003,7 +1035,11 @@ pub async fn admin_galleries(State(state): State<Arc<AppState>>, headers: Header
             })
         })
         .collect();
-    (StatusCode::OK, Json(json!({ "galleries": galleries }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "galleries": galleries, "next": next })),
+    )
+        .into_response()
 }
 
 /// Drop the admin token; the browser cookie is cleared in the response.
@@ -1313,14 +1349,88 @@ async fn sweep_parts(state: &AppState, budget: &mut UploadBudget) -> std::io::Re
     Ok(())
 }
 
+/// Reap galleries that never received a photo. A preserved unindexed
+/// original or any live upload keeps the gallery; one missing file must not
+/// turn into a deleted gallery.
+async fn sweep_empty_galleries(state: &AppState) -> Result<usize, ()> {
+    let cutoff = crate::db::now_millis() / 1000 - EMPTY_GALLERY_TTL.as_secs() as i64;
+    let candidates: Vec<String> = {
+        let db = state.db.lock().unwrap();
+        let mut stmt =
+            match db.prepare("SELECT slug FROM galleries WHERE photos = 0 AND created < ?1") {
+                Ok(stmt) => stmt,
+                Err(_) => return Err(()),
+            };
+        let rows = match stmt.query_map([cutoff], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(_) => return Err(()),
+        };
+        match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(rows) => rows,
+            Err(_) => return Err(()),
+        }
+    };
+    let mut removed = Vec::new();
+    {
+        // The admission lock makes the active/upload and file checks atomic
+        // with a new upload's target check.
+        let budget = state.upload_budget.lock().await;
+        for slug in candidates {
+            let prefix = format!("{slug}_");
+            if budget.active.keys().any(|id| id.starts_with(&prefix)) {
+                continue;
+            }
+            if has_prefixed(&state.dir, &prefix).await
+                || has_prefixed(&state.dir, &format!(".part-{slug}_")).await
+            {
+                continue;
+            }
+            let photos = {
+                let db = state.db.lock().unwrap();
+                match db.gallery_meta(&slug) {
+                    Ok(Some(meta)) => meta.photos,
+                    Ok(None) => continue,
+                    Err(_) => return Err(()),
+                }
+            };
+            if photos != 0 {
+                continue;
+            }
+            let removed_row = {
+                let mut db = state.db.lock().unwrap();
+                match db.remove_gallery(&slug) {
+                    Ok(removed) => removed,
+                    Err(_) => return Err(()),
+                }
+            };
+            if removed_row {
+                removed.push(slug);
+            }
+        }
+    }
+    for slug in &removed {
+        // Thumbs are derived; sweep them after the row is gone. This also
+        // clears any part that raced the target check but could not finish.
+        let _ = sweep_files(state, slug).await;
+    }
+    Ok(removed.len())
+}
+
 /// Reap expired upload temps even when no health checker is configured.
 /// Runs until the process exits; `every` is injectable for tests.
 pub async fn part_sweeper(state: Arc<AppState>, every: Duration) {
     loop {
         tokio::time::sleep(every).await;
-        let mut budget = state.upload_budget.lock().await;
-        if let Err(e) = sweep_parts(&state, &mut budget).await {
-            tracing::warn!(error = %e, "upload temp sweep failed");
+        {
+            let mut budget = state.upload_budget.lock().await;
+            if let Err(e) = sweep_parts(&state, &mut budget).await {
+                tracing::warn!(error = %e, "upload temp sweep failed");
+            }
+        }
+        match sweep_empty_galleries(&state).await {
+            Ok(0) => {}
+            Ok(galleries) => tracing::info!(galleries, "removed empty galleries"),
+            Err(()) => tracing::warn!("empty gallery sweep failed"),
         }
     }
 }
@@ -1642,9 +1752,13 @@ pub async fn admin_sweep(State(state): State<Arc<AppState>>, headers: HeaderMap)
         &mut failed,
     )
     .await;
+    let galleries = match sweep_empty_galleries(&state).await {
+        Ok(galleries) => galleries,
+        Err(()) => return ApiError::Internal.into_response(),
+    };
     (
         StatusCode::OK,
-        Json(json!({ "deleted": deleted, "failed": failed })),
+        Json(json!({ "deleted": deleted, "failed": failed, "galleries": galleries })),
     )
         .into_response()
 }
@@ -3297,6 +3411,64 @@ mod tests {
             reaped.is_ok(),
             "part sweeper did not remove the expired temp"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_gallery_sweep_keeps_recent_or_uploaded_galleries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(tmp.path()).await.expect("state");
+        let old = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("empty-old-key-01")
+            .expect("old");
+        let recent = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("empty-recent-key")
+            .expect("recent");
+        let with_file = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("empty-file-key-01")
+            .expect("file");
+        let active = state
+            .db
+            .lock()
+            .unwrap()
+            .get_or_create_gallery("empty-active-key")
+            .expect("active");
+        let cutoff = crate::db::now_millis() / 1000 - EMPTY_GALLERY_TTL.as_secs() as i64 - 60;
+        for slug in [&old, &with_file, &active] {
+            state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE galleries SET created = ?1 WHERE slug = ?2",
+                    rusqlite::params![cutoff, slug],
+                )
+                .unwrap();
+        }
+        let stray = format!("{with_file}_{}_x.jpg", "a".repeat(32));
+        std::fs::write(state.dir.join(&stray), b"x").unwrap();
+        state
+            .upload_budget
+            .lock()
+            .await
+            .active
+            .insert(format!("{active}_{}", "b".repeat(32)), Default::default());
+
+        let removed = sweep_empty_galleries(&state).await.expect("sweep");
+        assert_eq!(removed, 1);
+        let db = state.db.lock().unwrap();
+        assert!(!db.gallery_exists(&old).unwrap());
+        assert!(db.gallery_exists(&recent).unwrap());
+        assert!(db.gallery_exists(&with_file).unwrap());
+        assert!(db.gallery_exists(&active).unwrap());
     }
 
     #[test]

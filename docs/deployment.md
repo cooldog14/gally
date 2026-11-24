@@ -102,9 +102,13 @@ but the login returns 404.
 
 The admin can:
 
-- list galleries (slug, photo count, bytes, visibility);
+- list galleries 200 at a time (slug, photo count, bytes, visibility);
 - delete one gallery and its files;
-- sweep files whose gallery row is gone, plus expired upload temp files.
+- sweep files whose gallery row is gone, expired upload temp files, and empty
+  galleries older than one hour.
+
+The same empty-gallery sweep runs in the background every ten minutes, so a
+home batch that never stored a photo does not accumulate in the list.
 
 The admin cannot recover a key or a viewer password, and cannot read a private
 gallery's photos. Deleting a gallery does not revoke its key: the same key

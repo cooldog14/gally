@@ -362,13 +362,15 @@ If `ADMIN_PASS` is unset, unlock answers `404` and the other routes answer
 | Route | Body | Success |
 |---|---|---|
 | `POST /api/admin/unlock` | `{"password":"..."}` | `200 {"ok":true}` + `admin` cookie; `403` wrong, `429` locked out, `404` admin disabled |
-| `GET /api/admin/galleries` | — | `200 {"galleries":[{slug,created,photos,bytes,public}]}`; `created` is Unix ms |
+| `GET /api/admin/galleries` | optional `limit` (default 200, 1–1000) and `before` | `200 {"galleries":[{slug,created,photos,bytes,public}],"next":...}`; `created` is Unix seconds |
 | `POST /api/admin/galleries/{slug}/remove` | — | `200 {"deleted":slug,"files":N}`; `404`; `500` partial |
-| `POST /api/admin/sweep` | — | `200 {"deleted":N,"failed":N}`; removes orphaned files and expired temps |
+| `POST /api/admin/sweep` | — | `200 {"deleted":N,"failed":N,"galleries":N}`; removes orphaned files, expired temps, and empty galleries older than one hour |
 | `POST /api/admin/logout` | — | `200 {"ok":true}`; clears the cookie. Without a live admin session: `403 {"error":"admin session inactive"}`; a generic `403` is not proof of logout |
 
 The admin cannot recover keys or passwords, and cannot read a private
-gallery's photos. Deleting a gallery does not revoke its key.
+gallery's photos. Deleting a gallery does not revoke its key. The gallery
+list uses `created:slug` as its `before` cursor and returns `next` until the
+last page; the admin page uses 200-row pages.
 
 ### Static and SPA routes
 

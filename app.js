@@ -837,12 +837,17 @@ function openLightbox(i) {
   if (!photos.length) { closeLightbox(); return; }
   index = Math.min(Math.max(i, 0), photos.length - 1);
   showInViewport(index);
-  lightbox.hidden = false;
+  if (!lightbox.open) {
+    focusReturn = document.activeElement;
+    lightbox.showModal();
+  }
+  closeBtn.focus();
   render();
 }
 
 // Tile index whose media is currently adopted by the lightbox (-1 = none).
 let adoptedTile = -1;
+let focusReturn = null;
 
 function showInViewport(i) {
   stopViewportMedia();
@@ -920,8 +925,8 @@ function showInViewport(i) {
 }
 
 function stopViewportMedia() {
-  const v = viewport.querySelector("video");
-  if (v) { try { v.pause(); } catch (_) {} }
+  const media = viewport.querySelector("video, audio");
+  if (media) { try { media.pause(); } catch (_) {} }
 }
 
 function restoreThumbnails() {
@@ -931,6 +936,8 @@ function restoreThumbnails() {
     const media = viewport.querySelector("img, video, .file-generic");
     const tile = grid.children[adoptedTile];
     if (media && tile && !tile.querySelector("img, video, .file-generic")) {
+      const link = media.querySelector("a");
+      if (link) link.remove();
       if (media.tagName === "VIDEO") { media.controls = false; media.muted = true; }
       tile.prepend(media);
     }
@@ -940,9 +947,16 @@ function restoreThumbnails() {
 }
 
 function closeLightbox() {
-  restoreThumbnails();
-  lightbox.hidden = true;
+  if (lightbox.open) lightbox.close();
 }
+
+lightbox.addEventListener("close", () => {
+  restoreThumbnails();
+  if (focusReturn) {
+    try { focusReturn.focus(); } catch (_) {}
+    focusReturn = null;
+  }
+});
 
 function step(d) {
   if (!photos.length) { closeLightbox(); return; }
@@ -956,10 +970,10 @@ prevBtn.addEventListener("click", () => step(-1));
 nextBtn.addEventListener("click", () => step(1));
 closeBtn.addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (e) => {
-  if (lightbox.hidden) return;
+  if (!lightbox.open) return;
   if (e.key === "ArrowLeft") step(-1);
   else if (e.key === "ArrowRight") step(1);
-  else if (e.key === "Escape") closeLightbox();
+  else if (e.key === "Escape") { e.preventDefault(); closeLightbox(); }
 });
 
 // The key is hand-typed, never generated: the user must remember (or note)

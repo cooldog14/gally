@@ -2616,6 +2616,80 @@ async fn admin_sweep_removes_only_orphans() {
 }
 
 #[tokio::test]
+async fn admin_sweep_removes_old_empty_galleries() {
+    let (state, _tmp) = test_state().await;
+    let (_, v) = resolve(&state, "empty-sweep-key").await;
+    let slug = v["slug"].as_str().unwrap().to_string();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE galleries SET created = CAST(strftime('%s','now') AS INTEGER) - 7200 WHERE slug = ?1",
+            [&slug],
+        )
+        .unwrap();
+    let cookie = admin_cookie(&state);
+    let r = request(
+        "POST",
+        "/api/admin/sweep",
+        &[("cookie", cookie.as_str())],
+        Body::empty(),
+    );
+    let resp = router(state.clone()).oneshot(r).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["galleries"], serde_json::Value::from(1));
+    assert!(!state.db.lock().unwrap().gallery_exists(&slug).unwrap());
+}
+
+#[tokio::test]
+async fn admin_galleries_paginate_with_cursor() {
+    let (state, _tmp) = test_state().await;
+    let mut slugs = Vec::new();
+    for i in 0..3 {
+        let (_, v) = resolve(&state, &format!("page-key-{i}")).await;
+        let slug = v["slug"].as_str().unwrap().to_string();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE galleries SET created = ?1 WHERE slug = ?2",
+                rusqlite::params![100 + i, slug],
+            )
+            .unwrap();
+        slugs.push(slug);
+    }
+    let cookie = admin_cookie(&state);
+    let base = "/api/admin/galleries?limit=2";
+    let resp = router(state.clone())
+        .oneshot(get(base, &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_json(resp).await;
+    let rows = page["galleries"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["slug"], slugs[2].as_str());
+    assert_eq!(rows[1]["slug"], slugs[1].as_str());
+    let next = page["next"].as_str().unwrap().to_string();
+    assert!(next.starts_with("101:"), "{next}");
+
+    let second = format!("{base}&before={next}");
+    let resp = router(state.clone())
+        .oneshot(get(&second, &[("cookie", cookie.as_str())]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_json(resp).await;
+    let rows = page["galleries"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["slug"], slugs[0].as_str());
+    assert!(page["next"].is_null());
+}
+
+#[tokio::test]
 async fn admin_logout_clears_cookie_and_token() {
     let (state, _tmp) = test_state().await;
     let cookie = admin_cookie(&state);
