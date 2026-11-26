@@ -38,6 +38,8 @@ it. New galleries stay private until the owner ticks **Public** in edit mode;
 a viewer password only gates a public gallery. `ADMIN_PASS` and
 `GALLY_INVITE_CODE` are unset by default, so admin and the invite gate are
 off.
+If prompted for an invite code, enter the value shared by the site operator,
+not the setting name `GALLY_INVITE_CODE`.
 
 The app writes `galleries.db` and `photos/` under the working directory; set
 `GALLY_ROOT=/path` to move them. The local run is plain HTTP with secure

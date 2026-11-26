@@ -12,6 +12,7 @@ const vm = require("vm");
 
 const APP = fs.readFileSync(process.env.APP_JS || path.join(__dirname, "..", "app.js"), "utf8");
 const BASE = (process.env.GALLY_BASE_URL || "").replace(/\/+$/, "");
+const INVITE = process.env.GALLY_TEST_INVITE;
 
 // 1x1 PNG: real bytes so the server can generate previews.
 const PNG = Buffer.from(
@@ -369,9 +370,11 @@ async function waitFor(fn, what, ms = 10000) {
 // --- real-server helpers (the workflows below) ---
 
 async function mint(key) {
+  const headers = { "Content-Type": "application/json", "X-Gallery-Key": key };
+  if (INVITE) headers["X-Invite-Code"] = INVITE;
   const res = await globalThis.fetch(BASE + "/api/galleries/resolve", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
+    headers,
     body: "{}",
   });
   assert.strictEqual(res.status, 200, "mint gallery");
@@ -455,6 +458,13 @@ async function workflowUpload() {
   assert.strictEqual(home.location.assigned, "", "no navigation for a weak key");
 
   await submitKey(home, key);
+  if (INVITE) {
+    await waitFor(() => home.els.get("key-dialog").open &&
+      home.els.get("key-title").textContent === "Invite code", "live invite prompt");
+    await submitKey(home, "wrong-code");
+    await waitFor(() => /Incorrect invite code/.test(home.els.get("key-error").textContent), "live invite rejection");
+    await submitKey(home, INVITE);
+  }
   await batch;
   assert.match(home.location.assigned, /^\/[a-z]+-[a-z]+-[a-z]+-[a-z]+-[0-9a-f]{4}$/, "navigates to minted gallery");
   const slug = home.location.assigned.slice(1);
@@ -1026,8 +1036,6 @@ async function testBlockedStorageStillLoads() {
   // still render and keep its controls working.
   const page = makePage({ pathname: "/", storageThrows: true });
   await tick();
-  assert.strictEqual(page.els.get("empty").hidden, false);
-  assert.match(page.els.get("empty").textContent, /Upload photos to start/);
   assert.strictEqual(page.els.get("upload-btn").hidden, false);
   assert.strictEqual(page.els.get("key-dialog").open, false);
 }
@@ -1079,7 +1087,7 @@ async function testLightboxPausesAudio() {
 
 function testAccessibleMarkup() {
   const index = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
-  assert.match(index, /id="key-input"[^>]*aria-label=/);
+  assert.match(index, /id="key-input"[^>]*aria-labelledby="key-title"/);
   assert.match(index, /id="key-input"[^>]*aria-describedby="key-help"/);
   assert.match(index, /id="setpass-input"[^>]*aria-label=/);
   assert.match(index, /<dialog id="lightbox"/);
@@ -1429,6 +1437,7 @@ async function testWrongInviteCodeIsAskedAgain() {
   assert.strictEqual(resolves.length, 2, "the wrong code is not re-sent");
   assert.strictEqual(page.els.get("key-dialog").open, true);
   assert.match(page.els.get("key-title").textContent, /Invite code/);
+  assert.match(page.els.get("key-error").textContent, /Incorrect invite code/);
 
   page.els.get("key-input").value = "good-code";
   await page.fire("key-form", { type: "submit", submitter: { value: "default" }, preventDefault() {} });
@@ -1719,14 +1728,11 @@ async function testUploadKeyCheckWaitsForRateLimit() {
   assert.strictEqual(page.els.get("upload-status").textContent, "Uploaded 1 photo.");
 }
 
-async function testLandingExplainsKeys() {
+async function testBlankLanding() {
   const page = makePage({ pathname: "/" });
   await tick();
-  assert.match(
-    page.els.get("empty").textContent,
-    /Upload photos to start a new private gallery/,
-    "landing explains what to do"
-  );
+  assert.strictEqual(page.els.get("empty").hidden, true, "no empty-gallery message on the landing");
+  assert.strictEqual(page.els.get("empty").textContent, "");
   assert.strictEqual(page.els.get("gallery-state").hidden, true, "no state on the landing");
   assert.strictEqual(page.els.get("copy-link-btn").hidden, true, "no link to copy on the landing");
 }
@@ -1901,7 +1907,7 @@ async function testPrivateGalleryKeyOpens() {
   await testNoHeicNeverLoadsDecoder();
   await testHeicFetchesOnlyWhenVisible();
   await testHeicBudgetAndFallback();
-  await testLandingExplainsKeys();
+  await testBlankLanding();
   await testPrivateProtectWarns();
   await testLateOwnerCheckCannotResolveCreatePrompt();
   await testWrongCachedKeyReprompts();

@@ -9,6 +9,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const INVITE: &str = "Smoke invite-42";
+
 struct Server {
     child: Child,
     port: u16,
@@ -32,7 +34,7 @@ impl Server {
             .env("GALLY_MIN_FREE_BYTES", "0")
             .env("RUST_LOG", "error")
             .env_remove("ADMIN_PASS")
-            .env_remove("GALLY_INVITE_CODE")
+            .env("GALLY_INVITE_CODE", format!(" {INVITE} "))
             .current_dir(tmp.path())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -70,6 +72,7 @@ fn client_smoke() {
     let out = Command::new("node")
         .arg(&script)
         .current_dir(root)
+        .env("GALLY_TEST_INVITE", INVITE)
         .env(
             "GALLY_BASE_URL",
             format!("http://127.0.0.1:{}", server.port),

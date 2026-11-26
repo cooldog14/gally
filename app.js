@@ -223,7 +223,8 @@ function showLanding() {
   nextCursor = null;
   galleryLocked = false;
   renderGrid();
-  empty.textContent = "Upload photos to start a new private gallery. To open an existing gallery, use its link; a private gallery also needs its key.";
+  empty.hidden = true;
+  empty.textContent = "";
 }
 
 function showUnavailable(message) {
@@ -1134,7 +1135,7 @@ function finishKeyPrompt(prompt, value) {
   prompt.resolve(value);
 }
 
-function needKey(mode, { title, help, validate } = {}) {
+function needKey(mode, { title, help, validate, error = "" } = {}) {
   // Create, invite, and other galleries cannot consume the old prompt's answer.
   finishKeyPrompt(keyPrompt, "");
   const prompt = { mode, validate, controller: validate ? new AbortController() : null, resolve: null };
@@ -1142,9 +1143,9 @@ function needKey(mode, { title, help, validate } = {}) {
   keyPrompt = prompt;
   document.getElementById("key-title").textContent =
     title || (mode === "create" ? "New gallery key" : "Gallery key");
-  keyHelp.textContent = help || "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery. Using the same key on the home page starts a new gallery, never an existing one.";
+  keyHelp.textContent = help || "At least 12 characters, with a capital letter and a symbol.";
   keyInput.value = "";
-  keyError.textContent = "";
+  keyError.textContent = error;
   keyConfirm.disabled = false;
   keyDialog.showModal();
   keyInput.focus();
@@ -1221,17 +1222,6 @@ passDialog.addEventListener("close", () => {
   passInput.value = "";
   resolve(null);
 });
-// Invite code for NEW galleries: memory-only, asked once per batch when the
-// server answers "invite required". Contributing to an existing gallery
-// never needs it.
-let inviteCode = "";
-
-function needInvite() {
-  return inviteCode || needKey("invite", {
-    title: "Invite code",
-    help: "Ask the gallery owner for the invite code.",
-  });
-}
 
 keyForm.addEventListener("submit", async (e) => {
   // The dialog closes only on success, so a failed owner-key check can show
@@ -1242,12 +1232,11 @@ keyForm.addEventListener("submit", async (e) => {
   keyError.textContent = "";
   const v = keyInput.value.trim();
   if (prompt.mode === "invite") {
-    if (!/^[\x21-\x7e]{1,128}$/.test(v)) {
-      keyError.textContent = !v ? "Invite code required" : "Invite code must be ASCII (no spaces/accents)";
+    if (!/^[\x20-\x7e]{1,128}$/.test(v)) {
+      keyError.textContent = !v ? "Invite code required" : "Use 1–128 printable ASCII characters.";
       keyInput.focus();
       return;
     }
-    inviteCode = v;
     finishKeyPrompt(prompt, v);
     return;
   }
@@ -1291,8 +1280,9 @@ keyDialog.addEventListener("close", () => {
 
 uploadBtn.addEventListener("click", () => fileInput.click());
 
-/** Mint one gallery for a whole home upload batch (invite asked once). */
+/** Mint one gallery for a whole home upload batch. */
 async function newGallery(key) {
+  let inviteCode = "";
   for (;;) {
     const headers = { "Content-Type": "application/json", "X-Gallery-Key": key };
     if (inviteCode) headers["X-Invite-Code"] = inviteCode;
@@ -1310,9 +1300,12 @@ async function newGallery(key) {
     if (res.status !== 403 || data?.error !== "invite required") {
       throw new Error("Could not create the gallery. Try again.");
     }
-    // A rejected code must not be cached and re-sent in a tight loop.
-    inviteCode = "";
-    if (!(await needInvite())) return "";
+    inviteCode = await needKey("invite", {
+      title: "Invite code",
+      help: "Enter the invite code shared by the site operator.",
+      error: inviteCode ? "Incorrect invite code. Check it and try again." : "",
+    });
+    if (!inviteCode) return "";
   }
 }
 

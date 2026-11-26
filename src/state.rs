@@ -333,6 +333,21 @@ impl AppState {
     }
 
     pub async fn new_with(root: &Path, limits: Limits) -> anyhow::Result<Arc<AppState>> {
+        let invite = match std::env::var("GALLY_INVITE_CODE") {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.len() > 128 || !trimmed.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+                    anyhow::bail!(
+                        "GALLY_INVITE_CODE must contain at most 128 printable ASCII characters"
+                    );
+                }
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("GALLY_INVITE_CODE must contain printable ASCII characters");
+            }
+        };
         // Lock before touching the dir: the stale-.part sweep below would
         // otherwise delete a live server's in-flight uploads.
         tokio::fs::create_dir_all(root).await?;
@@ -463,11 +478,7 @@ impl AppState {
             pass_ok: Mutex::new(HashMap::new()),
             pass_fail: Mutex::new(HashMap::new()),
             statics,
-            invite: Mutex::new(
-                std::env::var("GALLY_INVITE_CODE")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty()),
-            ),
+            invite: Mutex::new(invite),
             limits,
             media_secret,
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
