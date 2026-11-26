@@ -30,8 +30,7 @@ const START_HIDDEN = new Set([
   "key-banner",
   "lightbox",
   "load-more",
-  "setpass-private",
-  "setpass-remove",
+  "share-password-field",
 ]);
 
 class ClassList {
@@ -528,6 +527,14 @@ async function testDelayedListingSharesUploadPrompt() {
   assert.strictEqual(page.els.get("grid").children.length, 1);
 }
 
+async function saveShare(page, mode, password = "") {
+  await page.fire("share-btn");
+  page.els.get("share-mode").value = mode;
+  await page.fire("share-mode", { type: "change" });
+  page.els.get("share-password").value = password;
+  await page.fire("share-form", { type: "submit" });
+}
+
 async function testVisibilityLostReply() {
   const key = "Visibility-Key-77!";
   const slug = await mint(key);
@@ -568,8 +575,8 @@ async function testVisibilityLostReply() {
     },
   });
   const state = page.els.get("gallery-state");
-  const checkbox = page.els.get("public-check");
-  const status = page.els.get("edit-status");
+  const save = page.els.get("share-save");
+  const error = page.els.get("share-error");
   await waitFor(() => state.textContent === "Private", "initial private visibility");
 
   // Delay a real listing requested by a completed upload until after the write.
@@ -579,34 +586,28 @@ async function testVisibilityLostReply() {
   await waitFor(() => stalePublic === false, "pre-write private listing");
   await page.fire("edit-btn");
   loseWrite = true;
-  checkbox.checked = true;
-  const publishFromCheckbox = page.fire("public-check", { type: "change" });
+  const publishFromDialog = saveShare(page, "public");
   await waitFor(() => recoveryStarted, "owner reread after lost publish reply");
   assert.strictEqual(state.textContent, "Visibility unknown");
-  assert(checkbox.indeterminate && checkbox.disabled);
-  assert.strictEqual(status.textContent, "", "no confirmation before an authoritative reply");
+  assert(save.disabled);
+  assert.strictEqual(error.textContent, "", "no confirmation before an authoritative reply");
   releaseRecovery();
-  await publishFromCheckbox;
-  assert.strictEqual(status.textContent, "", "confirmed visibility needs no success message");
+  await publishFromDialog;
+  assert.strictEqual(page.els.get("share-dialog").open, false, "confirmed sharing closes");
   releaseStale();
   await batch;
   assert.strictEqual(state.textContent, "Public", "pre-write listing cannot revert visibility");
-  assert(checkbox.checked && !checkbox.indeterminate && !checkbox.disabled);
   assert.strictEqual(await galleryStatus(slug), 200, "public state matches the real server");
 
   loseWrite = false;
-  checkbox.checked = false;
-  await page.fire("public-check", { type: "change" });
-  await page.fire("lock-btn");
+  await saveShare(page, "private");
   loseWrite = true;
   loseRead = true;
-  await page.fire("setpass-public");
-  assert.strictEqual(await galleryStatus(slug), 200, "Make public also committed before losing its reply");
+  await saveShare(page, "public");
+  assert.strictEqual(await galleryStatus(slug), 200, "the server published before the reply was lost");
   assert.strictEqual(state.textContent, "Visibility unknown", "failed owner read cannot restore Private");
-  assert(checkbox.indeterminate && checkbox.disabled);
-  assert.strictEqual(status.textContent, "", "Protect cannot confirm an ambiguous write");
-  assert.match(page.els.get("setpass-error").textContent, /Visibility unknown.*Reload/);
-  assert.match(page.els.get("setpass-help").textContent, /Visibility unknown/);
+  assert(page.els.get("share-btn").disabled);
+  assert.match(error.textContent, /Visibility unknown.*Reload/);
 }
 
 async function testPasswordUnconfirmedReply() {
@@ -623,13 +624,13 @@ async function testPasswordUnconfirmedReply() {
     key,
     async handler(url, opts) {
       const res = await globalThis.fetch(BASE + url, opts);
-      if (url.endsWith("/lock")) {
+      if (url.endsWith("/visibility")) {
         assert.strictEqual(res.status, 200, "the server committed the password change");
-        assert.deepStrictEqual(await res.json(), { slug, locked: true });
+        assert.deepStrictEqual(await res.json(), { slug, public: true, locked: true });
         committed = true;
         return new Response("{", { status: 200 });
       }
-      if (committed && url.includes("/photos?")) {
+      if (committed && url.endsWith("/photos?limit=1")) {
         refreshedLocked = (await res.clone().json()).locked;
         await pending;
       }
@@ -637,26 +638,20 @@ async function testPasswordUnconfirmedReply() {
     },
   });
   const badge = page.els.get("gallery-state");
-  const status = page.els.get("upload-status");
   const storageKey = "gallery-pass:" + slug;
-  const message = "Password change was not confirmed. Try again.";
+  const message = "Sharing change was not confirmed. Try again.";
   await waitFor(() => badge.textContent === "Public", "initial unlocked badge");
-  await page.fire("lock-btn");
-  const dialog = page.els.get("setpass-dialog");
-  page.els.get("setpass-input").value = password;
-  const save = page.fire("setpass-form", { type: "submit", submitter: { value: "default" } });
-  dialog.close(); // Native method=dialog closes before the async reply.
+  const save = saveShare(page, "protected", password);
+  const dialog = page.els.get("share-dialog");
   await waitFor(() => refreshedLocked === true, "authoritative locked listing");
-  assert.strictEqual(status.textContent, message, "corrupt acknowledgment never reports success");
-  assert.strictEqual(badge.textContent, "Public", "wait for the authoritative listing");
+  assert.strictEqual(badge.textContent, "Visibility unknown", "wait for the authoritative listing");
   assert.strictEqual(page.session.has(storageKey), false);
   release();
   await save;
   assert.strictEqual(badge.textContent, "Public · Protected");
-  assert.strictEqual(status.textContent, message);
   assert.strictEqual(page.session.has(storageKey), false, "listing cannot confirm the new password");
   assert.strictEqual(dialog.open, true);
-  assert.strictEqual(page.els.get("setpass-error").textContent, message);
+  assert.strictEqual(page.els.get("share-error").textContent, message);
 }
 
 // --- workflow 2: edit ---
@@ -692,41 +687,43 @@ async function workflowEdit() {
   await page.fireEl(tiles()[1]);
   assert.strictEqual(sel(), "1 selected", "clicking a selected tile deselects it");
 
-  assert.strictEqual(page.els.get("public-check").checked, false, "new galleries are private");
-  page.els.get("public-check").checked = true;
-  await page.fire("public-check", { type: "change" });
-  assert.strictEqual(page.els.get("public-check").checked, true);
-  assert.strictEqual(page.els.get("gallery-state").textContent, "Public", "public state updates");
-  assert.strictEqual(await galleryStatus(slug), 200, "public gallery lists anonymously");
+  assert.strictEqual(await galleryStatus(slug), 404, "new galleries are private");
+  const visibility = BASE + "/api/galleries/" + slug + "/visibility";
+  for (const body of [{ mode: "protected" }, { mode: "public", password: "Viewer-Pass-9" }]) {
+    const res = await globalThis.fetch(visibility, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
+      body: JSON.stringify(body),
+    });
+    assert.strictEqual(res.status, 400, "invalid sharing changes are rejected");
+    assert.strictEqual(await galleryStatus(slug), 404, "invalid changes never publish");
+  }
 
-  page.els.get("public-check").checked = false;
-  await page.fire("public-check", { type: "change" });
-  assert.strictEqual(page.els.get("public-check").checked, false);
-  assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private state updates");
-  assert.strictEqual(await galleryStatus(slug), 404, "private gallery hides");
+  await saveShare(page, "protected", "Viewer-Pass-9");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Public · Protected");
+  assert.strictEqual(await galleryStatus(slug), 401, "one save publishes with the password");
+  const viewerListing = BASE + "/api/galleries/" + slug + "/photos?limit=1";
+  let viewer = await globalThis.fetch(viewerListing, { headers: { "X-Gallery-Pass": "Viewer-Pass-9" } });
+  assert.strictEqual(viewer.status, 200, "the new password opens the gallery");
+  const cookie = viewer.headers.get("Set-Cookie").split(";")[0];
+  await viewer.arrayBuffer();
 
-  page.els.get("public-check").checked = true;
-  await page.fire("public-check", { type: "change" });
+  await saveShare(page, "private");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Private");
+  assert.strictEqual(await galleryStatus(slug), 404, "private gallery hides again");
+  await saveShare(page, "protected");
+  assert.strictEqual(await galleryStatus(slug), 401, "protected mode can reuse the saved password");
+  viewer = await globalThis.fetch(viewerListing, { headers: { Cookie: cookie } });
+  assert.strictEqual(viewer.status, 401, "returning to protected does not revive old access");
+  await viewer.arrayBuffer();
 
-  await page.fire("lock-btn");
-  assert.strictEqual(page.els.get("setpass-dialog").open, true);
-  assert.strictEqual(page.els.get("setpass-remove").hidden, true, "unlocked gallery has nothing to remove");
-  page.els.get("setpass-input").value = "Viewer-Pass-9";
-  await page.fire("setpass-form", { type: "submit", submitter: { value: "default" } });
-  assert.strictEqual(page.els.get("upload-status").textContent, "Gallery protected.");
-  assert.strictEqual(page.els.get("gallery-state").textContent, "Public · Protected", "protected state");
-  assert.strictEqual(await galleryStatus(slug), 401, "protected gallery asks for the password");
+  await saveShare(page, "public");
+  assert.strictEqual(page.els.get("gallery-state").textContent, "Public");
+  assert.strictEqual(await galleryStatus(slug), 200, "open links no longer need the password");
 
-  await page.fire("lock-btn");
-  assert.strictEqual(page.els.get("setpass-remove").hidden, false, "locked gallery offers Remove");
-  await page.fire("setpass-form", { type: "submit", submitter: { value: "remove" } });
-  assert.strictEqual(page.els.get("upload-status").textContent, "Protection removed.");
-  assert.strictEqual(page.els.get("gallery-state").textContent, "Public", "state after unlock");
-  assert.strictEqual(await galleryStatus(slug), 200);
-
-  await page.fire("lock-btn");
-  await page.fire("setpass-cancel");
-  assert.strictEqual(page.els.get("setpass-dialog").open, false, "Protect dialog cancels");
+  await page.fire("share-btn");
+  await page.fire("share-cancel");
+  assert.strictEqual(page.els.get("share-dialog").open, false);
 
   // Leave and re-enter edit mode to clear the selection.
   await page.fire("done-btn");
@@ -1091,68 +1088,26 @@ function testAccessibleMarkup() {
   const index = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
   assert.match(index, /id="key-input"[^>]*aria-labelledby="key-title"/);
   assert.match(index, /id="key-input"[^>]*aria-describedby="key-help"/);
-  assert.match(index, /id="setpass-input"[^>]*aria-label=/);
+  assert.match(index, /<label for="share-password">/);
   assert.match(index, /<dialog id="lightbox"/);
   const admin = fs.readFileSync(path.join(__dirname, "..", "admin.html"), "utf8");
   assert.match(admin, /id="password"[^>]*aria-label=/);
   assert.match(admin, /id="load-more-galleries"/);
 }
 
-async function testButtonsWithStoredKey() {
-  // Regression: KEY_MIN_LEN was undefined, so every one of these threw.
-  const page = galleryPage(false);
-  await tick();
-  await page.fire("edit-btn");
-  await page.fire("lock-btn");
-}
-
-async function testProtectReflectsLock() {
-  const lockedPage = galleryPage(true);
-  await tick();
-  await lockedPage.fire("lock-btn");
-  assert.strictEqual(lockedPage.els.get("setpass-remove").hidden, false, "locked gallery offers Remove");
-
-  const openPage = galleryPage(false);
-  await tick();
-  await openPage.fire("lock-btn");
-  assert.strictEqual(openPage.els.get("setpass-remove").hidden, true, "unlocked gallery hides Remove");
-
-  // Enter in #setpass-input must submit Save, never Remove: browsers use the
-  // first submit button in tree order as the default submitter.
-  const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
-  const formStart = html.indexOf('id="setpass-form"');
-  const form = html.slice(formStart, html.indexOf("</form>", formStart));
-  const submits = [...form.matchAll(/<button[^>]*type="submit"[^>]*>/g)].map((m) => m[0]);
-  assert.strictEqual(submits.length, 2, "setpass-form has Save and Remove");
-  assert.match(submits[0], /id="setpass-confirm"/, "Enter submits Save");
-  assert.match(submits[0], /value="default"/);
-  assert.match(submits[1], /id="setpass-remove"/);
-
-  // Implicit Enter (browsers may omit `submitter`) must send the typed
-  // password, not the remove action's empty one.
-  let sent = null;
-  const enterPage = makePage({
-    pathname: "/" + SLUG,
-    key: KEY,
-    listing: { slug: SLUG, public: true, locked: true, photos: [] },
-    handler: (url, opts) => {
-      if (url.endsWith("/lock")) {
-        sent = JSON.parse(opts.body);
-        return {
-          status: 200,
-          ok: true,
-          statusText: "status 200",
-          json: async () => ({ slug: SLUG, locked: true }),
-        };
-      }
-      throw new Error("unexpected request " + url);
-    },
-  });
-  await tick();
-  await enterPage.fire("lock-btn");
-  enterPage.els.get("setpass-input").value = "Viewer-Pass-9";
-  await enterPage.fire("setpass-form", { type: "submit" });
-  assert.deepStrictEqual(sent, { password: "Viewer-Pass-9" }, "Enter saves the new password");
+async function testShareReflectsAccess() {
+  for (const [locked, mode] of [[true, "protected"], [false, "public"]]) {
+    const page = galleryPage(locked);
+    await tick();
+    await page.fire("edit-btn");
+    await page.fire("share-btn");
+    assert.strictEqual(page.els.get("share-mode").value, mode);
+    assert.strictEqual(page.els.get("share-password-field").hidden, !locked);
+    page.els.get("share-mode").value = "protected";
+    await page.fire("share-mode", { type: "change" });
+    assert.strictEqual(page.els.get("share-password-field").hidden, false);
+    assert.strictEqual(page.els.get("share-password").required, !locked);
+  }
 }
 
 async function testNoHeicNeverLoadsDecoder() {
@@ -1738,40 +1693,6 @@ async function testBlankLanding() {
   assert.strictEqual(page.els.get("gallery-state").hidden, true, "no state on the landing");
 }
 
-async function testPrivateProtectWarns() {
-  const page = makePage({
-    pathname: "/" + SLUG,
-    key: KEY,
-    listing: { slug: SLUG, public: false, locked: false, photos: [] },
-    handler: (url) => {
-      if (url.endsWith("/visibility")) {
-        return {
-          status: 200,
-          ok: true,
-          statusText: "status 200",
-          json: async () => ({ slug: SLUG, public: true }),
-        };
-      }
-      throw new Error("unexpected request " + url);
-    },
-  });
-  await tick();
-  await page.fire("lock-btn");
-  assert.strictEqual(page.els.get("setpass-dialog").open, true);
-  assert.match(page.els.get("setpass-help").textContent, /private/, "warns that a private lock is unreachable");
-  assert.strictEqual(page.els.get("setpass-private").hidden, false, "offers Make public");
-
-  await page.fire("setpass-public");
-  assert.strictEqual(page.els.get("setpass-private").hidden, true, "Make public hides its own row");
-  assert.strictEqual(page.els.get("edit-status").textContent, "", "no redundant success message");
-  assert.strictEqual(page.els.get("public-check").checked, true, "checkbox follows the publish");
-  assert.match(
-    page.els.get("setpass-help").textContent,
-    /Enter a password below/,
-    "no password is claimed before one is set"
-  );
-}
-
 async function testLateOwnerCheckCannotResolveCreatePrompt() {
   let finishCheck;
   let ownerSignal;
@@ -1898,13 +1819,11 @@ async function testPrivateGalleryKeyOpens() {
   await testLightboxFocusAndLinkCleanup();
   await testLightboxPausesAudio();
   testAccessibleMarkup();
-  await testButtonsWithStoredKey();
-  await testProtectReflectsLock();
+  await testShareReflectsAccess();
   await testNoHeicNeverLoadsDecoder();
   await testHeicFetchesOnlyWhenVisible();
   await testHeicBudgetAndFallback();
   await testBlankLanding();
-  await testPrivateProtectWarns();
   await testLateOwnerCheckCannotResolveCreatePrompt();
   await testWrongCachedKeyReprompts();
   await testCopyFallbackWithoutClipboard();

@@ -33,12 +33,8 @@ try {
 </header>
 <div id="editbar" hidden>
   <span id="sel-count">0 selected</span>
-  <label id="public-row" title="Anyone with the link can view this gallery. A viewer password may still be required.">
-    <input type="checkbox" id="public-check"> Public
-  </label>
-  <span id="edit-status" role="status"></span>
   <button id="show-key-btn" type="button">Show key</button>
-  <button id="lock-btn" type="button">Protect</button>
+  <button id="share-btn" type="button" disabled>Share</button>
   <button id="delete-btn" type="button">Delete</button>
   <button id="delete-gallery-btn" type="button">Delete gallery</button>
   <button id="done-btn" type="button">Done</button>
@@ -73,17 +69,23 @@ try {
     </div>
   </form>
 </dialog>
-<dialog id="setpass-dialog" aria-labelledby="setpass-title">
-  <form method="dialog" id="setpass-form">
-    <h2 id="setpass-title">Protect gallery</h2>
-    <p id="setpass-help">Viewers will need this password to open the gallery.</p>
-    <p id="setpass-private" hidden><button id="setpass-public" type="button">Make public</button></p>
-    <input type="password" id="setpass-input" aria-label="New gallery password" aria-describedby="setpass-help" placeholder="New password" autocomplete="new-password">
-    <p id="setpass-error" role="alert"></p>
+<dialog id="share-dialog" aria-labelledby="share-title">
+  <form method="dialog" id="share-form">
+    <h2 id="share-title">Share gallery</h2>
+    <label for="share-mode">Who can open this gallery?</label>
+    <select id="share-mode">
+      <option value="private">Private — only the owner</option>
+      <option value="protected">Anyone with the link and password</option>
+      <option value="public">Anyone with the link — no password</option>
+    </select>
+    <div id="share-password-field" hidden>
+      <label for="share-password">Viewer password</label>
+      <input type="password" id="share-password" autocomplete="new-password">
+    </div>
+    <p id="share-error" role="alert"></p>
     <div id="key-actions">
-      <button id="setpass-cancel" value="cancel" type="button">Cancel</button>
-      <button id="setpass-confirm" value="default" type="submit">Save</button>
-      <button id="setpass-remove" value="remove" formnovalidate type="submit" hidden>Remove protection</button>
+      <button id="share-cancel" type="button">Cancel</button>
+      <button id="share-save" type="submit">Save</button>
     </div>
   </form>
 </dialog>

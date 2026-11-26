@@ -18,9 +18,13 @@ const keyInput = document.getElementById("key-input");
 const keyError = document.getElementById("key-error");
 const keyHelp = document.getElementById("key-help");
 const keyConfirm = document.getElementById("key-confirm");
-const publicCheck = document.getElementById("public-check");
-const makePublicBtn = document.getElementById("setpass-public");
-const editStatus = document.getElementById("edit-status");
+const shareBtn = document.getElementById("share-btn");
+const shareDialog = document.getElementById("share-dialog");
+const shareMode = document.getElementById("share-mode");
+const sharePassword = document.getElementById("share-password");
+const shareError = document.getElementById("share-error");
+const shareSave = document.getElementById("share-save");
+const shareCancel = document.getElementById("share-cancel");
 const keyBanner = document.getElementById("key-banner");
 const keyBannerKey = document.getElementById("key-banner-key");
 const keyBannerCopy = document.getElementById("key-banner-copy");
@@ -109,7 +113,6 @@ const themeBtn = document.getElementById("theme-btn");
 const editBtn = document.getElementById("edit-btn");
 const editBar = document.getElementById("editbar");
 const deleteBtn = document.getElementById("delete-btn");
-const lockBtn = document.getElementById("lock-btn");
 const showKeyBtn = document.getElementById("show-key-btn");
 const doneBtn = document.getElementById("done-btn");
 const confirmDialog = document.getElementById("confirm-dialog");
@@ -127,7 +130,7 @@ function galleryVisibilityHint() {
       ? "Anyone with the link needs the viewer password."
       : "Anyone with the link can view this gallery.";
   }
-  return "This gallery is private. Tick Public in Edit to share it.";
+  return "Only the owner can open this gallery.";
 }
 
 function showKeyBanner(key) {
@@ -190,14 +193,10 @@ function updateGalleryState() {
   galleryState.hidden = !slug;
   homeLink.hidden = !slug;
   if (!slug) return;
-  publicCheck.checked = galleryPublic === true;
-  publicCheck.indeterminate = galleryPublic === null;
-  publicCheck.disabled = visibilityPending || galleryPublic === null;
-  makePublicBtn.disabled = publicCheck.disabled;
+  shareBtn.disabled = visibilityPending || galleryPublic === null;
   galleryState.textContent = galleryPublic === null ? "Visibility unknown"
-    : (galleryPublic ? "Public" : "Private") + (galleryLocked ? " · Protected" : "");
+    : (galleryPublic ? (galleryLocked ? "Public · Protected" : "Public") : "Private");
   galleryState.title = galleryVisibilityHint();
-  updateProtectUI();
 }
 
 function showLanding() {
@@ -255,8 +254,7 @@ async function loadPhotos(retry = false) {
   galleryLabel.textContent = slug;
   editBtn.hidden = false;
   homeLink.hidden = false;
-  publicCheck.indeterminate = galleryPublic === null;
-  publicCheck.disabled = visibilityPending || galleryPublic === null;
+  shareBtn.disabled = visibilityPending || galleryPublic === null;
   try {
     // The listing's Set-Cookie authorises every media tag.
     const headers = listingHeaders(slug);
@@ -342,7 +340,6 @@ async function loadPhotos(retry = false) {
 
 function setEditing(on) {
   editing = on;
-  editStatus.textContent = "";
   document.body.classList.toggle("editing", on);
   if (!on) {
     selected.clear();
@@ -377,13 +374,40 @@ editBtn.addEventListener("click", async () => {
 
 doneBtn.addEventListener("click", () => setEditing(false));
 
-/** Write once; after an ambiguous result, report only what an owner read confirms. */
-async function setGalleryPublic(want) {
+function updateSharePassword() {
+  document.getElementById("share-password-field").hidden = shareMode.value !== "protected";
+  sharePassword.required = shareMode.value === "protected" && !galleryLocked;
+  sharePassword.placeholder = galleryLocked ? "Leave blank to keep the password" : "Viewer password";
+}
+
+shareMode.addEventListener("change", updateSharePassword);
+shareBtn.addEventListener("click", () => {
+  shareMode.value = !galleryPublic ? "private" : galleryLocked ? "protected" : "public";
+  sharePassword.value = "";
+  shareError.textContent = "";
+  updateSharePassword();
+  shareDialog.showModal();
+  shareMode.focus();
+});
+shareCancel.addEventListener("click", () => shareDialog.close());
+shareDialog.addEventListener("cancel", (e) => {
+  if (visibilityPending) e.preventDefault();
+});
+shareDialog.addEventListener("close", () => { sharePassword.value = ""; });
+
+document.getElementById("share-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
   const slug = slugFromPath();
   const key = galleryKey;
-  if (!slug || !key || visibilityPending || galleryPublic === null) return;
+  if (!shareDialog.open || !slug || !key || visibilityPending) return;
+  const mode = shareMode.value;
+  const password = mode === "protected" ? sharePassword.value : "";
+  const wantPublic = mode !== "private";
+  const wantLocked = mode === "protected";
   visibilityPending = true;
   visibilityVersion += 1;
+  shareSave.disabled = shareCancel.disabled = shareMode.disabled = sharePassword.disabled = true;
+  shareError.textContent = "";
   updateGalleryState();
   try {
     let res;
@@ -391,16 +415,23 @@ async function setGalleryPublic(want) {
       res = await fetch("/api/galleries/" + slug + "/visibility", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
-        body: JSON.stringify({ public: want }),
+        body: JSON.stringify(password ? { mode, password } : { mode }),
       });
     } catch (_) { /* The server may have committed before the connection failed. */ }
     const data = await res?.json().catch(() => null);
-    if (res?.ok && data?.slug === slug && data.public === want) {
-      galleryPublic = want;
+    if (res?.ok && data?.slug === slug && data.public === wantPublic && data.locked === wantLocked) {
+      galleryPublic = wantPublic;
+      // Private galleries may still have a saved password.
+      if (wantPublic) galleryLocked = wantLocked;
+      if (password || mode === "public") {
+        try { sessionStorage.removeItem("gallery-pass:" + slug); } catch (_) {}
+      }
+      shareDialog.close();
       return;
     }
     if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
-      throw new Error(data?.error || "The server refused the visibility change. Try again.");
+      shareError.textContent = data?.error || "Could not save sharing settings. Try again.";
+      return;
     }
 
     galleryPublic = null;
@@ -414,114 +445,23 @@ async function setGalleryPublic(want) {
       if (read.ok) listing = await read.json();
     } catch (_) { /* Remain unknown when the owner read also fails. */ }
     if (listing?.slug !== slug || typeof listing.public !== "boolean" || typeof listing.locked !== "boolean") {
-      throw new Error(galleryVisibilityHint());
+      shareError.textContent = galleryVisibilityHint();
+      return;
     }
     galleryPublic = listing.public;
     galleryLocked = listing.locked;
-    if (galleryPublic === want) return;
-    throw new Error("Visibility change was not confirmed. The gallery is " +
-      (galleryPublic ? "public" : "private") + ". Try again.");
+    if (!password && galleryPublic === wantPublic && (!wantPublic || galleryLocked === wantLocked)) {
+      shareDialog.close();
+      return;
+    }
+    shareError.textContent = "Sharing change was not confirmed. Try again.";
   } finally {
     visibilityPending = false;
     visibilityVersion += 1;
+    shareSave.disabled = shareCancel.disabled = shareMode.disabled = sharePassword.disabled = false;
+    updateSharePassword();
     updateGalleryState();
   }
-}
-
-publicCheck.addEventListener("change", async () => {
-  const want = publicCheck.checked;
-  editStatus.textContent = "";
-  try {
-    await setGalleryPublic(want);
-  } catch (e) {
-    editStatus.textContent = e.message;
-  }
-});
-
-function updateProtectUI() {
-  const help = document.getElementById("setpass-help");
-  document.getElementById("setpass-remove").hidden = !galleryLocked;
-  document.getElementById("setpass-private").hidden = galleryPublic !== false;
-  if (galleryPublic === null) {
-    help.textContent = galleryVisibilityHint();
-  } else if (galleryPublic) {
-    help.textContent = galleryLocked
-      ? "This gallery is protected. Enter a new password to change it, or remove protection below."
-      : "This gallery is public. Enter a password below to protect it.";
-  } else {
-    help.textContent =
-      (galleryLocked
-        ? "This gallery is protected, but it is private, so only you can open it. "
-        : "This gallery is private, so only you can open it. ") +
-      "Make it public to share it; the password then gates viewers.";
-  }
-}
-
-lockBtn.addEventListener("click", async () => {
-  const slug = slugFromPath();
-  if (!slug || !(galleryKey || await askKeyForGallery(slug, "Enter the owner key for this gallery."))) return;
-  const input = document.getElementById("setpass-input");
-  document.getElementById("setpass-error").textContent = "";
-  input.value = "";
-  updateProtectUI();
-  document.getElementById("setpass-dialog").showModal();
-  input.focus();
-});
-
-makePublicBtn.addEventListener("click", async () => {
-  const errEl = document.getElementById("setpass-error");
-  errEl.textContent = "";
-  editStatus.textContent = "";
-  try {
-    if (await setGalleryPublic(true)) editStatus.textContent = "Gallery is public";
-  } catch (e) {
-    errEl.textContent = e.message;
-  }
-});
-
-document.getElementById("setpass-form").addEventListener("submit", async (e) => {
-  const clicked = e.submitter?.value;
-  if (clicked === "cancel") return;
-  const slug = slugFromPath();
-  const expectedLocked = clicked !== "remove";
-  const value = document.getElementById("setpass-input").value;
-  const errEl = document.getElementById("setpass-error");
-  if (expectedLocked && !value) return; // empty = keep, no request
-  const dialog = document.getElementById("setpass-dialog");
-  const key = galleryKey;
-  let res;
-  try {
-    res = await fetch("/api/galleries/" + slug + "/lock", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
-      body: JSON.stringify({ password: expectedLocked ? value : "" }),
-    });
-  } catch (_) { /* The request may have committed before the connection failed. */ }
-  if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
-    const data = await res.json().catch(() => null);
-    errEl.textContent = data?.error || res.statusText;
-    dialog.showModal();
-    return;
-  }
-  const data = res?.ok ? await res.json().catch(() => null) : null;
-  if (data?.slug === slug && data?.locked === expectedLocked) {
-    galleryLocked = expectedLocked;
-    updateGalleryState();
-    try {
-      if (expectedLocked) sessionStorage.setItem("gallery-pass:" + slug, value);
-      else sessionStorage.removeItem("gallery-pass:" + slug);
-    } catch (_) {}
-    uploadStatus.textContent = galleryLocked ? "Gallery protected." : "Protection removed.";
-    await loadPhotos();
-    return;
-  }
-  const unconfirmed = "Password change was not confirmed. Try again.";
-  uploadStatus.textContent = unconfirmed;
-  await loadPhotos();
-  uploadStatus.textContent = unconfirmed;
-  errEl.textContent = unconfirmed;
-  updateProtectUI();
-  dialog.showModal();
 });
 
 deleteBtn.addEventListener("click", () => {
@@ -1193,9 +1133,6 @@ document.getElementById("pass-form").addEventListener("submit", async (e) => {
   prompt.resolve(data);
 });
 document.getElementById("pass-cancel").addEventListener("click", () => passDialog.close());
-document.getElementById("setpass-cancel").addEventListener("click", () => {
-  document.getElementById("setpass-dialog").close();
-});
 passDialog.addEventListener("close", () => {
   if (passDialog.open || !passPrompt) return;
   const { resolve, controller } = passPrompt;

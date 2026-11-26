@@ -34,10 +34,11 @@ Galleries created before 2026-10-30 have shorter `adj-noun-N` slugs (for
 example `/happy-otter-7`); those old links and files keep working, while new
 galleries get the four-word form.
 The key banner has **Copy key**; edit mode has **Show key** if you dismissed
-it. New galleries stay private until the owner ticks **Public** in edit mode;
-a viewer password only gates a public gallery. `ADMIN_PASS` and
-`GALLY_INVITE_CODE` are unset by default, so admin and the invite gate are
-off.
+it. New galleries start private. Open **Edit → Share** to keep a gallery
+private, share the link with a viewer password, or share the link without a
+password. **Save** applies the chosen access and any new password together.
+`ADMIN_PASS` and `GALLY_INVITE_CODE` are unset by default, so admin and the
+invite gate are off.
 If prompted for an invite code, enter the value shared by the site operator,
 not the setting name `GALLY_INVITE_CODE`.
 

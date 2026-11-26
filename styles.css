@@ -167,10 +167,6 @@ input[type="password"], #key-input {
 }
 #editbar[hidden] { display: none; }
 #sel-count { flex: 1 1 auto; }
-#public-row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-#public-row input { accent-color: var(--accent); }
-#edit-status { color: var(--muted); }
-#edit-status:empty { display: none; }
 body.editing #main { padding-bottom: 150px; }
 #editbar button, #edit-btn {
   background: transparent;
@@ -211,12 +207,19 @@ dialog { border: 1px solid var(--border); background: var(--bg); color: var(--fg
 dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 dialog h2 { font-size: 16px; margin: 0 0 8px; }
 dialog p { font-size: 13px; color: var(--muted); }
+#share-dialog label { display: block; margin: 8px 0 4px; }
+#share-mode, #share-password { width: 100%; }
+#share-mode {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 7px 10px;
+}
 #upload-status:empty { display: none; }
 #key-error { color: #dc2626; min-height: 1em; }
 :root[data-theme="dark"] #key-error { color: #f87171; }
 
 #key-input { width: 100%; margin: 8px 0; font-family: ui-monospace, monospace; letter-spacing: 0.02em; }
-#setpass-private { margin: 8px 0 0; }
 #key-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 
 #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
