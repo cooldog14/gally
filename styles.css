@@ -72,7 +72,6 @@ button { font: inherit; }
   background: var(--bg);
   border: 1px solid var(--border);
 }
-#key-banner-hint { color: var(--muted); }
 #key-banner button {
   background: transparent;
   color: var(--fg);

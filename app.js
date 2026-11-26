@@ -24,7 +24,6 @@ const makePublicBtn = document.getElementById("setpass-public");
 const editStatus = document.getElementById("edit-status");
 const keyBanner = document.getElementById("key-banner");
 const keyBannerKey = document.getElementById("key-banner-key");
-const keyBannerHint = document.getElementById("key-banner-hint");
 const keyBannerCopy = document.getElementById("key-banner-copy");
 const loadMoreBtn = document.getElementById("load-more");
 
@@ -122,7 +121,7 @@ document.getElementById("key-banner-close").addEventListener("click", () => {
   keyBanner.hidden = true;
 });
 
-function keyBannerHintText() {
+function galleryVisibilityHint() {
   if (galleryPublic === null) return "Visibility unknown. Reload to check who can view this gallery.";
   if (galleryPublic) {
     return galleryLocked
@@ -134,7 +133,6 @@ function keyBannerHintText() {
 
 function showKeyBanner(key) {
   keyBannerKey.textContent = key;
-  keyBannerHint.textContent = keyBannerHintText();
   keyBanner.hidden = false;
 }
 
@@ -207,8 +205,7 @@ function updateGalleryState() {
   makePublicBtn.disabled = publicCheck.disabled;
   galleryState.textContent = galleryPublic === null ? "Visibility unknown"
     : (galleryPublic ? "Public" : "Private") + (galleryLocked ? " · Protected" : "");
-  galleryState.title = keyBannerHintText();
-  if (!keyBanner.hidden) keyBannerHint.textContent = keyBannerHintText();
+  galleryState.title = galleryVisibilityHint();
   updateProtectUI();
 }
 
@@ -429,7 +426,7 @@ async function setGalleryPublic(want) {
       if (read.ok) listing = await read.json();
     } catch (_) { /* Remain unknown when the owner read also fails. */ }
     if (listing?.slug !== slug || typeof listing.public !== "boolean" || typeof listing.locked !== "boolean") {
-      throw new Error(keyBannerHintText());
+      throw new Error(galleryVisibilityHint());
     }
     galleryPublic = listing.public;
     galleryLocked = listing.locked;
@@ -460,7 +457,7 @@ function updateProtectUI() {
   document.getElementById("setpass-remove").hidden = !galleryLocked;
   document.getElementById("setpass-private").hidden = galleryPublic !== false;
   if (galleryPublic === null) {
-    help.textContent = keyBannerHintText();
+    help.textContent = galleryVisibilityHint();
   } else if (galleryPublic) {
     help.textContent = galleryLocked
       ? "This gallery is protected. Enter a new password to change it, or remove protection below."

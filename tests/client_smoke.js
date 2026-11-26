@@ -476,7 +476,6 @@ async function workflowUpload() {
   assert.strictEqual(gallery.els.get("key-banner").hidden, false);
   assert.strictEqual(gallery.els.get("key-banner-key").textContent, key);
   assert.strictEqual(gallery.els.get("gallery-state").textContent, "Private", "private state is visible");
-  assert.match(gallery.els.get("key-banner-hint").textContent, /private/);
   await gallery.fire("key-banner-copy");
   assert.deepStrictEqual(gallery.clipboard, [key], "Copy key copies the key");
   await gallery.fire("key-banner-close");
