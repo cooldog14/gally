@@ -899,8 +899,27 @@ pub async fn gallery_photos(
 }
 
 #[derive(Deserialize)]
-struct VisibilityBody {
+#[serde(untagged)]
+enum VisibilityBody {
+    Sharing(SharingMode),
+    Legacy(LegacyVisibility),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyVisibility {
     public: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum SharingMode {
+    Private {},
+    Protected {
+        #[serde(default)]
+        password: String,
+    },
+    Public {},
 }
 
 /// Publish or unpublish the whole gallery. Owner key only.
@@ -943,22 +962,54 @@ pub async fn set_visibility(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let public = match serde_json::from_slice::<VisibilityBody>(&bytes) {
-        Ok(b) => b.public,
+    let change = match serde_json::from_slice::<VisibilityBody>(&bytes) {
+        Ok(change) => change,
         Err(_) => return err(StatusCode::BAD_REQUEST, "bad request"),
     };
+    let (public, locked, hash) = match change {
+        VisibilityBody::Legacy(body) => {
+            let ok = state.db.lock().unwrap().set_public(&slug, body.public);
+            return match ok {
+                Ok(true) => Json(json!({ "slug": slug, "public": body.public })).into_response(),
+                Ok(false) => err(StatusCode::NOT_FOUND, "unknown gallery"),
+                Err(_) => ApiError::Internal.into_response(),
+            };
+        }
+        VisibilityBody::Sharing(SharingMode::Private {}) => (false, false, None),
+        VisibilityBody::Sharing(SharingMode::Public {}) => (true, false, None),
+        VisibilityBody::Sharing(SharingMode::Protected { password }) => {
+            let hash = match viewer_password_hash(&state, password).await {
+                Ok(hash) => hash,
+                Err(resp) => return resp,
+            };
+            (true, true, hash)
+        }
+    };
     let ok = {
-        let mut db = state.db.lock().unwrap();
-        db.set_public(&slug, public)
+        let db = state.db.lock().unwrap();
+        // Never publish a protected link without a hash, even if a concurrent write removed it.
+        let keep = !public || (locked && hash.is_none());
+        db.execute(
+            "UPDATE galleries
+             SET public = ?1,
+                 pass_hash = CASE WHEN ?2 THEN pass_hash ELSE ?3 END,
+                 token_version = token_version + (public != ?1 OR NOT ?2)
+             WHERE slug = ?4 AND key_hash = ?5
+               AND (NOT ?6 OR NOT ?2 OR pass_hash IS NOT NULL)",
+            rusqlite::params![public, keep, hash, slug, crate::db::key_hash(&key), locked],
+        )
     };
     match ok {
-        Ok(true) => {}
-        Ok(false) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
+        Ok(1) => {}
+        Ok(_) if locked && hash.is_none() => {
+            return err(StatusCode::BAD_REQUEST, "Enter a viewer password.");
+        }
+        Ok(_) => return err(StatusCode::NOT_FOUND, "unknown gallery"),
         Err(_) => return ApiError::Internal.into_response(),
     }
     (
         StatusCode::OK,
-        Json(json!({ "slug": slug, "public": public })),
+        Json(json!({ "slug": slug, "public": public, "locked": locked })),
     )
         .into_response()
 }
@@ -1768,6 +1819,28 @@ struct LockBody {
     password: String,
 }
 
+async fn viewer_password_hash(
+    state: &AppState,
+    password: String,
+) -> Result<Option<Vec<u8>>, Response> {
+    if password.is_empty() {
+        return Ok(None);
+    }
+    let Ok(permit) = Arc::clone(&state.argon2).try_acquire_owned() else {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "busy"));
+    };
+    let hash = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::db::hash_password(&password)
+    })
+    .await
+    .unwrap_or_default();
+    if hash.is_empty() {
+        return Err(ApiError::Internal.into_response());
+    }
+    Ok(Some(hash))
+}
+
 /// Set (non-empty password) or clear (empty/missing) the gallery viewer lock.
 /// Requires the gallery key. Passwords are Argon2id-hashed, never stored raw.
 pub async fn lock_gallery(
@@ -1821,22 +1894,9 @@ pub async fn lock_gallery(
         Ok(b) => b.password,
         Err(_) => return err(StatusCode::BAD_REQUEST, "bad request"),
     };
-    let hash = if password.is_empty() {
-        None
-    } else {
-        let Ok(permit) = Arc::clone(&state.argon2).try_acquire_owned() else {
-            return err(StatusCode::SERVICE_UNAVAILABLE, "busy");
-        };
-        let h = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            crate::db::hash_password(&password)
-        })
-        .await
-        .unwrap_or_default();
-        if h.is_empty() {
-            return ApiError::Internal.into_response();
-        }
-        Some(h)
+    let hash = match viewer_password_hash(&state, password).await {
+        Ok(hash) => hash,
+        Err(resp) => return resp,
     };
     let ok = {
         let mut db = state.db.lock().unwrap();

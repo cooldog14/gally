@@ -227,6 +227,14 @@ with `Content-Type: application/json` (`415` otherwise).
 without a key, `403` when the key does not own the gallery, `404` for an
 unknown slug, `429` at the rate limit.
 
+The browser instead sends one of `{"mode":"private"}`, `{"mode":"public"}`,
+or `{"mode":"protected","password":"..."}`. The mode and password are saved
+atomically. Private keeps any saved password for later; public removes it.
+Protected with an omitted or empty password keeps an existing password, or
+returns `400` if none exists. The response also includes `locked`, which is
+true only for protected links in this form. Changes to the password or
+sharing visibility invalidate earlier viewer cookies.
+
 ### `POST /api/galleries/{slug}/lock`
 
 Owner key only. Body `{"password": "..."}` sets an Argon2id viewer password;
@@ -461,12 +469,12 @@ A `202` carries the committed offset; send the next chunk from it. On
 `409 offset mismatch` jump to `received`; on `410 upload expired` restart at
 zero with the same id.
 
-Protect a gallery, then unlock with the viewer password and reuse the cookie:
+Share a gallery with a viewer password in one request, then unlock and reuse the cookie:
 
 ```sh
-curl -fsS -X POST "http://127.0.0.1:8000/api/galleries/$SLUG/lock" \
+curl -fsS -X POST "http://127.0.0.1:8000/api/galleries/$SLUG/visibility" \
   -H "X-Gallery-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"password":"viewer-pass"}'
+  -d '{"mode":"protected","password":"viewer-pass"}'
 
 NAME=$(curl -fsS -c jar -X GET \
   "http://127.0.0.1:8000/api/galleries/$SLUG/photos" \
