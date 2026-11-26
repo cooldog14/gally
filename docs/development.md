@@ -25,12 +25,15 @@ cargo clippy --all-targets -- -D warnings
 
 ## CI
 
-`.github/workflows/ci.yml` runs on push and pull requests on `ubuntu-latest`:
-`cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings`, then
-`cargo test` and `cargo build --release`. A separate job builds the Docker
-image, validates `compose.yaml`, and smoke-tests the container's `/healthz`.
-Pushes to `master` and `v*` tags publish the image to GHCR. The stress suite is
-not run in CI.
+`.github/workflows/ci.yml` runs on push, pull requests, and manual dispatch on
+`ubuntu-latest`. The test job runs `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test`, and
+`cargo build --release`. After that job passes, the Docker job builds the image,
+validates `compose.yaml`, and smoke-tests the container's `/healthz`.
+Only pushes and manual runs for `master` or `v*` tags publish to GHCR, and
+only after those image checks pass. They publish a `sha-<short-commit>` tag
+plus `latest` for `master` or the matching version tag for a tag ref.
+The stress suite is not run in CI.
 
 ## Image checks
 

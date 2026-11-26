@@ -23,6 +23,7 @@ jobs:
       - run: cargo build --release
 
   docker:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
