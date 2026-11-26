@@ -189,7 +189,7 @@ class El {
   select() { this.selected = true; }
 }
 
-function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, storageThrows = false, clipboardApi = true, clock = null, script = APP } = {}) {
+function makePage({ pathname = "/", key = "", listing = null, handler = null, session: store = null, storageThrows = false, clipboardApi = true, clock = null, script = APP, heicConvert = null } = {}) {
   const els = new Map();
   const calls = [];
   const docListeners = new Map();
@@ -221,7 +221,13 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
     body: new El("body", page),
     documentElement: new El("html", page),
     getElementById: el,
-    createElement: (tag) => new El(tag, page),
+    createElement: (tag) => {
+      const node = new El(tag, page);
+      if (tag === "img" && heicConvert) node.decode = async () => {
+        if (node.src === "blob:image/heic") throw new Error("no native HEIC support");
+      };
+      return node;
+    },
     addEventListener(type, fn) {
       const list = docListeners.get(type) || [];
       list.push(fn);
@@ -279,8 +285,12 @@ function makePage({ pathname = "/", key = "", listing = null, handler = null, se
     performance: clock || performance,
     setTimeout: clock ? clock.setTimeout : setTimeout,
     AbortController,
+    AbortSignal,
+    Blob,
+    TextDecoder,
     Image: class {},
-    URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
+    URL: { createObjectURL: (blob) => "blob:" + blob.type, revokeObjectURL() {} },
+    heic2any: heicConvert,
     IntersectionObserver: class {
       observe() {}
       disconnect() {}
@@ -471,6 +481,172 @@ async function workflowUpload() {
   assert.strictEqual(await photoCount(slug, key), 3);
 }
 
+async function testDelayedListingSharesUploadPrompt() {
+  const key = "Shared-Key-42!";
+  const slug = await mint(key);
+  let releaseInitial;
+  const initial = new Promise((resolve) => { releaseInitial = resolve; });
+  let initialStatus;
+  const page = makePage({
+    pathname: "/" + slug,
+    async handler(url, opts) {
+      const res = await globalThis.fetch(BASE + url, opts);
+      if (url.includes("/photos?") && !opts.headers["X-Gallery-Key"]) {
+        initialStatus = res.status;
+        await initial;
+      }
+      return res;
+    },
+  });
+  await waitFor(() => initialStatus === 404, "private initial listing held in flight");
+  page.els.get("file-input").files = [new File([PNG], "shared.png", { type: "image/png" })];
+  const batch = page.fire("file-input", { type: "change" });
+  await waitFor(() => page.els.get("key-dialog").open, "upload key prompt before listing returns");
+  const input = page.els.get("key-input");
+  input.value = key;
+  releaseInitial();
+  await tick();
+  assert.strictEqual(input.value, key, "the late listing doesn't reset the shared prompt");
+  await submitKey(page, input.value);
+  await waitFor(() => !page.els.get("upload-btn").disabled, "upload settles after one key prompt");
+  await batch;
+  assert.strictEqual(page.els.get("upload-status").textContent, "Uploaded 1 photo.");
+  assert.strictEqual(page.els.get("key-dialog").open, false);
+  assert.strictEqual(await photoCount(slug, key), 1, "the real server received the upload");
+  assert.strictEqual(page.els.get("grid").children.length, 1);
+}
+
+async function testVisibilityLostReply() {
+  const key = "Visibility-Key-77!";
+  const slug = await mint(key);
+  let releaseStale;
+  const stale = new Promise((resolve) => { releaseStale = resolve; });
+  let releaseRecovery;
+  const recovery = new Promise((resolve) => { releaseRecovery = resolve; });
+  let loseWrite = false;
+  let loseRead = false;
+  let holdNextListing = false;
+  let stalePublic;
+  let recoveryStarted = false;
+  const page = makePage({
+    pathname: "/" + slug,
+    key,
+    async handler(url, opts) {
+      const res = await globalThis.fetch(BASE + url, opts);
+      if (loseWrite && url.endsWith("/visibility")) {
+        assert.strictEqual(res.status, 200, "the server committed before the reply was lost");
+        await res.arrayBuffer();
+        throw new Error("lost visibility reply");
+      }
+      if (url.endsWith("/photos?limit=1")) {
+        assert.strictEqual(opts.headers["X-Gallery-Key"], key, "visibility uses an owner read");
+        assert.strictEqual(opts.cache, "no-store");
+        if (loseRead) {
+          await res.arrayBuffer();
+          throw new Error("lost owner read");
+        }
+        recoveryStarted = true;
+        await recovery;
+      } else if (holdNextListing && url.includes("/photos?")) {
+        holdNextListing = false;
+        stalePublic = (await res.clone().json()).public;
+        await stale;
+      }
+      return res;
+    },
+  });
+  const state = page.els.get("gallery-state");
+  const checkbox = page.els.get("public-check");
+  const status = page.els.get("edit-status");
+  await waitFor(() => state.textContent === "Private", "initial private visibility");
+
+  // Delay a real listing requested by a completed upload until after the write.
+  holdNextListing = true;
+  page.els.get("file-input").files = [new File([PNG], "visibility.png", { type: "image/png" })];
+  const batch = page.fire("file-input", { type: "change" });
+  await waitFor(() => stalePublic === false, "pre-write private listing");
+  await page.fire("edit-btn");
+  loseWrite = true;
+  checkbox.checked = true;
+  const publishFromCheckbox = page.fire("public-check", { type: "change" });
+  await waitFor(() => recoveryStarted, "owner reread after lost publish reply");
+  assert.strictEqual(state.textContent, "Visibility unknown");
+  assert(checkbox.indeterminate && checkbox.disabled);
+  assert.strictEqual(status.textContent, "", "no confirmation before an authoritative reply");
+  releaseRecovery();
+  await publishFromCheckbox;
+  assert.strictEqual(status.textContent, "Gallery is public");
+  releaseStale();
+  await batch;
+  assert.strictEqual(state.textContent, "Public", "pre-write listing cannot revert visibility");
+  assert(checkbox.checked && !checkbox.indeterminate && !checkbox.disabled);
+  assert.strictEqual(await galleryStatus(slug), 200, "public state matches the real server");
+
+  loseWrite = false;
+  checkbox.checked = false;
+  await page.fire("public-check", { type: "change" });
+  await page.fire("lock-btn");
+  loseWrite = true;
+  loseRead = true;
+  await page.fire("setpass-public");
+  assert.strictEqual(await galleryStatus(slug), 200, "Make public also committed before losing its reply");
+  assert.strictEqual(state.textContent, "Visibility unknown", "failed owner read cannot restore Private");
+  assert(checkbox.indeterminate && checkbox.disabled);
+  assert.strictEqual(status.textContent, "", "Protect cannot confirm an ambiguous write");
+  assert.match(page.els.get("setpass-error").textContent, /Visibility unknown.*Reload/);
+  assert.match(page.els.get("setpass-help").textContent, /Visibility unknown/);
+}
+
+async function testPasswordUnconfirmedReply() {
+  const key = "Password-Reply-Key-99";
+  const slug = await mint(key);
+  const password = "Viewer-Password-88";
+  await publish(slug, key, true);
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  let committed = false;
+  let refreshedLocked;
+  const page = makePage({
+    pathname: "/" + slug,
+    key,
+    async handler(url, opts) {
+      const res = await globalThis.fetch(BASE + url, opts);
+      if (url.endsWith("/lock")) {
+        assert.strictEqual(res.status, 200, "the server committed the password change");
+        assert.deepStrictEqual(await res.json(), { slug, locked: true });
+        committed = true;
+        return new Response("{", { status: 200 });
+      }
+      if (committed && url.includes("/photos?")) {
+        refreshedLocked = (await res.clone().json()).locked;
+        await pending;
+      }
+      return res;
+    },
+  });
+  const badge = page.els.get("gallery-state");
+  const status = page.els.get("upload-status");
+  const storageKey = "gallery-pass:" + slug;
+  const message = "Password change was not confirmed. Try again.";
+  await waitFor(() => badge.textContent === "Public", "initial unlocked badge");
+  await page.fire("lock-btn");
+  const dialog = page.els.get("setpass-dialog");
+  page.els.get("setpass-input").value = password;
+  const save = page.fire("setpass-form", { type: "submit", submitter: { value: "default" } });
+  dialog.close(); // Native method=dialog closes before the async reply.
+  await waitFor(() => refreshedLocked === true, "authoritative locked listing");
+  assert.strictEqual(status.textContent, message, "corrupt acknowledgment never reports success");
+  assert.strictEqual(badge.textContent, "Public", "wait for the authoritative listing");
+  assert.strictEqual(page.session.has(storageKey), false);
+  release();
+  await save;
+  assert.strictEqual(badge.textContent, "Public · Protected");
+  assert.strictEqual(status.textContent, message);
+  assert.strictEqual(page.session.has(storageKey), false, "listing cannot confirm the new password");
+  assert.strictEqual(dialog.open, true);
+  assert.strictEqual(page.els.get("setpass-error").textContent, message);
+}
+
 // --- workflow 2: edit ---
 
 async function workflowEdit() {
@@ -569,6 +745,84 @@ async function workflowEdit() {
 }
 
 // --- workflow 3: view and mess around ---
+
+async function testBoundedTextPreview() {
+  const key = "Text-Preview-Key-99";
+  const slug = await mint(key);
+  const prefix = "x".repeat(65_536);
+  const original = prefix + "not in preview";
+  await upload(slug, key, "large.txt", Buffer.from(original), "text/plain");
+  await upload(slug, key, "image.png", PNG, "image/png");
+
+  let mode = "live";
+  let reads = 0;
+  let canceled = false;
+  let release;
+  const delayed = new Promise((resolve) => { release = resolve; });
+  const page = makePage({
+    pathname: "/" + slug,
+    key,
+    async handler(url, opts) {
+      if (url.endsWith("_large.txt") && mode === "proxy") {
+        return new Response(new ReadableStream({
+          pull(controller) { reads += 1; controller.close(); },
+          cancel() { canceled = true; },
+        }, { highWaterMark: 0 }));
+      }
+      if (url.endsWith("_large.txt") && mode === "oversized") {
+        return new Response(new TextEncoder().encode(original), { status: 206 });
+      }
+      if (url.endsWith("_large.txt") && mode === "delayed") {
+        await delayed;
+        throw new Error("delayed text request failed");
+      }
+      return globalThis.fetch(BASE + url, opts);
+    },
+  });
+  const grid = page.els.get("grid");
+  const viewport = page.els.get("viewport");
+  await waitFor(() => grid.children.length === 2, "image and text tiles");
+  const textTile = grid.children.find((tile) => tile.querySelector(".file-generic"));
+  assert(textTile, "text tile");
+  await page.fireEl(textTile);
+  await waitFor(() => viewport.querySelector("pre"), "bounded live preview");
+  assert.strictEqual(viewport.querySelector("pre").textContent, prefix);
+  assert.match(viewport.textContent, /First 64 KiB/);
+  const link = viewport.querySelector("a");
+  assert.strictEqual(link.textContent, "Download original");
+  const range = page.calls.find((call) => call.url === link.href);
+  assert.strictEqual(range.opts.headers.Range, "bytes=0-65535");
+  assert.strictEqual(range.opts.headers["X-Gallery-Key"], key);
+  const download = await globalThis.fetch(BASE + link.href, { headers: { "X-Gallery-Key": key } });
+  assert.strictEqual(download.status, 200);
+  assert.strictEqual(await download.text(), original);
+
+  await page.fire("close");
+  mode = "proxy";
+  await page.fireEl(textTile);
+  await waitFor(() => viewport.querySelector("a"), "download-only fallback");
+  assert.strictEqual(reads, 0, "never consume a full-body response");
+  assert.strictEqual(canceled, true);
+  assert.strictEqual(viewport.querySelector("pre"), null);
+  assert.strictEqual(viewport.querySelector("a").href, link.href);
+
+  await page.fire("close");
+  mode = "oversized";
+  await page.fireEl(textTile);
+  await waitFor(() => viewport.querySelector("pre"), "oversized partial response");
+  assert.strictEqual(viewport.querySelector("pre").textContent, prefix);
+  assert.match(viewport.textContent, /First 64 KiB/);
+
+  await page.fire("close");
+  mode = "delayed";
+  await page.fireEl(textTile);
+  await page.fire("next");
+  const image = viewport.querySelector("img");
+  assert(image && image.src.endsWith("_image.png"));
+  release();
+  await tick();
+  assert.strictEqual(viewport.querySelector("img"), image, "a late text failure cannot replace the image");
+}
 
 async function workflowView() {
   const key = "Viewer-Gallery-99";
@@ -701,6 +955,54 @@ async function workflowView() {
   assert.strictEqual(hidden.location.assigned, "", "cancel does not redirect");
   assert.strictEqual(hidden.els.get("edit-btn").hidden, true, "edit hidden when unavailable");
   assert.strictEqual(hidden.els.get("home-link").hidden, false, "home link remains");
+  await testLoadMoreDuringUploadRefresh(slug, key);
+}
+
+async function testLoadMoreDuringUploadRefresh(slug, key) {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const firstPages = [];
+  const morePages = [];
+  const page = makePage({
+    pathname: "/" + slug,
+    key,
+    async handler(url, opts) {
+      const res = await globalThis.fetch(BASE + url, opts);
+      if (url.includes("/photos?")) {
+        const data = await res.clone().json();
+        const cursor = new URL(BASE + url).searchParams.get("before");
+        if (cursor) {
+          morePages.push({ cursor, data });
+          if (morePages.length === 1) await pending;
+        } else {
+          firstPages.push(data);
+        }
+      }
+      return res;
+    },
+  });
+  const names = () => page.els.get("grid").children.map((tile) => (
+    tile.querySelector("img")?.alt || tile.querySelector(".file-generic").textContent
+  ));
+  const display = (photo) => photo.name.split("_").slice(2).join("_");
+  await waitFor(() => !page.els.get("load-more").hidden, "initial page cursor");
+  const oldRequest = page.fire("load-more");
+  await waitFor(() => morePages.length === 1, "old page held after server reply");
+  assert.strictEqual(morePages[0].cursor, firstPages[0].next);
+  page.els.get("file-input").files = [new File(["new"], "refresh.txt", { type: "text/plain" })];
+  await page.fire("file-input", { type: "change" });
+  assert.strictEqual(firstPages.length, 2, "completed upload refreshes the first page");
+  const refreshed = firstPages[1];
+  assert.notStrictEqual(refreshed.next, firstPages[0].next);
+  assert(names().includes("refresh.txt"));
+  release();
+  await oldRequest;
+  assert.deepStrictEqual(names(), refreshed.photos.map(display), "old page did not append");
+  assert.strictEqual(page.els.get("load-more").hidden, false, "fresh cursor remains available");
+  await page.fire("load-more");
+  assert.strictEqual(morePages[1].cursor, refreshed.next);
+  assert.deepStrictEqual(names(), [...refreshed.photos, ...morePages[1].data.photos].map(display));
+  assert.strictEqual(new Set(names()).size, 204, "only fresh names were appended");
 }
 
 // --- legacy stub-DOM checks ---
@@ -884,6 +1186,72 @@ async function testHeicFetchesOnlyWhenVisible() {
     !page.calls.some((c) => c.url.includes(".heic")),
     "off-screen HEIC is not fetched before the observer fires"
   );
+}
+
+async function testHeicBudgetAndFallback() {
+  const names = ["first.heic", "second.heic", "oversized.heic", "unknown-length.heic"];
+  const cap = 8 * 1024 * 1024;
+  let finish;
+  const held = new Promise((resolve) => { finish = resolve; });
+  let conversions = 0;
+  let declaredReads = 0;
+  const canceled = [];
+  const page = makePage({
+    pathname: "/" + SLUG,
+    key: KEY,
+    listing: { slug: SLUG, public: false, locked: false, photos: names.map((name) => ({ name })) },
+    async heicConvert({ blob }) {
+      assert.strictEqual(blob.size, 4, "only small originals reach the decoder");
+      conversions += 1;
+      if (conversions === 1) await held;
+      return new Blob(["jpeg"], { type: "image/jpeg" });
+    },
+    handler(url) {
+      if (url.endsWith("/oversized.heic")) {
+        return new Response(new ReadableStream({
+          pull() { declaredReads += 1; },
+          cancel() { canceled.push("declared"); },
+        }, { highWaterMark: 0 }), { headers: { "Content-Length": String(cap + 1) } });
+      }
+      if (url.endsWith("/unknown-length.heic")) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array(cap));
+            controller.enqueue(new Uint8Array(1));
+          },
+          cancel() { canceled.push("streamed"); },
+        }));
+      }
+      return new Response("heic");
+    },
+  });
+  const grid = page.els.get("grid");
+  const viewport = page.els.get("viewport");
+  page.document.body.append(grid, viewport);
+  await waitFor(() => grid.children.length === 4, "HEIC tiles");
+  await page.fireEl(grid.children[0]);
+  await waitFor(() => page.document.head.children.length, "fallback decoder loading");
+  page.document.head.children[0].onload();
+  await waitFor(() => conversions === 1, "first conversion held");
+  await page.fire("next");
+  await tick();
+  assert(!page.calls.some(({ url }) => url.endsWith("/second.heic")), "next fetch waits for the active conversion");
+  finish();
+  await waitFor(() => viewport.querySelector("img")?.src === "blob:image/jpeg", "second preview displayed");
+  assert.strictEqual(conversions, 2);
+  assert.strictEqual(viewport.querySelector("img").alt, "second.heic");
+
+  for (const [index, reason] of [[2, "declared"], [3, "streamed"]]) {
+    await page.fire("next");
+    await waitFor(() => viewport.querySelector("a"), "oversized original remains downloadable");
+    const link = viewport.querySelector("a");
+    assert.strictEqual(link.textContent, "Download original");
+    assert.strictEqual(link.href, "/photos/" + names[index]);
+    assert.match(viewport.textContent, new RegExp(names[index]));
+    assert(canceled.includes(reason));
+  }
+  assert.strictEqual(declaredReads, 0);
+  assert.strictEqual(conversions, 2, "neither oversized response is decoded");
 }
 
 function homePage(uploadHandler, clock) {
@@ -1397,6 +1765,47 @@ async function testPrivateProtectWarns() {
   );
 }
 
+async function testLateOwnerCheckCannotResolveCreatePrompt() {
+  let finishCheck;
+  let ownerSignal;
+  const page = makePage({
+    pathname: "/" + SLUG,
+    listing: { slug: SLUG, public: true, locked: false, photos: [] },
+    handler(url, opts) {
+      if (url === "/api/galleries/resolve" && JSON.parse(opts.body).slug) {
+        ownerSignal = opts.signal;
+        return new Promise((resolve) => { finishCheck = resolve; });
+      }
+      if (url === "/api/galleries/resolve") return Response.json({ slug: SLUG });
+      assert.strictEqual(opts.method, "PUT");
+      return Response.json({}, { status: 201 });
+    },
+  });
+  let editingSettled = false;
+  page.fire("edit-btn").then(() => { editingSettled = true; });
+  await waitFor(() => page.els.get("key-dialog").open, "edit owner-key prompt");
+  const oldValidation = submitKey(page, KEY);
+  await waitFor(() => finishCheck, "owner check in flight");
+
+  // Exercise competing modes on the same dialog without a document reload.
+  page.location.pathname = "/";
+  page.els.get("file-input").files = [filed("home.jpg")];
+  const batch = page.fire("file-input", { type: "change" });
+  await waitFor(() => editingSettled, "superseded owner-key waiter settles");
+  assert.strictEqual(ownerSignal.aborted, true, "the superseded request is cancelled");
+  await page.fire("key-dialog", { type: "close" }); // Native close is queued.
+  finishCheck(Response.json({ slug: SLUG }));
+  await oldValidation;
+  assert.strictEqual(page.els.get("key-dialog").open, true, "late validation leaves replacement open");
+  assert.strictEqual(page.els.get("key-title").textContent, "New gallery key");
+  assert.strictEqual(page.session.has("gallery-key"), false, "superseded key is not saved");
+  assert.strictEqual(page.els.get("editbar").hidden, true, "superseded Edit stays closed");
+  await submitKey(page, "Home-Key-1234");
+  await batch;
+  assert.strictEqual(page.location.assigned, "/" + SLUG);
+  assert.strictEqual(page.els.get("upload-btn").disabled, false, "replacement upload settles");
+}
+
 async function testWrongCachedKeyReprompts() {
   const wrong = "Wrong-Key-123";
   const right = "Right-Key-789";
@@ -1491,8 +1900,10 @@ async function testPrivateGalleryKeyOpens() {
   await testProtectReflectsLock();
   await testNoHeicNeverLoadsDecoder();
   await testHeicFetchesOnlyWhenVisible();
+  await testHeicBudgetAndFallback();
   await testLandingExplainsKeys();
   await testPrivateProtectWarns();
+  await testLateOwnerCheckCannotResolveCreatePrompt();
   await testWrongCachedKeyReprompts();
   await testCopyFallbackWithoutClipboard();
   await testLegacySlugURLs();
@@ -1512,8 +1923,12 @@ async function testPrivateGalleryKeyOpens() {
   await testRejectedFilesDoNotMintGallery();
   if (BASE) {
     await workflowUpload();
+    await testDelayedListingSharesUploadPrompt();
+    await testVisibilityLostReply();
+    await testPasswordUnconfirmedReply();
     await workflowEdit();
     await workflowView();
+    await testBoundedTextPreview();
     await testPrivateGalleryKeyOpens();
   } else {
     console.log("client smoke: live workflows skipped (GALLY_BASE_URL unset)");

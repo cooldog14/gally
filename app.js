@@ -20,6 +20,7 @@ const keyError = document.getElementById("key-error");
 const keyHelp = document.getElementById("key-help");
 const keyConfirm = document.getElementById("key-confirm");
 const publicCheck = document.getElementById("public-check");
+const makePublicBtn = document.getElementById("setpass-public");
 const editStatus = document.getElementById("edit-status");
 const keyBanner = document.getElementById("key-banner");
 const keyBannerKey = document.getElementById("key-banner-key");
@@ -79,8 +80,11 @@ let index = 0;
 // Server-side pagination: `next` cursor from the last listing page.
 let nextCursor = null;
 let loadingMore = false;
-// Whole-gallery visibility; new galleries start private server-side.
-let galleryPublic = true;
+// null means the current visibility is not known.
+let galleryPublic = null;
+let visibilityPending = false;
+let visibilityVersion = 0;
+let listingVersion = 0;
 // Viewer password set? Comes from the listing: an unauthenticated probe gets
 // 404 on a private gallery, so it cannot tell whether a lock exists.
 let galleryLocked = false;
@@ -88,8 +92,8 @@ let galleryLocked = false;
 // Storage can throw when site data is blocked; the page must still load.
 let galleryKey = "";
 try { galleryKey = sessionStorage.getItem("gallery-key") || ""; } catch (_) {}
-let keyResolver = null;
-let keyValidator = null;
+let keyPrompt = null;
+const ownerKeyRequests = new Map();
 // Viewer password for locked galleries: "<slug>:<password>" per tab.
 function storedPass(slug) {
   try { return sessionStorage.getItem("gallery-pass:" + slug) || ""; }
@@ -119,6 +123,7 @@ document.getElementById("key-banner-close").addEventListener("click", () => {
 });
 
 function keyBannerHintText() {
+  if (galleryPublic === null) return "Visibility unknown. Reload to check who can view this gallery.";
   if (galleryPublic) {
     return galleryLocked
       ? "Anyone with the link needs the viewer password."
@@ -196,9 +201,15 @@ function updateGalleryState() {
   homeLink.hidden = !slug;
   copyLinkBtn.hidden = !slug;
   if (!slug) return;
-  galleryState.textContent = (galleryPublic ? "Public" : "Private") + (galleryLocked ? " · Protected" : "");
+  publicCheck.checked = galleryPublic === true;
+  publicCheck.indeterminate = galleryPublic === null;
+  publicCheck.disabled = visibilityPending || galleryPublic === null;
+  makePublicBtn.disabled = publicCheck.disabled;
+  galleryState.textContent = galleryPublic === null ? "Visibility unknown"
+    : (galleryPublic ? "Public" : "Private") + (galleryLocked ? " · Protected" : "");
   galleryState.title = keyBannerHintText();
   if (!keyBanner.hidden) keyBannerHint.textContent = keyBannerHintText();
+  updateProtectUI();
 }
 
 function showLanding() {
@@ -210,7 +221,6 @@ function showLanding() {
   setEditing(false);
   photos = [];
   nextCursor = null;
-  publicCheck.checked = true;
   galleryLocked = false;
   renderGrid();
   empty.textContent = "Upload photos to start a new private gallery. To open an existing gallery, use its link; a private gallery also needs its key.";
@@ -251,23 +261,29 @@ async function loadPhotos(retry = false) {
     showLanding();
     return;
   }
+  const request = ++listingVersion;
+  const version = visibilityVersion;
+  const current = () => request === listingVersion && slug === slugFromPath();
+  const currentVisibility = () => version === visibilityVersion && !visibilityPending;
   galleryLabel.textContent = slug;
   editBtn.hidden = false;
   homeLink.hidden = false;
   copyLinkBtn.hidden = false;
-  galleryState.hidden = true;
+  publicCheck.indeterminate = galleryPublic === null;
+  publicCheck.disabled = visibilityPending || galleryPublic === null;
   try {
     // The listing's Set-Cookie authorises every media tag.
-    const res = await fetch(listingUrl(slug), { headers: listingHeaders(slug) });
+    const headers = listingHeaders(slug);
+    const res = await fetch(listingUrl(slug), { headers });
+    if (!current()) return;
     if (res.status === 404) {
-      // Private (or deleted): ask for the owner key and verify it before it
-      // is stored. A wrong key stays in the dialog with an error.
+      if (!currentVisibility()) return;
+      // Private (or deleted): join an upload or edit already asking for its key.
       if (!retry) {
-        const key = await needKey(true, "enter", {
-          title: "Gallery unavailable",
-          help: "This gallery is private or does not exist. Enter the owner key if the owner gave it to you; otherwise ask the owner for a link to a public gallery.",
-          validate: async (v) => (await verifyGalleryKey(slug, v)).error || "",
-        });
+        const key = await askKeyForGallery(slug,
+          "This gallery is private or does not exist. Enter the owner key if the owner gave it to you; otherwise ask the owner for a link to a public gallery.",
+          fetch, { title: "Gallery unavailable", rejectedKey: headers["X-Gallery-Key"] });
+        if (!current() || !currentVisibility()) return;
         if (key) return loadPhotos(true);
       }
       showUnavailable("This gallery is private or does not exist. Ask the owner for a public link, or for the owner key.");
@@ -275,6 +291,13 @@ async function loadPhotos(retry = false) {
     }
     let data;
     if (res.status === 401) {
+      if (!currentVisibility()) return;
+      const ownerRequest = ownerKeyRequests.get(slug);
+      if (!retry && ownerRequest) {
+        const key = await ownerRequest;
+        if (!current() || !currentVisibility()) return;
+        if (key) return loadPhotos(true);
+      }
       // Locked: prompt for the viewer password (owner key also accepted).
       // Only a public gallery reaches here, so its state is known.
       galleryPublic = true;
@@ -282,6 +305,7 @@ async function loadPhotos(retry = false) {
       updateGalleryState();
       showKeyBannerOnce(slug);
       data = await needPass(slug);
+      if (!current() || !currentVisibility()) return;
       if (!data) {
         photos = [];
         nextCursor = null;
@@ -294,10 +318,13 @@ async function loadPhotos(retry = false) {
       if (!res.ok) throw new Error("bad status " + res.status);
       data = await res.json();
     }
-    galleryPublic = data.public !== false;
-    galleryLocked = data.locked === true;
-    publicCheck.checked = galleryPublic;
-    updateGalleryState();
+    if (!current()) return;
+    // A listing started before or during a write cannot establish visibility.
+    if (currentVisibility()) {
+      galleryPublic = typeof data.public === "boolean" ? data.public : null;
+      galleryLocked = data.locked === true;
+      updateGalleryState();
+    }
     showKeyBannerOnce(slug);
     photos = data.photos || [];
     nextCursor = data.next || null;
@@ -318,6 +345,7 @@ async function loadPhotos(retry = false) {
       uploadStatus.textContent = "Some files were not uploaded: " + uploadFailures;
     }
   } catch (_) {
+    if (!current() || !currentVisibility()) return;
     nextCursor = null;
     updateLoadMore();
     galleryState.hidden = true;
@@ -363,59 +391,79 @@ editBtn.addEventListener("click", async () => {
 
 doneBtn.addEventListener("click", () => setEditing(false));
 
-/** Publish/unpublish the gallery; throws the server message on failure. */
+/** Write once; after an ambiguous result, report only what an owner read confirms. */
 async function setGalleryPublic(want) {
   const slug = slugFromPath();
-  if (!slug) return;
-  const res = await fetch("/api/galleries/" + slug + "/visibility", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Gallery-Key": galleryKey },
-    body: JSON.stringify({ public: want }),
-  });
-  if (!res.ok) {
-    let msg = res.statusText;
-    try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
-    throw new Error(msg);
-  }
-  galleryPublic = want;
-  publicCheck.checked = want;
+  const key = galleryKey;
+  if (!slug || !key || visibilityPending || galleryPublic === null) return false;
+  visibilityPending = true;
+  visibilityVersion += 1;
   updateGalleryState();
+  try {
+    let res;
+    try {
+      res = await fetch("/api/galleries/" + slug + "/visibility", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
+        body: JSON.stringify({ public: want }),
+      });
+    } catch (_) { /* The server may have committed before the connection failed. */ }
+    const data = await res?.json().catch(() => null);
+    if (res?.ok && data?.slug === slug && data.public === want) {
+      galleryPublic = want;
+      return true;
+    }
+    if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
+      throw new Error(data?.error || "The server refused the visibility change. Try again.");
+    }
+
+    galleryPublic = null;
+    updateGalleryState();
+    let listing;
+    try {
+      const read = await fetch("/api/galleries/" + slug + "/photos?limit=1", {
+        headers: { "X-Gallery-Key": key },
+        cache: "no-store",
+      });
+      if (read.ok) listing = await read.json();
+    } catch (_) { /* Remain unknown when the owner read also fails. */ }
+    if (listing?.slug !== slug || typeof listing.public !== "boolean" || typeof listing.locked !== "boolean") {
+      throw new Error(keyBannerHintText());
+    }
+    galleryPublic = listing.public;
+    galleryLocked = listing.locked;
+    if (galleryPublic === want) return true;
+    throw new Error("Visibility change was not confirmed. The gallery is " +
+      (galleryPublic ? "public" : "private") + ". Try again.");
+  } finally {
+    visibilityPending = false;
+    visibilityVersion += 1;
+    updateGalleryState();
+  }
 }
 
-// Publish/unpublish the whole gallery. Reverts the tick if the server refuses.
 publicCheck.addEventListener("change", async () => {
   const want = publicCheck.checked;
-  publicCheck.disabled = true;
   editStatus.textContent = "";
   try {
-    await setGalleryPublic(want);
-    editStatus.textContent = want ? "Gallery is public" : "Gallery is private";
+    if (await setGalleryPublic(want)) {
+      editStatus.textContent = want ? "Gallery is public" : "Gallery is private";
+    }
   } catch (e) {
-    publicCheck.checked = galleryPublic;
     editStatus.textContent = e.message;
-  } finally {
-    publicCheck.disabled = false;
   }
 });
 
-lockBtn.addEventListener("click", async () => {
-  const slug = slugFromPath();
-  if (!slug) return;
-  const key = await needKey(false, "enter");
-  if (!key) return;
-  const input = document.getElementById("setpass-input");
-  const errEl = document.getElementById("setpass-error");
+function updateProtectUI() {
   const help = document.getElementById("setpass-help");
-  const removeBtn = document.getElementById("setpass-remove");
-  const privateRow = document.getElementById("setpass-private");
-  errEl.textContent = "";
-  input.value = "";
-  removeBtn.hidden = !galleryLocked;
-  privateRow.hidden = galleryPublic;
-  if (galleryPublic) {
+  document.getElementById("setpass-remove").hidden = !galleryLocked;
+  document.getElementById("setpass-private").hidden = galleryPublic !== false;
+  if (galleryPublic === null) {
+    help.textContent = keyBannerHintText();
+  } else if (galleryPublic) {
     help.textContent = galleryLocked
       ? "This gallery is protected. Enter a new password to change it, or remove protection below."
-      : "Viewers will need this password to open the gallery.";
+      : "This gallery is public. Enter a password below to protect it.";
   } else {
     help.textContent =
       (galleryLocked
@@ -423,21 +471,25 @@ lockBtn.addEventListener("click", async () => {
         : "This gallery is private, so only you can open it. ") +
       "Make it public to share it; the password then gates viewers.";
   }
+}
+
+lockBtn.addEventListener("click", async () => {
+  const slug = slugFromPath();
+  if (!slug || !(galleryKey || await askKeyForGallery(slug, "Enter the owner key for this gallery."))) return;
+  const input = document.getElementById("setpass-input");
+  document.getElementById("setpass-error").textContent = "";
+  input.value = "";
+  updateProtectUI();
   document.getElementById("setpass-dialog").showModal();
   input.focus();
 });
 
-document.getElementById("setpass-public").addEventListener("click", async () => {
+makePublicBtn.addEventListener("click", async () => {
   const errEl = document.getElementById("setpass-error");
-  const help = document.getElementById("setpass-help");
   errEl.textContent = "";
+  editStatus.textContent = "";
   try {
-    await setGalleryPublic(true);
-    editStatus.textContent = "Gallery is public";
-    document.getElementById("setpass-private").hidden = true;
-    help.textContent = galleryLocked
-      ? "This gallery is public. Viewers will need the password to open it."
-      : "This gallery is public. Enter a password below to protect it.";
+    if (await setGalleryPublic(true)) editStatus.textContent = "Gallery is public";
   } catch (e) {
     errEl.textContent = e.message;
   }
@@ -447,36 +499,45 @@ document.getElementById("setpass-form").addEventListener("submit", async (e) => 
   const clicked = e.submitter?.value;
   if (clicked === "cancel") return;
   const slug = slugFromPath();
-  const input = document.getElementById("setpass-input");
+  const expectedLocked = clicked !== "remove";
+  const value = document.getElementById("setpass-input").value;
   const errEl = document.getElementById("setpass-error");
-  if (clicked !== "remove" && !input.value) return; // empty = keep, no request
+  if (expectedLocked && !value) return; // empty = keep, no request
+  const dialog = document.getElementById("setpass-dialog");
   const key = galleryKey;
+  let res;
   try {
-    const res = await fetch("/api/galleries/" + slug + "/lock", {
+    res = await fetch("/api/galleries/" + slug + "/lock", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
-      body: JSON.stringify({ password: clicked === "remove" ? "" : input.value }),
+      body: JSON.stringify({ password: expectedLocked ? value : "" }),
     });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { const e = await res.json(); if (e.error) msg = e.error; } catch (_) {}
-      errEl.textContent = msg;
-      document.getElementById("setpass-dialog").showModal();
-      return;
-    }
+  } catch (_) { /* The request may have committed before the connection failed. */ }
+  if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
     const data = await res.json().catch(() => null);
-    galleryLocked = data && data.locked === true;
+    errEl.textContent = data?.error || res.statusText;
+    dialog.showModal();
+    return;
+  }
+  const data = res?.ok ? await res.json().catch(() => null) : null;
+  if (data?.slug === slug && data?.locked === expectedLocked) {
+    galleryLocked = expectedLocked;
     updateGalleryState();
     try {
-      if (clicked === "remove") sessionStorage.removeItem("gallery-pass:" + slug);
-      else sessionStorage.setItem("gallery-pass:" + slug, input.value);
+      if (expectedLocked) sessionStorage.setItem("gallery-pass:" + slug, value);
+      else sessionStorage.removeItem("gallery-pass:" + slug);
     } catch (_) {}
     uploadStatus.textContent = galleryLocked ? "Gallery protected." : "Protection removed.";
     await loadPhotos();
-  } catch (_) {
-    errEl.textContent = "Request failed";
-    document.getElementById("setpass-dialog").showModal();
+    return;
   }
+  const unconfirmed = "Password change was not confirmed. Try again.";
+  uploadStatus.textContent = unconfirmed;
+  await loadPhotos();
+  uploadStatus.textContent = unconfirmed;
+  errEl.textContent = unconfirmed;
+  updateProtectUI();
+  dialog.showModal();
 });
 
 deleteBtn.addEventListener("click", () => {
@@ -569,51 +630,40 @@ function thumbUrl(name) {
 
 // Owner key as a header; viewer password goes on the listing fetch only
 // (percent-encoded: fetch() refuses non-ASCII header values).
-async function authedFetch(name) {
+async function authedFetch(name, { range, signal } = {}) {
   const headers = {};
   if (galleryKey) headers["X-Gallery-Key"] = galleryKey;
-  return fetch(mediaUrl(name), { headers });
+  if (range) headers.Range = range;
+  return fetch(mediaUrl(name), { headers, signal });
 }
 
 
 // --- HEIC: one fetch, render natively, decode only when the browser can't ---
-const heicCache = new Map();    // name -> displayed objectURL (LRU, capped)
-const heicBlobs = new Map();    // name -> {blob,url} fetched, not yet displayed
-const heicInflight = new Map(); // phase+name -> shared promise (one per photo)
+const HEIC_PREVIEW_BYTES = 8 * 1024 * 1024;
+const HEIC_CACHE_BYTES = 4 * HEIC_PREVIEW_BYTES;
+const heicCache = new Map();
+let heicCacheBytes = 0;
+let heicWork = Promise.resolve();
 
-// Cap ≈ two screens of tiles: 36 on desktop grids, 12 on phones.
-function heicCacheMax() {
-  const cols = Math.max(1, Math.floor((grid.clientWidth || 800) / 200));
-  const rows = Math.max(1, Math.ceil((window.innerHeight || 600) / 200));
-  const twoScreens = cols * rows * 2;
-  return Math.min(36, Math.max(12, twoScreens));
-}
-
-function heicOnce(key, fn) {
-  let p = heicInflight.get(key);
-  if (!p) {
-    p = fn();
-    heicInflight.set(key, p);
-    p.catch(() => {}).then(() => heicInflight.delete(key));
+async function readHeicPreview(name) {
+  const res = await authedFetch(name, { signal: AbortSignal.timeout(30_000) });
+  if (!res.ok || !res.body || Number(res.headers.get("Content-Length")) > HEIC_PREVIEW_BYTES) {
+    res.body?.cancel().catch(() => {});
+    throw new Error("HEIC preview unavailable");
   }
-  return p;
-}
-
-function heicRemember(name, url) {
-  heicCache.delete(name);
-  heicCache.set(name, url);
-  while (heicCache.size > heicCacheMax()) {
-    const [oldest, oldUrl] = heicCache.entries().next().value;
-    heicCache.delete(oldest);
-    URL.revokeObjectURL(oldUrl);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return new Blob(chunks, { type: "image/heic" });
+    size += value.byteLength;
+    if (size > HEIC_PREVIEW_BYTES) {
+      reader.cancel().catch(() => {});
+      throw new Error("HEIC preview too large");
+    }
+    chunks.push(value);
   }
-}
-
-function heicCached(name) {
-  const url = heicCache.get(name);
-  if (url === undefined) return null;
-  heicRemember(name, url); // refresh LRU position
-  return url;
 }
 
 // 1.3 MB decoder: injected only when a HEIC actually needs decoding.
@@ -631,43 +681,47 @@ function loadHeicDecoder() {
   return heicDecoder;
 }
 
-// Fetched once per photo; heicBlobs owns the blob URL until it is displayed.
-function heicBlob(name) {
-  return heicOnce("blob:" + name, async () => {
-    const res = await authedFetch(name);
-    if (!res.ok) throw new Error("fetch failed");
-    const blob = await res.blob();
-    const entry = { blob, url: URL.createObjectURL(blob) };
-    heicBlobs.delete(name);
-    heicBlobs.set(name, entry);
-    while (heicBlobs.size > heicCacheMax()) {
-      const [oldest, evicted] = heicBlobs.entries().next().value;
-      heicBlobs.delete(oldest);
-      URL.revokeObjectURL(evicted.url);
+async function renderHeicPreview(name, img) {
+  const cached = heicCache.get(name);
+  if (cached) {
+    heicCache.delete(name);
+    heicCache.set(name, cached);
+    img.src = cached.url;
+    await img.decode();
+    return;
+  }
+  let blob = await readHeicPreview(name);
+  if (!img.isConnected) return;
+  let url = URL.createObjectURL(blob);
+  try {
+    img.src = url;
+    try {
+      await img.decode();
+    } catch (error) {
+      if (!img.isConnected) throw error;
+      await loadHeicDecoder();
+      if (!img.isConnected) return;
+      const out = await heic2any({ blob, toType: "image/jpeg", quality: 0.8 });
+      blob = Array.isArray(out) ? out[0] : out;
+      if (!img.isConnected) return;
+      if (blob.size > HEIC_PREVIEW_BYTES) throw new Error("HEIC preview too large");
+      URL.revokeObjectURL(url);
+      url = URL.createObjectURL(blob);
+      img.src = url;
+      await img.decode();
     }
-    return entry;
-  });
-}
-
-function heicSource(name) {
-  const cached = heicCached(name);
-  return cached ? Promise.resolve(cached) : heicBlob(name).then((entry) => entry.url);
-}
-
-// Decode the already-fetched blob; cached, so concurrent callers share it.
-function heicDecode(name) {
-  return heicOnce("jpeg:" + name, async () => {
-    const cached = heicCached(name);
-    if (cached) return cached;
-    await loadHeicDecoder();
-    const entry = heicBlobs.get(name) || await heicBlob(name);
-    const out = await heic2any({ blob: entry.blob, toType: "image/jpeg", quality: 0.8 });
-    const jpeg = URL.createObjectURL(Array.isArray(out) ? out[0] : out);
-    if (heicBlobs.get(name) === entry) heicBlobs.delete(name);
-    URL.revokeObjectURL(entry.url); // intermediate: this browser can't show it
-    heicRemember(name, jpeg);
-    return jpeg;
-  });
+    heicCache.set(name, { url, size: blob.size });
+    heicCacheBytes += blob.size;
+    url = null;
+    while (heicCacheBytes > HEIC_CACHE_BYTES || heicCache.size > 12) {
+      const [oldest, entry] = heicCache.entries().next().value;
+      heicCache.delete(oldest);
+      heicCacheBytes -= entry.size;
+      URL.revokeObjectURL(entry.url);
+    }
+  } finally {
+    if (url !== null) URL.revokeObjectURL(url);
+  }
 }
 
 // <img> for a HEIC. Tiles start on intersect (one observer, no double trigger);
@@ -680,22 +734,12 @@ function heicImage(name, onFail, immediate = false) {
   const start = () => {
     if (started) return;
     started = true;
-    heicSource(name).then((url) => {
-      if (!img.isConnected) return; // the URL stays owned by heicBlobs/heicCache
-      img.onload = () => {
-        heicRemember(name, url);
-        const owned = heicBlobs.get(name);
-        if (owned && owned.url === url) heicBlobs.delete(name); // now heicCache's
-      };
-      img.onerror = () => {
-        img.onerror = null;
-        heicDecode(name).then((jpeg) => {
-          img.onload = null; // the JPEG is cached by heicDecode, not this URL
-          img.src = jpeg;
-        }).catch(() => { if (img.isConnected) onFail(); });
-      };
-      img.src = url;
-    }).catch(() => { if (img.isConnected) onFail(); });
+    // Hold one slot from the fetch through native or fallback decoding.
+    heicWork = heicWork.then(async () => {
+      if (img.isConnected) await renderHeicPreview(name, img);
+    }).catch(() => {
+      if (img.isConnected) onFail(img);
+    });
   };
   if (immediate || typeof IntersectionObserver === "undefined") {
     start();
@@ -714,15 +758,13 @@ function tileMedia(photo) {
   const kind = mediaKind(photo.name);
   const url = mediaUrl(photo.name);
   if (kind === "heic") {
-    const img = heicImage(photo.name, () => {
+    return heicImage(photo.name, (img) => {
       const div = document.createElement("div");
       div.className = "file-generic";
       div.textContent = displayName(photo.name);
-      div.title = displayName(photo.name) + " (preview not supported)";
+      div.title = displayName(photo.name) + " (open to download original)";
       img.replaceWith(div);
     });
-    img.loading = "lazy"; // off-screen tiles still defer decode/render
-    return img;
   }
   if (kind === "image") {
     const img = document.createElement("img");
@@ -805,20 +847,26 @@ function updateLoadMore() {
 /** Append the next page without rebuilding existing tiles or selection. */
 async function loadMore() {
   const slug = slugFromPath();
-  if (!slug || !nextCursor || loadingMore) return;
+  const version = listingVersion;
+  const listing = photos;
+  const cursor = nextCursor;
+  if (!slug || !cursor || loadingMore) return;
+  const current = () => slug === slugFromPath() && version === listingVersion &&
+    listing === photos && cursor === nextCursor;
   loadingMore = true;
   updateLoadMore();
   try {
-    const res = await fetch(listingUrl(slug, nextCursor), { headers: listingHeaders(slug) });
+    const res = await fetch(listingUrl(slug, cursor), { headers: listingHeaders(slug) });
     if (!res.ok) throw new Error("bad status " + res.status);
     const data = await res.json();
+    if (!current()) return;
     const fresh = data.photos || [];
     const start = photos.length;
     photos.push(...fresh);
     fresh.forEach((photo, i) => addTile(photo, start + i));
     nextCursor = data.next || null;
   } catch (_) {
-    uploadStatus.textContent = "Could not load more photos";
+    if (current()) uploadStatus.textContent = "Could not load more photos";
   } finally {
     loadingMore = false;
     updateLoadMore();
@@ -848,8 +896,10 @@ function openLightbox(i) {
 // Tile index whose media is currently adopted by the lightbox (-1 = none).
 let adoptedTile = -1;
 let focusReturn = null;
+let viewportVersion = 0;
 
 function showInViewport(i) {
+  const version = ++viewportVersion;
   stopViewportMedia();
   viewport.textContent = "";
   adoptedTile = -1;
@@ -857,13 +907,16 @@ function showInViewport(i) {
   const kind = mediaKind(name);
   const url = mediaUrl(name);
   if (kind === "heic") {
-    // Native Safari renders the blob; others swap in the decoded JPEG.
-    viewport.appendChild(heicImage(name, () => {
-      viewport.textContent = "";
+    viewport.appendChild(heicImage(name, (img) => {
       const div = document.createElement("div");
       div.className = "file-generic";
       div.textContent = displayName(name);
-      viewport.appendChild(div);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = displayName(name);
+      link.textContent = "Download original";
+      div.appendChild(link);
+      img.replaceWith(div);
     }, true));
     return;
   }
@@ -884,19 +937,54 @@ function showInViewport(i) {
   }
   if (kind === "text") {
     viewport.textContent = "Loading…";
-    authedFetch(name).then((r) => {
-      if (!r.ok) throw new Error("fetch failed");
-      return r.text();
-    }).then((text) => {
-      if (index !== i || photos[i].name !== name) return;
+    (async () => {
+      let text;
+      let truncated = false;
+      try {
+        const cap = 65_536;
+        const res = await authedFetch(name, { range: "bytes=0-65535" });
+        if (res.status !== 206) {
+          res.body?.cancel().catch(() => {});
+        } else if (res.body) {
+          const reader = res.body.getReader();
+          const bytes = new Uint8Array(cap);
+          let length = 0;
+          while (length < cap) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const chunk = value.subarray(0, cap - length);
+            bytes.set(chunk, length);
+            length += chunk.length;
+          }
+          if (length === cap) reader.cancel().catch(() => {});
+          const total = res.headers.get("Content-Range")?.match(/\/(\d+)$/);
+          truncated = total ? Number(total[1]) > cap : length === cap;
+          text = new TextDecoder().decode(bytes.subarray(0, length));
+        }
+      } catch (_) { /* An interrupted preview still offers the original. */ }
+      if (!lightbox.open || version !== viewportVersion) return;
+      const panel = document.createElement("div");
+      panel.className = "text-preview";
+      if (text !== undefined) {
+        if (truncated) {
+          const label = document.createElement("span");
+          label.textContent = "First 64 KiB";
+          panel.appendChild(label);
+        }
+        const pre = document.createElement("pre");
+        pre.textContent = text;
+        panel.appendChild(pre);
+      } else {
+        panel.textContent = "Preview unavailable.";
+      }
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = displayName(name);
+      link.textContent = "Download original";
+      panel.appendChild(link);
       viewport.textContent = "";
-      const pre = document.createElement("pre");
-      pre.textContent = text;
-      viewport.appendChild(pre);
-    }).catch(() => {
-      viewport.textContent = "";
-      viewport.appendChild(tileMedia(photos[i]));
-    });
+      viewport.appendChild(panel);
+    })();
     return;
   }
   const tile = grid.children[i];
@@ -930,6 +1018,7 @@ function stopViewportMedia() {
 }
 
 function restoreThumbnails() {
+  viewportVersion += 1;
   // Put the adopted media back where it came from (by index, not by URL).
   stopViewportMedia();
   if (adoptedTile >= 0) {
@@ -989,13 +1078,14 @@ function newKeyProblem(v) {
 }
 
 /** Resolves {ok:true} or {ok:false,status,error}. status 0 = network. */
-async function verifyGalleryKey(slug, key, request = fetch) {
+async function verifyGalleryKey(slug, key, request, signal) {
   let res;
   try {
     res = await request("/api/galleries/resolve", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Gallery-Key": key },
       body: JSON.stringify({ slug }),
+      signal,
     });
   } catch (_) {
     return { ok: false, status: 0, error: "Could not check the key. Check your connection and try again." };
@@ -1008,54 +1098,57 @@ async function verifyGalleryKey(slug, key, request = fetch) {
   return { ok: false, status: res.status, error: "Could not check the key: " + msg };
 }
 
-/** Return a key the server accepts for `slug`; prompt and verify when needed. */
-async function askKeyForGallery(slug, help, request = fetch) {
-  let promptHelp = help;
-  if (galleryKey) {
-    const check = await verifyGalleryKey(slug, galleryKey, request);
-    if (check.ok) return galleryKey;
-    if (check.status === 429) {
-      uploadStatus.textContent = check.error;
-      return "";
+/** Share the owner's key check and prompt for callers targeting the same gallery. */
+function askKeyForGallery(slug, help, request = fetch, { title, rejectedKey } = {}) {
+  if (ownerKeyRequests.has(slug)) return ownerKeyRequests.get(slug);
+  const pending = Promise.resolve().then(async () => {
+    if (slug !== slugFromPath()) return "";
+    const saved = galleryKey;
+    if (saved && saved !== rejectedKey) {
+      const check = await verifyGalleryKey(slug, saved, request);
+      if (slug !== slugFromPath()) return "";
+      if (check.ok) return saved;
+      if (check.status === 429) {
+        uploadStatus.textContent = check.error;
+        return "";
+      }
+      // Keep the cached key after a failed network check; the action can report the error.
+      if (check.status !== 403) return saved;
     }
-    // A failed network check keeps the cached key: the action itself will
-    // report the real error rather than throwing the key away.
-    if (check.status !== 403) return galleryKey;
-    // The key may own another gallery; keep it until this prompt accepts one.
-    promptHelp = "The saved key does not open this gallery. " + help;
-  }
-  return needKey(true, "enter", {
-    help: promptHelp,
-    validate: async (key) => (await verifyGalleryKey(slug, key, request)).error || "",
-  });
+    return needKey("enter", {
+      title,
+      help: saved ? "The saved key does not open this gallery. " + help : help,
+      validate: async (key, signal) => (await verifyGalleryKey(slug, key, request, signal)).error || "",
+    });
+  }).finally(() => ownerKeyRequests.delete(slug));
+  ownerKeyRequests.set(slug, pending);
+  return pending;
 }
 
-/** Resolve the gallery key: memory/session, else prompt once.
-    Landing page (no slug) always prompts: returning here means a new gallery. */
-let keyMode = "enter";
-function needKey(forcePrompt, mode = "enter", opts = {}) {
-  if (!forcePrompt && galleryKey && galleryKey.length >= 6) {
-    return Promise.resolve(galleryKey);
-  }
-  resetKeyDialog();
-  keyMode = mode;
-  keyValidator = opts.validate || null;
-  const create = mode === "create";
+function finishKeyPrompt(prompt, value) {
+  if (!prompt || keyPrompt !== prompt) return;
+  keyPrompt = null;
+  if (!value) prompt.controller?.abort();
+  keyInput.value = "";
+  if (keyDialog.open) keyDialog.close();
+  prompt.resolve(value);
+}
+
+function needKey(mode, { title, help, validate } = {}) {
+  // Create, invite, and other galleries cannot consume the old prompt's answer.
+  finishKeyPrompt(keyPrompt, "");
+  const prompt = { mode, validate, controller: validate ? new AbortController() : null, resolve: null };
+  const pending = new Promise((resolve) => { prompt.resolve = resolve; });
+  keyPrompt = prompt;
   document.getElementById("key-title").textContent =
-    opts.title || (create ? "New gallery key" : "Gallery key");
-  keyHelp.textContent = opts.help || (create
-    ? "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery. Using the same key on the home page starts a new gallery, never an existing one."
-    : "Enter the owner key for this gallery.");
+    title || (mode === "create" ? "New gallery key" : "Gallery key");
+  keyHelp.textContent = help || "At least 12 characters, with a capital letter and a symbol (like Sunset-Beach-42). Save it; it is the only way to edit this gallery. Using the same key on the home page starts a new gallery, never an existing one.";
   keyInput.value = "";
   keyError.textContent = "";
+  keyConfirm.disabled = false;
   keyDialog.showModal();
   keyInput.focus();
-  return new Promise((resolve) => { keyResolver = resolve; });
-}
-
-function resetKeyDialog() {
-  invitePrompt = false;
-  keyValidator = null;
+  return pending;
 }
 
 const passDialog = document.getElementById("pass-dialog");
@@ -1132,59 +1225,50 @@ passDialog.addEventListener("close", () => {
 // server answers "invite required". Contributing to an existing gallery
 // never needs it.
 let inviteCode = "";
-let invitePrompt = false;
-/** Prompt for the invite code (reuses the key dialog UI). */
+
 function needInvite() {
-  if (inviteCode) return Promise.resolve(inviteCode);
-  resetKeyDialog();
-  invitePrompt = true;
-  document.getElementById("key-title").textContent = "Invite code";
-  keyHelp.textContent = "Ask the gallery owner for the invite code.";
-  keyInput.value = "";
-  keyError.textContent = "";
-  keyDialog.showModal();
-  keyInput.focus();
-  return new Promise((resolve) => { keyResolver = resolve; });
+  return inviteCode || needKey("invite", {
+    title: "Invite code",
+    help: "Ask the gallery owner for the invite code.",
+  });
 }
 
 keyForm.addEventListener("submit", async (e) => {
   // The dialog closes only on success, so a failed owner-key check can show
   // its error in place.
   e.preventDefault();
+  const prompt = keyPrompt;
+  if (!prompt || !keyDialog.open || keyConfirm.disabled) return;
   keyError.textContent = "";
   const v = keyInput.value.trim();
-  if (invitePrompt) {
+  if (prompt.mode === "invite") {
     if (!/^[\x21-\x7e]{1,128}$/.test(v)) {
       keyError.textContent = !v ? "Invite code required" : "Invite code must be ASCII (no spaces/accents)";
       keyInput.focus();
       return;
     }
     inviteCode = v;
-    resetKeyDialog();
-    const resolve = keyResolver;
-    keyResolver = null;
-    keyDialog.close();
-    if (resolve) resolve(v);
+    finishKeyPrompt(prompt, v);
     return;
   }
   // Strong rules only for keys we create; an existing key just has to be one.
-  const problem = keyMode === "create" ? newKeyProblem(v) : (!/^[\x21-\x7e]{6,128}$/.test(v) ? "Key must be 6-128 ASCII characters (no spaces/accents)" : "");
+  const problem = prompt.mode === "create" ? newKeyProblem(v)
+    : (!/^[\x21-\x7e]{6,128}$/.test(v) ? "Key must be 6-128 ASCII characters (no spaces/accents)" : "");
   if (problem) {
     keyError.textContent = problem;
     keyInput.focus();
     return;
   }
-  if (keyValidator) {
+  if (prompt.validate) {
     keyConfirm.disabled = true;
     let check = "";
     try {
-      check = await keyValidator(v);
+      check = await prompt.validate(v, prompt.controller.signal);
     } catch (_) {
       check = "Could not check the key. Try again.";
-    } finally {
-      keyConfirm.disabled = false;
     }
-    if (!keyDialog.open) return; // cancelled while the check ran
+    if (keyPrompt !== prompt || !keyDialog.open) return;
+    keyConfirm.disabled = false;
     if (check) {
       keyError.textContent = check;
       keyInput.focus();
@@ -1193,18 +1277,16 @@ keyForm.addEventListener("submit", async (e) => {
   }
   galleryKey = v;
   try { sessionStorage.setItem("gallery-key", v); } catch (_) { /* private mode */ }
-  resetKeyDialog();
-  const resolve = keyResolver;
-  keyResolver = null;
-  keyDialog.close();
-  if (resolve) resolve(v);
+  finishKeyPrompt(prompt, v);
 });
-document.getElementById("key-cancel").addEventListener("click", () => keyDialog.close());
-// Dialog closed via Esc or Cancel: treat as cancel.
+document.getElementById("key-cancel").addEventListener("click", () => finishKeyPrompt(keyPrompt, ""));
+keyDialog.addEventListener("cancel", (e) => {
+  e.preventDefault();
+  finishKeyPrompt(keyPrompt, "");
+});
 keyDialog.addEventListener("close", () => {
-  if (keyResolver) keyResolver("");
-  keyResolver = null;
-  resetKeyDialog();
+  // The browser queues close events, so this may be from a replaced prompt.
+  if (!keyDialog.open) finishKeyPrompt(keyPrompt, "");
 });
 
 uploadBtn.addEventListener("click", () => fileInput.click());
@@ -1326,7 +1408,7 @@ fileInput.addEventListener("change", async () => {
 async function uploadBatch(pageSlug, accepted, failures) {
   const key = pageSlug
     ? await askKeyForGallery(pageSlug, "Enter the owner key for this gallery to upload.", resolveForUpload)
-    : await needKey(true, "create");
+    : await needKey("create");
   if (!key) return;
   // One gallery per batch, picked before the first byte.
   let target;
