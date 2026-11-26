@@ -70,6 +70,9 @@ At the public reverse proxy, block `/metrics`, `/gally/admin` and
 `/gally/admin/` (including subpaths), and `/api/admin` and its subpaths.
 Keep authenticated admin access on a separate private path to the service,
 such as the loopback-published port over an SSH tunnel.
+Public gallery and photo deletion require the owner key. Admin cookies are
+scoped to `/api/admin`; scripts that use an admin cookie to delete an original
+must use `DELETE /api/admin/photos/{name}`.
 
 When upgrading from a version that allowed public media to be cached, purge
 all cached originals and previews under `/photos/` from any CDN or caching
@@ -93,6 +96,8 @@ a dedicated directory — never `/tmp`, `/`, or a shared web root. Keep `.env`
 Server-side previews are generated at upload time for new
 JPG/PNG/GIF/WebP/BMP/ICO photos. Photos uploaded before this version have no
 preview and the grid falls back to the original; there is no backfill command.
+Browser-generated HEIC previews are optional and limited to originals up
+to 8 MiB. HEIC originals remain downloadable without a preview.
 
 ## Admin
 
@@ -104,11 +109,12 @@ The admin can:
 
 - list galleries 200 at a time (slug, photo count, bytes, visibility);
 - delete one gallery and its files;
-- sweep files whose gallery row is gone, expired upload temp files, and empty
-  galleries older than one hour.
+- sweep files whose gallery row is gone, expired upload temp files, and
+  unused galleries older than one hour.
 
-The same empty-gallery sweep runs in the background every ten minutes, so a
-home batch that never stored a photo does not accumulate in the list.
+The unused-gallery sweep also runs every ten minutes. It only removes
+galleries known never to have stored a photo; deleting the last photo from
+an established gallery does not retire its URL.
 
 The admin cannot recover a key or a viewer password, and cannot read a private
 gallery's photos. Deleting a gallery does not revoke its key: the same key
@@ -150,17 +156,23 @@ watch its restart count. There is no separate timer to install.
 The sidecar takes a SQLite `VACUUM INTO` snapshot, then copies its indexed
 originals and their available `.thumbs/` previews into a private sibling
 directory (`0700`, database `0600`). Unindexed files and upload/thumbnail
-temps are not copied. An original already gone when copied is dropped from
-the snapshot's index and counts; other I/O errors fail the run. If the live
-index has photo rows but none of their files are present, the run fails and
-leaves the previous snapshot in place rather than publishing an empty one.
+temps are not copied. An original that vanishes during copying is omitted
+only if its row is also gone from the live database. A missing original still
+in the live index, another I/O error, or losing every original from a nonempty
+snapshot fails the run and leaves the previous snapshot in place.
 Changes to the live gallery after the DB snapshot are not guaranteed to be
 included.
 
-The same rule protects startup: if the database has photo rows but `photos/`
-contains none of them, the server refuses to rebuild an empty index and
-exits. Restore the files, or move both `galleries.db` and `photos/` aside to
-start a fresh library.
+Startup refuses a photos-only restore: if `galleries.db` is missing or empty,
+restore the database before starting with existing originals. Startup also
+refuses an initialized database missing either required table and refuses to
+rebuild if any indexed original is missing, truncated, or otherwise invalid.
+Startup recovers interrupted single-photo deletes before recounting. If a
+parked original has no matching photo row, startup moves it into a private
+`.quarantine-*` directory under `photos/`. Quarantined originals are not
+listed, served, snapshotted, or automatically removed. Compare them with
+known-good data before recovering or deleting them. Restore missing or
+damaged data from a known-good copy rather than rebuilding over it.
 
 After syncing the files and directories, the sidecar publishes the complete
 directory as `current` with an atomic rename. Replacing an existing snapshot
@@ -204,80 +216,172 @@ test "$archive_status" -eq 0
 # Copy "$work/gally.tar" off-host only after this test passed.
 ```
 
-**Restore drill:** Fetch a known-good archive you created into a fresh,
-private working directory. Never extract an untrusted archive or restore over
-an existing data volume. The commands below run in a shell from the Compose
-directory. Set `archive` to the absolute path of the downloaded archive.
+### Restore drill
+
+Fetch a known-good archive you created into a fresh, private working
+directory. Never extract an untrusted archive or restore over an existing
+data volume. Run the restore commands in one shell from the recovered
+Compose directory. Set `archive` to the absolute path of the downloaded
+archive.
 
 ```sh
 set -e
 umask 077
 : "${archive:?Set archive to the absolute path of the backup archive}"
-test -f "$archive"
 work=$(mktemp -d)
-restore_volume="gally-restore-${work##*.}"
 image=$(docker compose config --images | sort -u)  # server and sidecar use one image
-if docker volume inspect "$restore_volume" >/dev/null 2>&1; then
-  echo "Restore volume already exists; choose a fresh name" >&2
-  exit 1
-fi
-docker volume create "$restore_volume"
-docker run --rm -i --network none --read-only --user 10001:10001 \
-  --mount "type=volume,src=$restore_volume,dst=/data" \
-  --entrypoint /bin/sh "$image" -ec '
-    umask 077
-    entries=$(ls -A /data); test -z "$entries"
-    tar -x -C /data --no-same-owner --no-same-permissions
-    test -f /data/galleries.db
-    test -s /data/galleries.db
-    test -d /data/photos
-    types=$(find /data -mindepth 1 ! -type f ! -type d -print -quit); test -z "$types"
-    links=$(find /data -type f -links +1 -print -quit); test -z "$links"
-    extras=$(find /data -mindepth 1 -maxdepth 1 ! -name galleries.db ! -name photos -print -quit); test -z "$extras"
-  ' < "$archive"
+drill=
+trap 'if [ -n "$drill" ]; then docker stop "$drill"; fi' EXIT
 
-override="compose.$restore_volume.yaml"
-(set -C; cat > "$override" <<EOF
+restore_drill() {
+  test -z "$drill"
+  test -f "$1"
+  restore_volume="gally-restore-${work##*.}-$2"
+  if docker volume inspect "$restore_volume" >/dev/null 2>&1; then
+    echo "Restore volume already exists; choose a fresh name" >&2
+    exit 1
+  fi
+  docker volume create "$restore_volume"
+  docker run --rm -i --network none --read-only --user 10001:10001 \
+    --mount "type=volume,src=$restore_volume,dst=/data" \
+    --entrypoint /bin/sh "$image" -ec '
+      umask 077
+      entries=$(ls -A /data); test -z "$entries"
+      tar -x -C /data --no-same-owner --no-same-permissions
+      test -f /data/galleries.db
+      test -s /data/galleries.db
+      test -d /data/photos
+      types=$(find /data -mindepth 1 ! -type f ! -type d -print -quit); test -z "$types"
+      links=$(find /data -type f -links +1 -print -quit); test -z "$links"
+      extras=$(find /data -mindepth 1 -maxdepth 1 ! -name galleries.db ! -name photos -print -quit); test -z "$extras"
+    ' < "$1"
+
+  override="compose.$restore_volume.yaml"
+  (set -C; cat > "$override" <<EOF
 volumes:
   data:
     external: true
     name: $restore_volume
 EOF
-)
-drill=$(docker compose -f compose.yaml -f "$override" run --rm -d --no-deps \
-  -e GALLY_SECURE_COOKIES=0 -p 127.0.0.1::8000 gally)
-docker port "$drill" 8000/tcp
+  )
+  drill=$(docker compose -f compose.yaml -f "$override" run --rm -d --no-deps \
+    -e GALLY_SECURE_COOKIES=0 -p 127.0.0.1::8000 gally)
+  docker port "$drill" 8000/tcp
+}
+
+restore_drill "$archive" initial
 ```
+
+#### Verify and stop the drill
 
 `GALLY_SECURE_COOKIES=0` is only for this isolated HTTP drill. Never use it in
 production or for a TLS test. Only the fresh volume is writable during
 extraction, and the temporary app uses it without changing live routing or
-running the sidecar. Open the printed
-loopback address in a browser. Use a known gallery URL from the archive and
-its owner key or viewer password if required. Confirm the expected listing
-and open or download an **original**, not just a preview. Compare the bytes
-or checksum with a known copy if available. A 200 from `/healthz` alone says
-nothing about the recovered photos. If verification fails, stop the temporary
-container and leave the active deployment untouched.
+running the sidecar.
 
-After a successful check, stop the temporary container before switching (only
-one writer can open the restored volume). Keep the generated override beside
-`compose.yaml` and include it in subsequent commands:
+1. Open the printed loopback address in a browser. Use a known gallery URL
+   and its owner key or viewer password if required.
+2. Confirm the expected listing and open or download an **original**, not
+   just a preview. Compare the bytes or checksum with a known copy if
+   available. For a planned cutover's second drill, also check a known
+   original or change newer than the first archive, if one exists.
+   A 200 from `/healthz` alone says nothing about the recovered photos.
+3. Always stop the drill before continuing:
+
+   ```sh
+   docker stop "$drill"
+   drill=
+   ```
+
+If verification fails, stop the drill and do not start the recovered
+deployment. If the former deployment has already been stopped, see rollback
+below.
+
+### Planned cutover from a healthy deployment
+
+After stopping the first drill, stop the former app and backup sidecar. Set
+`former_dir` to the former Compose directory and run this in the restore
+shell. Use the former deployment's Compose files for both Docker commands
+(include its former overrides, if any). Take a fresh snapshot with the
+backup service's mounts, not from `current`.
+If the former deployment is on another host, run the snapshot block there
+with `set -e`, `umask 077`, and a separate `work=$(mktemp -d)`.
 
 ```sh
-docker stop "$drill"
-docker compose stop gally backup
-docker compose -f compose.yaml -f "$override" up -d --no-build gally backup
+test -z "${drill:-}"  # The initial drill must already be stopped.
+(
+  cd "${former_dir:?Set former_dir to the former Compose directory}"
+  docker compose stop gally backup
+  docker compose run --rm -T --no-deps --entrypoint /bin/sh backup -ec '
+    stage=$(mktemp -d /backups/.pre-cutover.XXXXXX)
+    cleanup() { rm -rf -- "$stage"; }
+    trap cleanup EXIT
+    /usr/local/bin/gally-uring --backup "$stage/snapshot" >&2
+    tar -C "$stage/snapshot" -cf - galleries.db photos
+  ' > "$work/pre-cutover.tar.partial"
+)
+tar -tf "$work/pre-cutover.tar.partial" > /dev/null
+mv "$work/pre-cutover.tar.partial" "$work/pre-cutover.tar"
 ```
 
-Both services now use the recovered data volume. Before the sidecar is allowed
-to replace it, keep an off-host copy of the currently installed snapshot.
-Retain the former volume and the off-host archive. To roll back, stop both
-services using the override,
-then run `docker compose up -d --no-build gally backup` without it (or use
-your prior override). New writes to the recovered volume will not be on the
-former volume. Do not use `down -v` or delete either volume during the drill
-or cutover.
+Keep the former deployment stopped and retain its data volume. Copy
+`$work/pre-cutover.tar` off-host, download that copy to
+`$work/pre-cutover.off-host.tar` in the recovered shell, and verify it
+against the source. When both files are on the same host:
+
+```sh
+cmp "$work/pre-cutover.tar" "$work/pre-cutover.off-host.tar"
+```
+
+For separate hosts, run these in their respective shells and proceed only
+if the checksums match:
+
+```sh
+# Former host:
+sha256sum "$work/pre-cutover.tar"
+# Recovered host:
+sha256sum "$work/pre-cutover.off-host.tar"
+```
+
+In the recovered shell, restore the verified fresh archive into a second
+fresh volume:
+
+```sh
+restore_drill "$work/pre-cutover.off-host.tar" cutover
+```
+
+Repeat [Verify and stop the drill](#verify-and-stop-the-drill) on this second
+volume. The second restore sets `override` to that volume. Use it for startup,
+not the override from the initial drill.
+
+### Disaster recovery without a usable former deployment
+
+After verifying and stopping the initial drill, go directly to startup with
+its restore override. Retain the already verified off-host archive. No local
+`/backups/current` or former host is required.
+
+### Start the recovered deployment
+
+From the recovered Compose directory, keep the selected override beside
+`compose.yaml` and use it for both services.
+
+```sh
+test -z "$drill"
+docker compose -f compose.yaml -f "$override" up -d --no-build --no-deps gally
+```
+
+Verify the recovered server and a known original before starting the sidecar:
+
+```sh
+docker compose -f compose.yaml -f "$override" up -d --no-build --no-deps backup
+```
+
+Roll back only if the former healthy data volume and Compose configuration
+are still available. If the recovered services have started, stop both
+using the restore override. Then start `gally` and `backup` using the
+former configuration, including any former overrides. New writes to the
+recovered volume will not be on the former volume. Do not use `down -v` or
+delete the former or restore volumes during the drills or cutover.
 
 Setting `GALLY_MEDIA_SECRET` in `.env` keeps media-cookie signing stable
 across restores; it must be at least 32 bytes, and rotating it invalidates all
