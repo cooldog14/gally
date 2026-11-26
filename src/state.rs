@@ -116,8 +116,8 @@ pub struct AppState {
     /// Verified (stored hash, supplied password) digests: a locked gallery
     /// costs one Argon2 run, not one per image.
     pub pass_ok: Mutex<HashMap<Vec<u8>, Instant>>,
-    /// Failed password/key attempts per IP (sliding window).
-    pub pass_fail: Mutex<HashMap<IpAddr, WindowRing>>,
+    /// Failed and in-flight credential attempts share one budget per IP.
+    pass_fail: Mutex<HashMap<IpAddr, CredentialAttempts>>,
     pub statics: HashMap<&'static str, (&'static [u8], &'static str, String)>,
     /// Invite code gating NEW gallery creation (`GALLY_INVITE_CODE` at
     /// startup; `None` = open creation). Contributing to an existing
@@ -133,10 +133,11 @@ pub struct AppState {
     pub upload_ips: Mutex<HashMap<IpAddr, usize>>,
     /// Serializes part cleanup and reservation changes, never body streaming.
     pub(crate) upload_budget: tokio::sync::Mutex<UploadBudget>,
-    pub argon2: tokio::sync::Semaphore,
+    pub argon2: Arc<tokio::sync::Semaphore>,
     /// Thumbnail decodes in flight. Hardcoded to 2: a small thumbnail can
     /// need the full source bitmap in RAM, so this bounds peak decode memory.
     pub thumbs: tokio::sync::Semaphore,
+    pub(crate) capture_times: tokio::sync::Semaphore,
     /// Read requests per IP (listing + photo), separate from uploads.
     pub read: Mutex<HashMap<IpAddr, WindowRing>>,
     /// Resumable-chunk requests per IP, separate from the upload bucket.
@@ -367,9 +368,30 @@ impl AppState {
         let db_path = root.join("galleries.db");
         let scan_dir = dir.clone();
         let conn = tokio::task::spawn_blocking(move || {
+            let missing_or_zero = match db_path.metadata() {
+                Ok(md) => md.len() == 0,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => return Err(e.into()),
+            };
+            if missing_or_zero {
+                db::require_no_originals(&scan_dir)?;
+            }
             let mut conn = db::open(&db_path)?;
             // WAL sidecars exist once open ran; keep the whole DB owner-only.
             restrict_db_files(&db_path)?;
+            if !missing_or_zero {
+                let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                if version == 0
+                    && !conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM galleries UNION ALL SELECT 1 FROM photos)",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )?
+                {
+                    db::require_no_originals(&scan_dir)?;
+                }
+            }
+            db::reconcile_pending_deletes(&conn, &scan_dir)?;
             db::recount(&mut conn, &scan_dir)?;
             let backfilled = db::backfill_exif(&mut conn, &scan_dir)?;
             if backfilled > 0 {
@@ -451,8 +473,9 @@ impl AppState {
             uploads: tokio::sync::Semaphore::new(limits.upload_slots),
             upload_ips: Mutex::new(HashMap::new()),
             upload_budget: tokio::sync::Mutex::new(UploadBudget::default()),
-            argon2: tokio::sync::Semaphore::new(limits.argon2_slots),
+            argon2: Arc::new(tokio::sync::Semaphore::new(limits.argon2_slots)),
             thumbs: tokio::sync::Semaphore::new(2),
+            capture_times: tokio::sync::Semaphore::new(2),
             read: Mutex::new(HashMap::new()),
             chunks: Mutex::new(HashMap::new()),
             last_sweep: Mutex::new(Instant::now()),
@@ -594,6 +617,11 @@ impl WindowRing {
         total
     }
 
+    fn record(&mut self, now_sec: u64) {
+        let bucket = (now_sec % RATE_WINDOW_SECS) as usize;
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+    }
+
     /// Record one hit, or return how long until a slot opens.
     fn hit(&mut self, now_sec: u64, max: usize, window_secs: u64) -> Option<Duration> {
         debug_assert!(
@@ -607,8 +635,7 @@ impl WindowRing {
         let max = max as u64;
         let recent = self.recent(window_secs);
         if recent < max {
-            let bucket = (now_sec % RATE_WINDOW_SECS) as usize;
-            self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+            self.record(now_sec);
             return None;
         }
         // Refuse without recording. The slot opens when the max-th newest hit
@@ -681,23 +708,136 @@ pub fn chunk_limited(state: &AppState, ip: &IpAddr) -> Option<Duration> {
     window_hit(&state.chunks, ip, state.limits.chunk_max, RATE_WINDOW_SECS)
 }
 
-/// True when `ip` already burned `PASS_FAIL_MAX` attempts in the window.
-/// Read-only: never records a failure (the caller still refuses outright).
-pub fn pass_fail_exceeded(state: &AppState, ip: &IpAddr) -> bool {
-    let now_sec = window_sec();
-    let mut fail = state.pass_fail.lock().unwrap();
-    let Some(ring) = fail.get_mut(ip) else {
-        return false;
-    };
-    ring.expire(now_sec);
-    ring.recent(PASS_FAIL_WINDOW_SECS) >= PASS_FAIL_MAX as u64
+#[derive(Default)]
+struct CredentialAttempts {
+    failures: WindowRing,
+    in_flight: u32,
+}
+
+impl CredentialAttempts {
+    fn exhausted(&mut self, now_sec: u64) -> bool {
+        self.failures.expire(now_sec);
+        self.failures.recent(PASS_FAIL_WINDOW_SECS) + u64::from(self.in_flight)
+            >= PASS_FAIL_MAX as u64
+    }
+}
+
+fn credential_entry(
+    attempts: &mut HashMap<IpAddr, CredentialAttempts>,
+    ip: IpAddr,
+) -> Option<&mut CredentialAttempts> {
+    // Never evict an entry whose worker will settle an outstanding attempt.
+    if attempts.len() >= 10_000 && !attempts.contains_key(&ip) {
+        let oldest = attempts
+            .iter()
+            .filter(|(_, entry)| entry.in_flight == 0)
+            .min_by_key(|(_, entry)| entry.failures.last_sec)
+            .map(|(ip, _)| *ip)?;
+        attempts.remove(&oldest);
+    }
+    Some(attempts.entry(ip).or_default())
 }
 
 /// Record one failed password/key attempt. Returns true once over the limit.
-/// shortcut: same 10k-IP bound as rate_limited, evicts oldest — switch to LRU
-/// when NAT-heavy.
 pub fn pass_fail_record(state: &AppState, ip: &IpAddr) -> bool {
-    window_hit(&state.pass_fail, ip, PASS_FAIL_MAX, PASS_FAIL_WINDOW_SECS).is_some()
+    pass_fail_check(state, *ip, || false).is_none()
+}
+
+/// A cheap credential check and any resulting failure are one transaction.
+pub(crate) fn pass_fail_check(
+    state: &AppState,
+    ip: IpAddr,
+    check: impl FnOnce() -> bool,
+) -> Option<bool> {
+    let mut attempts = state.pass_fail.lock().unwrap();
+    pass_fail_check_at(&mut attempts, ip, window_sec(), check)
+}
+
+fn pass_fail_check_at(
+    attempts: &mut HashMap<IpAddr, CredentialAttempts>,
+    ip: IpAddr,
+    now_sec: u64,
+    check: impl FnOnce() -> bool,
+) -> Option<bool> {
+    if attempts.get_mut(&ip).is_some_and(|e| e.exhausted(now_sec)) {
+        return None;
+    }
+    let ok = check();
+    if !ok {
+        let failures = &mut credential_entry(attempts, ip)?.failures;
+        failures.expire(now_sec);
+        failures.record(now_sec);
+    }
+    Some(ok)
+}
+
+#[derive(Debug)]
+pub(crate) enum ViewerAdmission {
+    RateLimited,
+    Busy,
+}
+
+/// The blocking job owns both the hash slot and the per-IP reservation.
+pub(crate) struct ViewerAttempt {
+    state: Arc<AppState>,
+    ip: IpAddr,
+    failed: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ViewerAttempt {
+    pub(crate) fn try_begin(state: &Arc<AppState>, ip: IpAddr) -> Result<Self, ViewerAdmission> {
+        let mut attempts = state.pass_fail.lock().unwrap();
+        if attempts
+            .get_mut(&ip)
+            .is_some_and(|e| e.exhausted(window_sec()))
+        {
+            return Err(ViewerAdmission::RateLimited);
+        }
+        let permit = Arc::clone(&state.argon2)
+            .try_acquire_owned()
+            .map_err(|_| ViewerAdmission::Busy)?;
+        credential_entry(&mut attempts, ip)
+            .ok_or(ViewerAdmission::RateLimited)?
+            .in_flight += 1;
+        Ok(Self {
+            state: Arc::clone(state),
+            ip,
+            failed: false,
+            _permit: permit,
+        })
+    }
+
+    pub(crate) fn finish(mut self, verified_key: Option<Vec<u8>>) {
+        if let Some(key) = verified_key {
+            let mut cache = self.state.pass_ok.lock().unwrap();
+            if cache.len() >= 10_000 {
+                cache.retain(|_, at| at.elapsed() < PASS_CACHE_TTL);
+            }
+            cache.insert(key, Instant::now());
+        } else {
+            self.failed = true;
+        }
+    }
+}
+
+impl Drop for ViewerAttempt {
+    fn drop(&mut self) {
+        let mut attempts = self.state.pass_fail.lock().unwrap();
+        let std::collections::hash_map::Entry::Occupied(mut attempt) = attempts.entry(self.ip)
+        else {
+            unreachable!("an in-flight attempt cannot be evicted");
+        };
+        let entry = attempt.get_mut();
+        entry.in_flight -= 1;
+        let now_sec = window_sec();
+        entry.failures.expire(now_sec);
+        if self.failed {
+            entry.failures.record(now_sec);
+        } else if entry.in_flight == 0 && entry.failures.recent(PASS_FAIL_WINDOW_SECS) == 0 {
+            attempt.remove();
+        }
+    }
 }
 
 /// Admin tokens live 24h from issue; expired ones are dropped on sight.
@@ -792,52 +932,53 @@ pub fn is_admin(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn denied_credentials_do_not_extend_the_window() {
-        let root = tempfile::tempdir().unwrap();
-        let state = AppState::new_with(root.path(), Limits::defaults())
-            .await
-            .unwrap();
+    #[test]
+    fn denied_credentials_do_not_extend_the_window() {
+        let mut attempts = HashMap::new();
         let ip = IpAddr::from([127, 0, 0, 1]);
-        // Drive the same map `pass_fail_record` uses, with an explicit clock so
-        // the window can age without sleeping.
         for _ in 0..PASS_FAIL_MAX {
-            assert!(
-                window_hit_at(
-                    &state.pass_fail,
-                    &ip,
-                    PASS_FAIL_MAX,
-                    PASS_FAIL_WINDOW_SECS,
-                    0
-                )
-                .is_none()
+            assert_eq!(
+                pass_fail_check_at(&mut attempts, ip, 0, || false),
+                Some(false)
             );
         }
-        let recorded = state.pass_fail.lock().unwrap()[&ip].clone();
-        for _ in 0..100 {
-            assert!(
-                window_hit_at(
-                    &state.pass_fail,
-                    &ip,
-                    PASS_FAIL_MAX,
-                    PASS_FAIL_WINDOW_SECS,
-                    0
-                )
-                .is_some()
-            );
+        for now_sec in 1..PASS_FAIL_WINDOW_SECS {
+            assert!(pass_fail_check_at(&mut attempts, ip, now_sec, || panic!("checked")).is_none());
         }
-        assert_eq!(state.pass_fail.lock().unwrap()[&ip], recorded);
-        // Past the window the hits are gone, so a new attempt is allowed.
-        assert!(
-            window_hit_at(
-                &state.pass_fail,
-                &ip,
-                PASS_FAIL_MAX,
-                PASS_FAIL_WINDOW_SECS,
-                PASS_FAIL_WINDOW_SECS + 1
-            )
-            .is_none()
+        assert_eq!(
+            pass_fail_check_at(&mut attempts, ip, PASS_FAIL_WINDOW_SECS, || false),
+            Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn in_flight_viewers_share_the_credential_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::new_with(
+            root.path(),
+            Limits {
+                argon2_slots: PASS_FAIL_MAX + 1,
+                ..Limits::defaults()
+            },
+        )
+        .await
+        .unwrap();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let another_ip = IpAddr::from([127, 0, 0, 2]);
+        for _ in 1..PASS_FAIL_MAX {
+            assert!(!pass_fail_record(&state, &ip));
+        }
+        let viewer = ViewerAttempt::try_begin(&state, ip).unwrap();
+        assert!(matches!(
+            ViewerAttempt::try_begin(&state, ip),
+            Err(ViewerAdmission::RateLimited)
+        ));
+        assert!(pass_fail_check(&state, ip, || panic!("checked")).is_none());
+        assert!(ViewerAttempt::try_begin(&state, another_ip).is_ok());
+        viewer.finish(Some(vec![1]));
+        assert_eq!(pass_fail_check(&state, ip, || true), Some(true));
+        ViewerAttempt::try_begin(&state, ip).unwrap().finish(None);
+        assert!(pass_fail_record(&state, &ip));
     }
 
     #[test]

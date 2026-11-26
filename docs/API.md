@@ -47,7 +47,7 @@ type is `415`. A bodyless request is allowed.
 
 | Cookie | Lifetime | Path | Flags | Purpose |
 |---|---|---|---|---|
-| `admin` | 24 h | `/` | `HttpOnly; SameSite=Lax`, `Secure` if configured | Admin API |
+| `admin` | 24 h | `/api/admin` | `HttpOnly; SameSite=Lax`, `Secure` if configured | Admin API |
 | `galowner_<slug>` | 12 h | `/photos/` | `HttpOnly; SameSite=Lax`, `Secure` if configured | Owner media (`<img>`/`<video>`) |
 | `galpass_<slug>` | 12 h | `/photos/` | `HttpOnly; SameSite=Lax`, `Secure` if configured | Viewer media after a password succeeds |
 
@@ -78,6 +78,9 @@ rate-limited request returns `429`; the error string depends on the endpoint
 (`too many uploads`, `too many requests`, or `too many attempts`).
 Upload and chunk throttles include `Retry-After`: whole seconds, rounded up
 until a slot opens. Pause new uploads in the batch until then.
+An in-flight viewer password check holds one place in the failure budget
+until it finishes. If all Argon2 slots are occupied, a new password check
+or password change returns `503 busy` instead of waiting in a queue.
 
 ### Errors and status codes
 
@@ -109,12 +112,12 @@ denial, `deleted`/`files` on deletes, `ok`/`free_bytes` on health.
 | `416` | Unsatisfiable `Range` |
 | `429` | Rate limit or failure lockout |
 | `500` | Internal error; files are kept where the recount can repair them |
-| `503` | No upload slot (`busy`), or `/healthz` not ready |
+| `503` | No upload or Argon2 slot (`busy`), or `/healthz` not ready |
 | `507` | Free-space floor reached (`storage full`) |
 
-Private galleries answer `404` for listings and media to anyone who is not the
-owner, so a slug cannot be probed. A wrong key is counted before the `404`;
-repeated guesses become `429`.
+Private and missing galleries answer the same way on listings and media.
+A supplied wrong key counts toward the failure limit in both cases:
+`404` until attempts are exhausted, then `429`.
 
 ### Caching, ETags, and ranges
 
@@ -274,6 +277,9 @@ Content-Range: bytes 0-8388607/12582912
 < total`; `total` cannot be 0. `X-Gallery-Slug` is required. Chunks must be
 contiguous: the existing temp length must equal `start`. Keep the filename
 and total unchanged, and use a different ID for each file in a gallery.
+Each chunk must end after exactly `end - start + 1` bytes. If supplied,
+`Content-Length` must match that size. A matching completed upload ID can
+still be retried without resending its body.
 
 | Response | Meaning |
 |---|---|
@@ -281,7 +287,7 @@ and total unchanged, and use a different ID for each file in a gallery.
 | `201 {name,slug}` | Final chunk stored, or the matching upload is already complete |
 | `409 {"error":"offset mismatch","received":N}` | Server has N bytes; jump to N |
 | `409 {"error":"upload in progress"}` | Another request owns this gallery's upload ID; back off and retry the same offset |
-| `409 {"error":"upload id already used"}` | A saved file or row for this ID does not match this request; use a different ID for a different file |
+| `409 {"error":"upload id already used"}` | A saved file or row does not match this request, or this name has a pending delete; use a different ID for a new upload |
 | `410 {"error":"upload expired"}` | Temp is gone (restart, startup sweep, or 1 h TTL); restart at 0 with the same id |
 | `400` | Bad headers, a chunk overrun, an empty body, or `temp > total` |
 | `408` | Idle timeout, short body, or a chunk shorter than its declared range |
@@ -332,21 +338,22 @@ preview feature have no preview.
 
 ### `DELETE /api/photos/{name}`
 
-Owner key or admin cookie. `name` must be a stored name (no slash, backslash,
-or leading dot) and must resolve inside `photos/`. Response:
+Owner key only. `name` must be a stored name (no slash, backslash, or
+leading dot) and must resolve inside `photos/`. Response:
 
 ```json
 { "deleted": "velvet-lagoon-quiet-river-1a2b_0123..._photo.jpg",
   "gallery_gone": false }
 ```
 
-`404` for unknown/not-yours; `500` if the DB update fails after the file
-removal. A retry after the file is gone clears the stale row and returns
-`200`; a later recount also drops it. The gallery row is kept.
+`404` for unknown/not-yours; `500` on storage or database failure. A retry
+can finish an interrupted delete. On restart, a parked original with a
+matching row is restored; without a row it is quarantined, not listed or
+served. The gallery and its URL are kept.
 
 ### `DELETE /api/galleries/{slug}`
 
-Owner key or admin cookie. Removes the DB row and the gallery's originals,
+Owner key only. Removes the DB row and the gallery's originals,
 previews, and upload temps. Response `200 {"deleted":"...","files":N}`. A
 failed or incomplete sweep is `500` with `{"deleted":"...","files":N,
 "error":"partial delete"}`; the row is already gone. The key itself stays
@@ -364,7 +371,8 @@ If `ADMIN_PASS` is unset, unlock answers `404` and the other routes answer
 | `POST /api/admin/unlock` | `{"password":"..."}` | `200 {"ok":true}` + `admin` cookie; `403` wrong, `429` locked out, `404` admin disabled |
 | `GET /api/admin/galleries` | optional `limit` (default 200, 1–1000) and `before` | `200 {"galleries":[{slug,created,photos,bytes,public}],"next":...}`; `created` is Unix seconds |
 | `POST /api/admin/galleries/{slug}/remove` | — | `200 {"deleted":slug,"files":N}`; `404`; `500` partial |
-| `POST /api/admin/sweep` | — | `200 {"deleted":N,"failed":N,"galleries":N}`; removes orphaned files, expired temps, and empty galleries older than one hour |
+| `DELETE /api/admin/photos/{name}` | — | `200 {"deleted":name,"gallery_gone":false}`; `404` for a missing photo |
+| `POST /api/admin/sweep` | — | `200 {"deleted":N,"failed":N,"galleries":N}`; removes orphaned files, expired temps, and galleries older than one hour that are known never to have stored a photo |
 | `POST /api/admin/logout` | — | `200 {"ok":true}`; clears the cookie. Without a live admin session: `403 {"error":"admin session inactive"}`; a generic `403` is not proof of logout |
 
 The admin cannot recover keys or passwords, and cannot read a private
@@ -479,20 +487,20 @@ curl -fsS -b admin.jar http://127.0.0.1:8000/api/admin/galleries
 ## Failure behavior
 
 - Startup takes the data-dir lock, sweeps `.part-*` and `.tmp-*`, opens and
-  migrates SQLite, recounts counters from `photos/`, and backfills missing EXIF
-  capture times. An interrupted upload does not survive a restart; restart
-  that file from zero. If the database has photo rows but `photos/` contains
-  none of them, startup fails instead of rebuilding an empty index; restore the
-  files, or move both `galleries.db` and `photos/` aside to start a fresh
-  library.
+  migrates SQLite, recovers interrupted deletes, recounts live galleries
+  from `photos/`, and backfills capture times. An interrupted upload restarts
+  from zero. Startup refuses a missing or empty database alongside existing
+  originals, a damaged indexed original, or a photo tree missing all its
+  indexed originals. Restore the missing or damaged data from backup.
 - A final upload is synced and renamed before the DB row is added. A DB error
   keeps the file, returns `500`, and the next recount adopts it.
 - A database read error is a `500`, never a missing gallery, a missing
   password, or an orphaned file: the admin sweep aborts without deleting.
 - SQLite runs with WAL and `synchronous=FULL`: an acknowledged upload row,
   visibility change, or viewer-password change survives a power cut.
-- A photo delete removes and syncs the file before updating counters; a DB
-  error returns `500` and a later recount removes the stale row.
+- A photo delete parks and syncs the file before committing the database
+  change. Startup restores a parked file if the photo row survived, or
+  removes it if the delete committed.
 - A gallery delete refuses to touch the row if `photos/` cannot be read; a
   partial sweep after the row is gone returns `500`.
 - The server is single-node. The data-dir lock prevents a second writer; the

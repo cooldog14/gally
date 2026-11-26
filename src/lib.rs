@@ -85,6 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/galleries/resolve", post(resolve_gallery))
         .route("/api/admin/unlock", post(admin_unlock))
         .route("/api/admin/galleries/{slug}/remove", post(remove_gallery))
+        .route("/api/admin/photos/{*name}", delete(admin_delete_photo))
         .route("/api/galleries/{slug}/lock", post(lock_gallery))
         .route("/gally/admin/", get(admin_page))
         .route("/gally/admin", get(admin_page_redirect))

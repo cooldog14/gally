@@ -16,7 +16,7 @@ All values are read at startup; restart the process or container to apply them.
 | `GALLY_MIN_FREE_BYTES` | `2147483648` (2 GiB) | Free space kept on the data volume; `0` = off. |
 | `GALLY_UPLOAD_SLOTS` | `32` | Concurrent uploads overall; minimum 1. |
 | `GALLY_UPLOAD_SLOTS_PER_IP` | `4` | Concurrent uploads per IP; minimum 1. |
-| `GALLY_ARGON2_SLOTS` | `4` | Concurrent Argon2 password hashes; minimum 1. |
+| `GALLY_ARGON2_SLOTS` | `4` | Concurrent Argon2 password checks and hashes; minimum 1. Requests that need a hash return `503 busy` if all slots are occupied. |
 | `GALLY_INVITE_CODE` | unset | When set, new galleries need this code via `X-Invite-Code`; existing galleries never do. Wrong codes count toward the 10/min/IP failure bucket; once full, further attempts are `429`. A correct code still works. |
 | `ADMIN_PASS` | unset | Enables `/api/admin/*` and the admin login. When unset, admin login returns 404. |
 | `GALLY_TRUST_PROXY` | off, including Compose | List the exact IP address of each actual reverse-proxy hop allowed to set `X-Forwarded-For` (CIDRs are supported; `1/true/yes` trusts loopback). Do not trust an entire Docker subnet. Leave off for a directly reachable app. |

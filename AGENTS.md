@@ -21,6 +21,8 @@ recovery.
   gallery.
 - The admin can list, delete, and sweep galleries. The admin cannot recover a
   key or password and cannot read a private gallery's photos.
+- Admin credentials are scoped to `/api/admin`; public delete routes require
+  the owner key even from an admin session.
 - Losing the owner key means the gallery can no longer be edited or deleted by
   its owner. Say this plainly; never promise recovery.
 - One node. SQLite, local disk, in-process rate limits, no distributed state.
@@ -33,6 +35,8 @@ recovery.
 - Fail closed on auth; fail safe on data. On an error, keep files, return 5xx,
   and let startup recount repair the index. Never delete user data to make an
   error go away.
+- A restart must distinguish an interrupted photo delete from missing storage.
+  Recount must not adopt damaged originals or originals with no live gallery.
 - Ops are deliberately unmagical: TLS is the reverse proxy's job, off-host
   backup is the operator's job, and the app ships one local snapshot plus
   health/metrics. The data-dir lock enforces one writer.

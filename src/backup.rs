@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, ensure};
 use rusqlite::{Connection, OpenFlags};
 
+use crate::db::{GalleryDb, PENDING_DELETE_PREFIX, require_no_originals};
+
 fn sync_dir(dir: &Path) -> anyhow::Result<()> {
-    File::open(dir)
-        .and_then(|file| file.sync_all())
-        .with_context(|| format!("sync directory {}", dir.display()))
+    crate::db::sync_dir(dir).with_context(|| format!("sync directory {}", dir.display()))
 }
 
 fn entry(path: &Path) -> anyhow::Result<Option<fs::Metadata>> {
@@ -172,6 +172,17 @@ fn copy_live_file(src: &Path, dst: &Path, expected: Option<u64>) -> anyhow::Resu
     Ok(true)
 }
 
+fn confirm_original_removed(src: &Connection, slug: &str, name: &str) -> anyhow::Result<()> {
+    let size = src
+        .photo_size(slug, name)
+        .with_context(|| format!("check live index for original {name}"))?;
+    ensure!(
+        size.is_none(),
+        "indexed original missing from live storage: {name}"
+    );
+    Ok(())
+}
+
 fn build_snapshot(
     src: &Connection,
     source_photos: &Path,
@@ -210,6 +221,11 @@ fn build_snapshot(
         version >= 1,
         "live database startup recount not finished; start Gally and retry"
     );
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM galleries)", [], |r| {
+        r.get::<_, bool>(0)
+    })? {
+        require_no_originals(source_photos)?;
+    }
     let tx = db.transaction()?;
     // Only the snapshotted index authorizes a copy. Extra originals in a
     // snapshot could become live again when restore recounts the directory.
@@ -232,11 +248,19 @@ fn build_snapshot(
                 "invalid photo name in snapshot"
             );
             indexed += 1;
-            if !copy_live_file(
-                &source_photos.join(name),
-                &photos.join(name),
-                Some(u64::try_from(size)?),
-            )? {
+            let source = source_photos.join(name);
+            let dest = photos.join(name);
+            let expected = Some(u64::try_from(size)?);
+            if !copy_live_file(&source, &dest, expected)?
+                && !copy_live_file(
+                    &source_photos.join(format!("{PENDING_DELETE_PREFIX}{name}")),
+                    &dest,
+                    expected,
+                )?
+                // Startup can move a pending original back to its normal name.
+                && !copy_live_file(&source, &dest, expected)?
+            {
+                confirm_original_removed(src, slug, name)?;
                 missing.push((slug.to_owned(), name.to_owned(), size));
                 continue;
             }
@@ -247,9 +271,8 @@ fn build_snapshot(
             }
         }
     }
-    // One deleted original is normal during a live delete. None of the
-    // indexed originals is a missing mount or wrong restore; do not overwrite
-    // the previous snapshot with an empty one.
+    // Even confirmed concurrent deletes must not replace a nonempty
+    // snapshot with an empty one.
     if indexed > 0 && copied == 0 {
         anyhow::bail!(
             "none of the {indexed} indexed photos are present in {}; refusing to publish an empty snapshot",
@@ -512,49 +535,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_drops_indexed_rows_whose_source_vanished() {
-        use crate::db::{GalleryDb, open};
+    fn backup_keeps_last_snapshot_when_one_indexed_original_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
-        fs::create_dir_all(root.join("photos/.thumbs")).unwrap();
-        let mut db = open(&root.join("galleries.db")).unwrap();
+        let photos = root.join("photos");
+        fs::create_dir_all(&photos).unwrap();
+        let mut db = crate::db::open(&root.join("galleries.db")).unwrap();
         let slug = db.get_or_create_gallery("reconcile-key-0001").unwrap();
         let hex = "e".repeat(32);
         let kept = format!("{slug}_{hex}_kept.jpg");
-        let dropped = format!("{slug}_{hex}_dropped.jpg");
-        fs::write(root.join("photos").join(&kept), b"original").unwrap();
+        let lost = format!("{slug}_{hex}_lost.jpg");
+        fs::write(photos.join(&kept), b"original").unwrap();
+        fs::write(photos.join(&lost), b"last copy").unwrap();
+        db.add_upload(&slug, &kept, 8, 1).unwrap().unwrap();
+        db.add_upload(&slug, &lost, 9, 2).unwrap().unwrap();
+        crate::db::backfill_exif(&mut db, &photos).unwrap();
+
+        let dest = tmp.path().join("current");
+        run(&root, &dest).unwrap();
+        fs::remove_file(photos.join(&lost)).unwrap();
+        let err = run(&root, &dest).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("indexed original missing from live storage: {lost}")
+        );
+
+        let snap = crate::db::open(&dest.join("galleries.db")).unwrap();
+        assert_eq!(snap.photo_size(&slug, &kept).unwrap(), Some(8));
+        assert_eq!(snap.photo_size(&slug, &lost).unwrap(), Some(9));
+        assert_eq!(
+            fs::read(dest.join("photos").join(kept)).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(dest.join("photos").join(lost)).unwrap(),
+            b"last copy"
+        );
+        let meta = snap.gallery_meta(&slug).unwrap().unwrap();
+        assert_eq!((meta.bytes, meta.photos), (17, 2));
+    }
+
+    #[test]
+    fn backup_confirms_a_committed_removal_on_the_live_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("galleries.db");
+        let mut writer = crate::db::open(&path).unwrap();
+        let slug = writer.get_or_create_gallery("reconcile-key-0001").unwrap();
+        let name = format!("{slug}_{}_removed.jpg", "a".repeat(32));
+        writer.add_upload(&slug, &name, 8, 1).unwrap().unwrap();
+        let src = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(confirm_original_removed(&src, &slug, &name).is_err());
+        writer.remove_upload(&slug, &name, 8).unwrap().unwrap();
+        confirm_original_removed(&src, &slug, &name).unwrap();
+    }
+
+    #[test]
+    fn backup_recovers_indexed_bytes_during_pending_delete() {
+        use crate::db::{GalleryDb, open};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let photos = root.join("photos");
+        fs::create_dir_all(&photos).unwrap();
+        let mut db = open(&root.join("galleries.db")).unwrap();
+        let slug = db.get_or_create_gallery("backup-pending-key").unwrap();
+        let name = format!("{slug}_{}_pending.jpg", "a".repeat(32));
         fs::write(
-            root.join("photos/.thumbs").join(format!("{dropped}.jpg")),
-            b"stale",
+            photos.join(format!("{PENDING_DELETE_PREFIX}{name}")),
+            b"bytes",
         )
         .unwrap();
-        db.add_upload(&slug, &kept, 8, 1).unwrap().unwrap();
-        db.add_upload(&slug, &dropped, 20, 2).unwrap().unwrap();
-        crate::db::backfill_exif(&mut db, &root.join("photos")).unwrap();
+        db.add_upload(&slug, &name, 5, 1).unwrap().unwrap();
+        crate::db::backfill_exif(&mut db, &photos).unwrap();
 
         let dest = tmp.path().join("dest");
         run(&root, &dest).unwrap();
-        let snap = open(&dest.join("galleries.db")).unwrap();
-        assert!(!snap.photo_exists(&slug, &dropped));
-        assert!(snap.photo_exists(&slug, &kept));
-        assert_eq!(
-            fs::read(dest.join("photos").join(&kept)).unwrap(),
-            b"original"
-        );
+        let snapshot = open(&dest.join("galleries.db")).unwrap();
+        assert_eq!(snapshot.photo_size(&slug, &name).unwrap(), Some(5));
+        assert_eq!(fs::read(dest.join("photos").join(&name)).unwrap(), b"bytes");
         assert!(
             !dest
-                .join("photos/.thumbs")
-                .join(format!("{dropped}.jpg"))
+                .join("photos")
+                .join(format!("{PENDING_DELETE_PREFIX}{name}"))
                 .exists()
         );
-        let meta = snap.gallery_meta(&slug).unwrap().unwrap();
-        assert_eq!((meta.bytes, meta.photos), (8, 1));
-        let live = db.gallery_meta(&slug).unwrap().unwrap();
-        assert_eq!(
-            (live.bytes, live.photos),
-            (28, 2),
-            "only the snapshot is reconciled"
+    }
+
+    #[test]
+    fn backup_will_not_replace_a_snapshot_from_an_empty_database_with_originals() {
+        use crate::db::{GalleryDb, open};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let photos = root.join("photos");
+        fs::create_dir_all(&photos).unwrap();
+        let mut db = open(&root.join("galleries.db")).unwrap();
+        let slug = db.get_or_create_gallery("last-good-backup-key").unwrap();
+        let name = format!("{slug}_{}_original.jpg", "a".repeat(32));
+        fs::write(photos.join(&name), b"bytes").unwrap();
+        db.add_upload(&slug, &name, 5, 1).unwrap().unwrap();
+        crate::db::backfill_exif(&mut db, &photos).unwrap();
+        let dest = tmp.path().join("dest");
+        run(&root, &dest).unwrap();
+
+        // An older binary could boot a replacement empty database while the
+        // original survived, making an empty index look initialized.
+        db.remove_gallery(&slug).unwrap();
+        assert!(
+            run(&root, &dest)
+                .unwrap_err()
+                .to_string()
+                .contains("restore galleries.db")
         );
+        let snapshot = open(&dest.join("galleries.db")).unwrap();
+        assert_eq!(snapshot.photo_size(&slug, &name).unwrap(), Some(5));
+        assert_eq!(fs::read(dest.join("photos").join(name)).unwrap(), b"bytes");
     }
 
     #[test]
@@ -885,7 +978,7 @@ mod tests {
         fs::remove_file(photos.join(&name)).unwrap();
         let err = run(&root, &dest).unwrap_err();
         assert!(
-            format!("{err:#}").contains("none of the 1 indexed photos"),
+            format!("{err:#}").contains("indexed original missing from live storage"),
             "{err:#}"
         );
         let snapshot = crate::db::open(&dest.join("galleries.db")).unwrap();

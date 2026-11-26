@@ -1,9 +1,12 @@
 //! SQLite gallery metadata: galleries.
 
 use std::collections::HashSet;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, ensure};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand_core::OsRng;
@@ -61,7 +64,7 @@ pub(crate) fn now_millis() -> i64 {
 
 /// Fresh-install schema. Older files are upgraded by `migrate`.
 const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0, token_version INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS galleries(slug TEXT PRIMARY KEY, key_hash BLOB NOT NULL, created INTEGER NOT NULL, pass_hash BLOB, public INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, photos INTEGER NOT NULL DEFAULT 0, token_version INTEGER NOT NULL DEFAULT 0, ever_stored INTEGER);
     CREATE INDEX IF NOT EXISTS idx_galleries_key ON galleries(key_hash);
     CREATE TABLE IF NOT EXISTS photos(slug TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(slug, name));
     CREATE INDEX IF NOT EXISTS idx_photos_list ON photos(slug, created DESC, name DESC);";
@@ -74,6 +77,19 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(path)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 1 {
+        for table in ["galleries", "photos"] {
+            if !conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get::<_, bool>(0),
+            )? {
+                tracing::error!(table, "initialized database is missing a required table");
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+    }
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000; {SCHEMA}"
     ))?;
@@ -122,6 +138,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("photos", "INTEGER NOT NULL DEFAULT 0"),
         ("token_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("ever_stored", "INTEGER"),
     ] {
         if !cols.contains(name) {
             conn.execute(
@@ -155,73 +172,201 @@ pub enum StoreUpload {
     PhotoLimit,
 }
 
+pub(crate) const PENDING_DELETE_PREFIX: &str = ".pending-delete-";
+
+/// A photos-only restore cannot reconstruct gallery keys or visibility.
+pub(crate) fn require_no_originals(photos_dir: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(photos_dir)
+        .with_context(|| format!("read photos dir {}", photos_dir.display()))?
+    {
+        let name = entry?.file_name();
+        if let Some(name) = name.to_str() {
+            let original = name.strip_prefix(PENDING_DELETE_PREFIX).unwrap_or(name);
+            ensure!(
+                crate::validate::photo_slug(original).is_none(),
+                "database is missing or empty but {} contains originals; restore galleries.db before continuing",
+                photos_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Restore indexed pending originals. A missing row might mean an older
+/// database was restored, so preserve unmatched originals out of the index.
+pub(crate) fn reconcile_pending_deletes(
+    conn: &Connection,
+    photos_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut changed = false;
+    let mut quarantine: Option<std::path::PathBuf> = None;
+    for entry in fs::read_dir(photos_dir)
+        .with_context(|| format!("read photos dir {}", photos_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(PENDING_DELETE_PREFIX))
+        else {
+            continue;
+        };
+        let Some(slug) = crate::validate::photo_slug(name).filter(|_| !name.contains(['/', '\\']))
+        else {
+            continue;
+        };
+        let pending = entry.path();
+        ensure!(
+            entry.file_type()?.is_file(),
+            "not a regular pending original: {}",
+            pending.display()
+        );
+        let original = photos_dir.join(name);
+        match original.symlink_metadata() {
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("stat {}", original.display())),
+            Ok(_) => anyhow::bail!(
+                "both pending and original exist for {}; keeping both",
+                original.display()
+            ),
+        }
+        if conn.photo_size(slug, name)?.is_some() {
+            fs::rename(&pending, &original)
+                .with_context(|| format!("restore {}", pending.display()))?;
+        } else {
+            let dir = match &quarantine {
+                Some(dir) => dir,
+                None => {
+                    let dir = photos_dir.join(format!(".quarantine-{}", uuid::Uuid::new_v4()));
+                    fs::create_dir(&dir).with_context(|| {
+                        format!("create pending-delete quarantine {}", dir.display())
+                    })?;
+                    sync_dir(photos_dir).context("sync quarantine directory entry")?;
+                    quarantine.insert(dir)
+                }
+            };
+            let saved = dir.join(name);
+            fs::rename(&pending, &saved)
+                .with_context(|| format!("quarantine {}", pending.display()))?;
+            sync_dir(dir).with_context(|| format!("sync {}", dir.display()))?;
+            tracing::warn!(path = %saved.display(), "parked original has no matching row; retained for review");
+        }
+        changed = true;
+    }
+    if changed {
+        sync_dir(photos_dir).with_context(|| format!("sync {}", photos_dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Recount `galleries.bytes`/`.photos` from the files on disk. Runs at
 /// startup: repairs counters after a crash. A directory we cannot read aborts
 /// the rebuild before the transaction, leaving the previous listing intact.
-/// A directory that contains none of the indexed files also aborts: that is a
-/// missing mount or wrong restore, not a normal one-file delete.
+/// A missing indexed original also aborts: a normal delete removes its row.
 pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
-    use anyhow::Context;
     use std::collections::HashMap;
-    let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
-    // Rows carry the capture time (EXIF backfill or upload time); the disk
-    // only knows mtime, so keep what the DB already has for known files.
-    let mut existing: HashMap<String, i64> = HashMap::new();
+    let mut galleries = {
+        let mut stmt = conn.prepare("SELECT slug FROM galleries")?;
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (0i64, 0i64))))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+    let mut existing = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT name, created FROM photos")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut stmt = conn.prepare(
+            "SELECT p.slug, p.name, p.size, p.created FROM photos p JOIN galleries g ON g.slug = p.slug",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                (
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ),
+            ))
+        })?;
         for row in rows {
-            let (name, created) = row?;
-            existing.insert(name, created);
+            let (name, indexed) = row?;
+            ensure!(
+                !existing.contains_key(&name),
+                "duplicate live entries for indexed original {name}"
+            );
+            existing.insert(name, indexed);
         }
     }
     // The listing table is a projection of the directory: rebuild it, not
     // just the counters, so a crashed install gets its rows back.
     let mut files: Vec<(String, String, i64, i64)> = Vec::new();
     let mut found_existing = 0usize;
-    let rd = std::fs::read_dir(photos_dir)
+    let rd = fs::read_dir(photos_dir)
         .with_context(|| format!("read photos dir {}", photos_dir.display()))?;
     for ent in rd {
         let ent = ent.with_context(|| format!("read photos dir {}", photos_dir.display()))?;
-        let name = ent.file_name().to_string_lossy().into_owned();
-        // Count by name before the photo-name validator: an old or unusual
-        // name still proves the directory is not empty or wrongly mounted.
-        if existing.contains_key(&name) {
-            found_existing += 1;
-        }
-        let Some(slug) = crate::validate::photo_slug(&name) else {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let known = existing.get(name);
+        let gallery = crate::validate::photo_slug(name)
+            .filter(|_| !name.contains('\\'))
+            .and_then(|slug| galleries.get_mut(slug).map(|counts| (slug, counts)));
+        if known.is_none() && gallery.is_none() {
             continue;
-        };
-        let slug = slug.to_string();
+        }
         let md = match ent.metadata() {
-            // Directories (`.thumbs`) and dotfiles never become rows.
-            Ok(m) if m.is_file() => m,
-            Ok(_) => continue,
-            // Vanished between read_dir and stat: not a listing error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| format!("stat {}", ent.path().display()));
             }
         };
-        let mtime = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let created = existing.get(&name).copied().unwrap_or(mtime);
-        files.push((slug.clone(), name, md.len() as i64, created));
-        let e = counts.entry(slug).or_default();
-        e.0 += md.len() as i64;
-        e.1 += 1;
+        if let Some((_, expected, _)) = known {
+            ensure!(
+                md.is_file() && u64::try_from(*expected) == Ok(md.len()),
+                "indexed original {} is not a regular file of expected size {expected}",
+                ent.path().display()
+            );
+        }
+        let Some((slug, counts)) = gallery else {
+            ensure!(
+                known.is_none(),
+                "invalid name or gallery for indexed original {name}"
+            );
+            continue;
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let size = i64::try_from(md.len())?;
+        let created = if let Some((indexed_slug, _, created)) = known {
+            ensure!(
+                indexed_slug == slug,
+                "wrong gallery for indexed original {name}"
+            );
+            found_existing += 1;
+            *created
+        } else {
+            md.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+        files.push((slug.to_owned(), name.to_owned(), size, created));
+        counts.0 = counts
+            .0
+            .checked_add(size)
+            .context("gallery size exceeds SQLite integer range")?;
+        counts.1 += 1;
     }
-    if !existing.is_empty() && found_existing == 0 {
-        anyhow::bail!(
-            "photos directory {} contains none of the {} photos in the index; refusing to rebuild an empty index (restore the files, or move galleries.db and photos/ aside to reset)",
-            photos_dir.display(),
-            existing.len()
-        );
-    }
+    ensure!(
+        found_existing == existing.len(),
+        "photos directory {} is missing {} indexed originals; refusing to rebuild the index (restore the files, or move galleries.db and photos/ aside to reset)",
+        photos_dir.display(),
+        existing.len() - found_existing
+    );
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM photos", [])?;
     {
@@ -232,9 +377,9 @@ pub fn recount(conn: &mut Connection, photos_dir: &Path) -> anyhow::Result<()> {
         }
     }
     tx.execute("UPDATE galleries SET bytes = 0, photos = 0", [])?;
-    for (slug, (bytes, photos)) in counts {
+    for (slug, (bytes, photos)) in galleries.into_iter().filter(|(_, (_, photos))| *photos > 0) {
         tx.execute(
-            "UPDATE galleries SET bytes = ?1, photos = ?2 WHERE slug = ?3",
+            "UPDATE galleries SET bytes = ?1, photos = ?2, ever_stored = 1 WHERE slug = ?3",
             rusqlite::params![bytes, photos, slug],
         )?;
     }
@@ -359,7 +504,7 @@ impl GalleryDb for Connection {
         for _ in 0..50 {
             let slug = crate::validate::gen_slug(self);
             match self.execute(
-                "INSERT INTO galleries(slug, key_hash, created, public) VALUES(?1,?2,?3,0)",
+                "INSERT INTO galleries(slug, key_hash, created, public, ever_stored) VALUES(?1,?2,?3,0,0)",
                 rusqlite::params![slug, d, now_secs()],
             ) {
                 Ok(_) => return Some(slug),
@@ -449,7 +594,7 @@ impl GalleryDb for Connection {
         )?;
         let photos = meta.photos + 1;
         tx.execute(
-            "UPDATE galleries SET bytes = ?1, photos = ?2 WHERE slug = ?3",
+            "UPDATE galleries SET bytes = ?1, photos = ?2, ever_stored = 1 WHERE slug = ?3",
             rusqlite::params![total, photos, slug],
         )?;
         tx.commit()?;
@@ -490,9 +635,15 @@ impl GalleryDb for Connection {
     fn remove_gallery(&mut self, slug: &str) -> rusqlite::Result<bool> {
         let tx = self.transaction()?;
         tx.execute("DELETE FROM photos WHERE slug = ?1", [slug])?;
-        let n = tx.execute("DELETE FROM galleries WHERE slug = ?1", [slug])?;
+        let n = tx.execute(
+            "DELETE FROM galleries WHERE slug = ?1 AND NOT EXISTS (SELECT 1 FROM photos WHERE slug = ?1)",
+            [slug],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
         tx.commit()?;
-        Ok(n > 0)
+        Ok(true)
     }
 
     fn photos_page(
@@ -665,6 +816,14 @@ mod tests {
         recount(&mut db, &dir).expect("recount after migration");
         assert!(db.key_owns_slug(key, slug).expect("owns"));
         assert!(db.gallery_meta(slug).expect("query").expect("meta").public);
+        let marker: Option<i64> = db
+            .query_row(
+                "SELECT ever_stored FROM galleries WHERE slug = ?1",
+                [slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, None, "legacy empty history is unknown");
         assert!(
             db.get_or_create_gallery(key).is_some(),
             "same key must mint a second gallery after the UNIQUE rebuild"
@@ -786,7 +945,7 @@ mod tests {
         // not a normal delete: abort before the transaction wipes the rows.
         let err = recount(&mut db, &photos).unwrap_err();
         assert!(
-            format!("{err:#}").contains("contains none of the 1 photos"),
+            format!("{err:#}").contains("is missing 1 indexed originals"),
             "{err:#}"
         );
         assert!(db.photo_exists(&slug, &name), "the stale row is kept");
@@ -799,6 +958,104 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recount_preserves_rows_and_counters_after_partial_loss() {
+        let photos = tempfile::tempdir().unwrap();
+        let mut db = mem();
+        let slug = db.get_or_create_gallery("recount-partial-key").unwrap();
+        let kept = format!("{slug}_{}_kept.jpg", "a".repeat(32));
+        let lost = format!("{slug}_{}_lost.jpg", "b".repeat(32));
+        fs::write(photos.path().join(&kept), b"kept").unwrap();
+        db.add_upload(&slug, &kept, 4, 123).unwrap().unwrap();
+        db.add_upload(&slug, &lost, 7, 456).unwrap().unwrap();
+        let err = recount(&mut db, photos.path()).unwrap_err().to_string();
+        assert!(err.contains("is missing 1 indexed originals"), "{err}");
+        assert!(err.contains(photos.path().to_str().unwrap()), "{err}");
+        assert_eq!(db.photo_size(&slug, &kept).unwrap(), Some(4));
+        assert_eq!(db.photo_size(&slug, &lost).unwrap(), Some(7));
+        assert_eq!(
+            db.photos_page(&slug, None, 10).unwrap(),
+            vec![(456, lost), (123, kept)]
+        );
+        let meta = db.gallery_meta(&slug).unwrap().unwrap();
+        assert_eq!((meta.bytes, meta.photos), (11, 2));
+    }
+
+    #[test]
+    fn recount_refuses_damaged_indexed_originals() {
+        let photos = tempfile::tempdir().unwrap();
+        let mut db = mem();
+        let slug = db.get_or_create_gallery("recount-damaged-key").unwrap();
+        let name = format!("{slug}_{}_damaged.jpg", "a".repeat(32));
+        let path = photos.path().join(&name);
+        db.add_upload(&slug, &name, 5, 123).unwrap().unwrap();
+        fs::write(&path, b"cut").unwrap();
+        assert!(
+            recount(&mut db, photos.path())
+                .unwrap_err()
+                .to_string()
+                .contains("expected size 5")
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            recount(&mut db, photos.path())
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+        assert_eq!(db.photo_size(&slug, &name).unwrap(), Some(5));
+        let meta = db.gallery_meta(&slug).unwrap().unwrap();
+        assert_eq!((meta.bytes, meta.photos), (5, 1));
+        assert_eq!(db.photos_page(&slug, None, 10).unwrap(), vec![(123, name)]);
+    }
+
+    #[test]
+    fn recount_ignores_dead_gallery_rows_and_keeps_their_files() {
+        let photos = tempfile::tempdir().unwrap();
+        let mut db = mem();
+        let dead_slug = "ghost-gallery-quiet-calm-1a2b";
+        let name = |id: &str| format!("{dead_slug}_{}_original.jpg", id.repeat(32));
+        let orphan = name("a");
+        let missing = name("b");
+        for name in [&orphan, &missing] {
+            db.execute(
+                "INSERT INTO photos(slug, name, size, created) VALUES(?1, ?2, 4, 1)",
+                rusqlite::params![dead_slug, name],
+            )
+            .unwrap();
+        }
+        // A dead gallery's damaged and missing originals are ignored even
+        // when their rows are all that was in the old index.
+        let path = photos.path().join(&orphan);
+        fs::write(&path, b"abc").unwrap();
+        recount(&mut db, photos.path()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        assert!(db.photos_page(dead_slug, None, 10).unwrap().is_empty());
+        fs::remove_file(&path).unwrap();
+        recount(&mut db, photos.path()).unwrap();
+    }
+
+    #[test]
+    fn recount_marks_a_new_gallery_with_an_adopted_original_as_used() {
+        let photos = tempfile::tempdir().unwrap();
+        let mut db = mem();
+        let slug = db.get_or_create_gallery("recount-adopted-key").unwrap();
+        let name = format!("{slug}_{}_original.jpg", "a".repeat(32));
+        fs::write(photos.path().join(&name), b"abc").unwrap();
+        recount(&mut db, photos.path()).unwrap();
+        assert_eq!(db.photo_size(&slug, &name).unwrap(), Some(3));
+        db.remove_upload(&slug, &name, 3).unwrap().unwrap();
+        let marker: i64 = db
+            .query_row(
+                "SELECT ever_stored FROM galleries WHERE slug = ?1",
+                [&slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
     }
 
     #[test]
@@ -822,16 +1079,15 @@ mod tests {
             b"zz",
         )
         .unwrap();
-        assert_eq!(db.add_upload(&slug, "stale.jpg", 5, 500), Ok(Some((5, 1))));
         // Capture times already in the DB survive the rebuild.
         assert_eq!(
             db.add_upload(&slug, &name("a.jpg"), 40, 12_345),
-            Ok(Some((45, 2)))
+            Ok(Some((40, 1)))
         );
         recount(&mut db, &photos).expect("recount");
         let meta = db.gallery_meta(&slug).expect("query").expect("meta");
         assert_eq!((meta.bytes, meta.photos), (100, 2));
-        // The listing table was rebuilt (stale row gone, two real files in).
+        // The listing table now includes the adopted second file.
         let rows: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM photos WHERE slug = ?1",
