@@ -19,7 +19,7 @@ type is `415`. A bodyless request is allowed.
 
 - `X-Gallery-Key` is the owner credential. The server trims it and accepts
   6–128 characters. The bundled UI is stricter: visible ASCII with no spaces;
-  newly created keys need 12+ characters, a capital, and a symbol.
+  newly created keys also need a capital letter and a symbol.
 - `X-Gallery-Slug` selects the target gallery for uploads. It is optional for
   a full-body upload (absent = mint a new gallery) and required for chunked
   uploads.

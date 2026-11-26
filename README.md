@@ -20,9 +20,9 @@ cargo run --release
 ```
 
 Open <http://127.0.0.1:8000> and click **Upload**. The first upload asks for a
-new gallery key: at least 12 characters, with a capital letter and a symbol
-(for example `Sunset-Beach-42`). Save it; it is the only way to edit that
-gallery.
+new gallery key: 6–128 visible ASCII characters, with a capital letter and a
+symbol. Six is the minimum; choose a longer, unique key for a sensitive gallery.
+Note it down; it is the only way to edit that gallery.
 
 A key is not a gallery name. Every upload from the home page starts a **new**
 gallery with a new URL, even when you reuse the same key; a key alone never

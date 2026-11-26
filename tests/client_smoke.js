@@ -21,7 +21,6 @@ const PNG = Buffer.from(
 );
 
 const START_HIDDEN = new Set([
-  "copy-link-btn",
   "edit-btn",
   "editbar",
   "empty",
@@ -437,7 +436,7 @@ async function submitKey(page, value) {
 // --- workflow 1: upload ---
 
 async function workflowUpload() {
-  const key = "Sunset-Beach-42";
+  const key = "Mint7!";
   const session = new Map();
   const home = makePage({ pathname: "/", session });
 
@@ -454,8 +453,12 @@ async function workflowUpload() {
   assert.match(home.els.get("key-title").textContent, /New gallery key/);
 
   await submitKey(home, "short");
-  assert.match(home.els.get("key-error").textContent, /12-128/, "weak key is rejected");
+  assert.match(home.els.get("key-error").textContent, /6-128/, "five characters are rejected");
   assert.strictEqual(home.location.assigned, "", "no navigation for a weak key");
+  await submitKey(home, "mint7!");
+  assert.match(home.els.get("key-error").textContent, /capital letter/);
+  await submitKey(home, "Mint77");
+  assert.match(home.els.get("key-error").textContent, /symbol/);
 
   await submitKey(home, key);
   if (INVITE) {
@@ -584,7 +587,7 @@ async function testVisibilityLostReply() {
   assert.strictEqual(status.textContent, "", "no confirmation before an authoritative reply");
   releaseRecovery();
   await publishFromCheckbox;
-  assert.strictEqual(status.textContent, "Gallery is public");
+  assert.strictEqual(status.textContent, "", "confirmed visibility needs no success message");
   releaseStale();
   await batch;
   assert.strictEqual(state.textContent, "Public", "pre-write listing cannot revert visibility");
@@ -692,13 +695,13 @@ async function workflowEdit() {
   assert.strictEqual(page.els.get("public-check").checked, false, "new galleries are private");
   page.els.get("public-check").checked = true;
   await page.fire("public-check", { type: "change" });
-  assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is public");
+  assert.strictEqual(page.els.get("public-check").checked, true);
   assert.strictEqual(page.els.get("gallery-state").textContent, "Public", "public state updates");
   assert.strictEqual(await galleryStatus(slug), 200, "public gallery lists anonymously");
 
   page.els.get("public-check").checked = false;
   await page.fire("public-check", { type: "change" });
-  assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is private");
+  assert.strictEqual(page.els.get("public-check").checked, false);
   assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private state updates");
   assert.strictEqual(await galleryStatus(slug), 404, "private gallery hides");
 
@@ -1733,7 +1736,6 @@ async function testBlankLanding() {
   assert.strictEqual(page.els.get("empty").hidden, true, "no empty-gallery message on the landing");
   assert.strictEqual(page.els.get("empty").textContent, "");
   assert.strictEqual(page.els.get("gallery-state").hidden, true, "no state on the landing");
-  assert.strictEqual(page.els.get("copy-link-btn").hidden, true, "no link to copy on the landing");
 }
 
 async function testPrivateProtectWarns() {
@@ -1761,7 +1763,7 @@ async function testPrivateProtectWarns() {
 
   await page.fire("setpass-public");
   assert.strictEqual(page.els.get("setpass-private").hidden, true, "Make public hides its own row");
-  assert.strictEqual(page.els.get("edit-status").textContent, "Gallery is public");
+  assert.strictEqual(page.els.get("edit-status").textContent, "", "no redundant success message");
   assert.strictEqual(page.els.get("public-check").checked, true, "checkbox follows the publish");
   assert.match(
     page.els.get("setpass-help").textContent,
@@ -1858,12 +1860,6 @@ async function testCopyFallbackWithoutClipboard() {
   assert.strictEqual(copied, "Sunset-Beach-42", "fallback copies the key");
   assert.strictEqual(page.els.get("key-banner-copy").textContent, "Copied");
   assert.deepStrictEqual(page.clipboard, [], "clipboard API not used");
-
-  page.location.href = "https://gal.example/velvet-lagoon-quiet-river-1a2b";
-  page.els.get("copy-link-btn").hidden = false;
-  await page.fire("copy-link-btn");
-  assert.strictEqual(copied, page.location.href, "copy link uses the same fallback");
-  assert.strictEqual(page.els.get("copy-link-btn").textContent, "Copied");
 }
 
 async function testLegacySlugURLs() {
@@ -1889,6 +1885,7 @@ async function testPrivateGalleryKeyOpens() {
   await publish(slug, key, false);
   const page = makePage({ pathname: "/" + slug });
   await waitFor(() => page.els.get("key-dialog").open, "key prompt on a private gallery");
+  assert.strictEqual(page.els.get("key-help").textContent, "This gallery is private or does not exist.");
   await submitKey(page, key);
   await waitFor(() => page.els.get("grid").children.length === 1, "private gallery lists with the key");
   assert.strictEqual(page.els.get("gallery-state").textContent, "Private", "private state after the key");

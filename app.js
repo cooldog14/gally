@@ -12,7 +12,6 @@ const fileInput = document.getElementById("file-input");
 const galleryLabel = document.getElementById("gallery-label");
 const galleryState = document.getElementById("gallery-state");
 const homeLink = document.getElementById("home-link");
-const copyLinkBtn = document.getElementById("copy-link-btn");
 const keyDialog = document.getElementById("key-dialog");
 const keyForm = document.getElementById("key-form");
 const keyInput = document.getElementById("key-input");
@@ -175,13 +174,6 @@ keyBannerCopy.addEventListener("click", async () => {
   setTimeout(() => { keyBannerCopy.textContent = "Copy key"; }, 1500);
 });
 
-copyLinkBtn.addEventListener("click", async () => {
-  const url = (location.href || location.pathname || "").split("#")[0];
-  const ok = await copyText(url);
-  copyLinkBtn.textContent = ok ? "Copied" : "Copy failed";
-  setTimeout(() => { copyLinkBtn.textContent = "Copy link"; }, 1500);
-});
-
 showKeyBtn.addEventListener("click", () => {
   if (!galleryKey) return;
   showKeyBanner(galleryKey);
@@ -197,7 +189,6 @@ function updateGalleryState() {
   const slug = slugFromPath();
   galleryState.hidden = !slug;
   homeLink.hidden = !slug;
-  copyLinkBtn.hidden = !slug;
   if (!slug) return;
   publicCheck.checked = galleryPublic === true;
   publicCheck.indeterminate = galleryPublic === null;
@@ -213,7 +204,6 @@ function showLanding() {
   galleryLabel.textContent = "";
   galleryState.hidden = true;
   homeLink.hidden = true;
-  copyLinkBtn.hidden = true;
   editBtn.hidden = true;
   setEditing(false);
   photos = [];
@@ -227,7 +217,6 @@ function showLanding() {
 function showUnavailable(message) {
   setEditing(false);
   galleryState.hidden = true;
-  copyLinkBtn.hidden = true;
   editBtn.hidden = true;
   homeLink.hidden = false;
   photos = [];
@@ -266,7 +255,6 @@ async function loadPhotos(retry = false) {
   galleryLabel.textContent = slug;
   editBtn.hidden = false;
   homeLink.hidden = false;
-  copyLinkBtn.hidden = false;
   publicCheck.indeterminate = galleryPublic === null;
   publicCheck.disabled = visibilityPending || galleryPublic === null;
   try {
@@ -279,12 +267,12 @@ async function loadPhotos(retry = false) {
       // Private (or deleted): join an upload or edit already asking for its key.
       if (!retry) {
         const key = await askKeyForGallery(slug,
-          "This gallery is private or does not exist. Enter the owner key if the owner gave it to you; otherwise ask the owner for a link to a public gallery.",
+          "This gallery is private or does not exist.",
           fetch, { title: "Gallery unavailable", rejectedKey: headers["X-Gallery-Key"] });
         if (!current() || !currentVisibility()) return;
         if (key) return loadPhotos(true);
       }
-      showUnavailable("This gallery is private or does not exist. Ask the owner for a public link, or for the owner key.");
+      showUnavailable("This gallery is private or does not exist.");
       return;
     }
     let data;
@@ -393,7 +381,7 @@ doneBtn.addEventListener("click", () => setEditing(false));
 async function setGalleryPublic(want) {
   const slug = slugFromPath();
   const key = galleryKey;
-  if (!slug || !key || visibilityPending || galleryPublic === null) return false;
+  if (!slug || !key || visibilityPending || galleryPublic === null) return;
   visibilityPending = true;
   visibilityVersion += 1;
   updateGalleryState();
@@ -409,7 +397,7 @@ async function setGalleryPublic(want) {
     const data = await res?.json().catch(() => null);
     if (res?.ok && data?.slug === slug && data.public === want) {
       galleryPublic = want;
-      return true;
+      return;
     }
     if (res && res.status >= 400 && res.status < 500 && res.status !== 408) {
       throw new Error(data?.error || "The server refused the visibility change. Try again.");
@@ -430,7 +418,7 @@ async function setGalleryPublic(want) {
     }
     galleryPublic = listing.public;
     galleryLocked = listing.locked;
-    if (galleryPublic === want) return true;
+    if (galleryPublic === want) return;
     throw new Error("Visibility change was not confirmed. The gallery is " +
       (galleryPublic ? "public" : "private") + ". Try again.");
   } finally {
@@ -444,9 +432,7 @@ publicCheck.addEventListener("change", async () => {
   const want = publicCheck.checked;
   editStatus.textContent = "";
   try {
-    if (await setGalleryPublic(want)) {
-      editStatus.textContent = want ? "Gallery is public" : "Gallery is private";
-    }
+    await setGalleryPublic(want);
   } catch (e) {
     editStatus.textContent = e.message;
   }
@@ -1065,11 +1051,10 @@ document.addEventListener("keydown", (e) => {
 
 // The key is hand-typed, never generated: the user must remember (or note)
 // what they wrote. Keys are 6-128 visible ASCII chars (header-safe);
-// new keys also need 12+ chars, a capital and a symbol.
+// new keys also need a capital letter and a symbol.
 
 /** Why a *new* key is not acceptable yet ("" = fine). */
 function newKeyProblem(v) {
-  if (!/^[\x21-\x7e]{12,128}$/.test(v)) return "Key must be 12-128 ASCII characters (no spaces/accents)";
   if (!/\p{Lu}/u.test(v)) return "Key needs a capital letter";
   if (!/[^\p{L}\p{N}]/u.test(v)) return "Key needs a symbol, like ! - _ #";
   return "";
@@ -1140,7 +1125,7 @@ function needKey(mode, { title, help, validate, error = "" } = {}) {
   keyPrompt = prompt;
   document.getElementById("key-title").textContent =
     title || (mode === "create" ? "New gallery key" : "Gallery key");
-  keyHelp.textContent = help || "At least 12 characters, with a capital letter and a symbol.";
+  keyHelp.textContent = help || "At least 6 characters, with a capital letter and a symbol.";
   keyInput.value = "";
   keyError.textContent = error;
   keyConfirm.disabled = false;
@@ -1237,9 +1222,9 @@ keyForm.addEventListener("submit", async (e) => {
     finishKeyPrompt(prompt, v);
     return;
   }
-  // Strong rules only for keys we create; an existing key just has to be one.
-  const problem = prompt.mode === "create" ? newKeyProblem(v)
-    : (!/^[\x21-\x7e]{6,128}$/.test(v) ? "Key must be 6-128 ASCII characters (no spaces/accents)" : "");
+  const problem = !/^[\x21-\x7e]{6,128}$/.test(v)
+    ? "Key must be 6-128 ASCII characters (no spaces/accents)"
+    : (prompt.mode === "create" ? newKeyProblem(v) : "");
   if (problem) {
     keyError.textContent = problem;
     keyInput.focus();
